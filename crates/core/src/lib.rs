@@ -6,8 +6,12 @@
 //! - [`events::EventEngine`]: derives the narrated "story" events from raw samples.
 //! - [`mock::MockBackend`]: scripted simulation for CI/demos; the contract for real backends.
 
+#[cfg(target_os = "linux")]
+pub mod amd;
 pub mod backend;
 pub mod events;
+#[cfg(target_os = "linux")]
+pub mod intel;
 pub mod mock;
 pub mod model;
 #[cfg(all(feature = "nvidia", any(target_os = "linux", target_os = "windows")))]
@@ -211,6 +215,185 @@ mod tests {
             events.is_empty(),
             "no pressure event may fire from a stale window after a sharp drop: {:?}",
             events.iter().map(|e| &e.title).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- idle-gap (training stall) tests: synthetic 1 Hz traces, controlled ts_ms ----
+
+    fn idle_sample(ts_ms: u64, util_pct: f32) -> DynamicSample {
+        DynamicSample {
+            ts_ms,
+            util_pct: Some(util_pct),
+            mem_used_bytes: Some(8 << 30),
+            power_mw: None,
+            temp_c: None,
+            fan_pct: None,
+            sm_clock_mhz: None,
+            mem_clock_mhz: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            throttle: ThrottleReasons::default(),
+        }
+    }
+
+    fn python_proc() -> ProcessSample {
+        ProcessSample {
+            pid: 4521,
+            name: "python".into(),
+            kind: ProcessKind::Compute,
+            mem_bytes: Some(6 << 30),
+            util_pct: None,
+        }
+    }
+
+    /// Drive a 1 Hz constant-util trace through the engine; returns every event emitted.
+    fn drive(
+        engine: &mut EventEngine,
+        dev: &DeviceId,
+        ts_range: std::ops::RangeInclusive<u64>,
+        util_pct: f32,
+        procs: &[ProcessSample],
+    ) -> Vec<Event> {
+        let mut out = Vec::new();
+        for ts in ts_range.step_by(1000) {
+            out.extend(engine.observe(
+                dev,
+                &idle_sample(ts, util_pct),
+                procs,
+                Some(16 << 30),
+                None,
+            ));
+        }
+        out
+    }
+
+    /// A 14s trough after 30s of sustained activity, with python attached throughout,
+    /// narrates exactly one IdleGap when util recovers — hedged, with raw evidence.
+    #[test]
+    fn idle_gap_fires_once_on_recovery_and_is_hedged() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+        let procs = vec![python_proc()];
+
+        let active = drive(&mut engine, &dev, 0..=30_000, 92.0, &procs);
+        let during = drive(&mut engine, &dev, 31_000..=44_000, 2.0, &procs);
+        assert!(
+            active
+                .iter()
+                .chain(&during)
+                .all(|e| e.kind != EventKind::IdleGap),
+            "the gap must not narrate before it ends (its duration is unknown)"
+        );
+
+        let recovery = drive(&mut engine, &dev, 45_000..=45_000, 93.0, &procs);
+        let gaps: Vec<&Event> = recovery
+            .iter()
+            .filter(|e| e.kind == EventKind::IdleGap)
+            .collect();
+        assert_eq!(gaps.len(), 1, "exactly one IdleGap on recovery");
+        let e = gaps[0];
+        assert_eq!(e.confidence, Confidence::Likely, "a stall is an inference");
+        assert_eq!(e.severity, Severity::Info);
+        assert_eq!(
+            e.ts_ms, 45_000,
+            "event is stamped at gap end, from sample.ts_ms"
+        );
+        assert!(
+            e.title.contains("GPU0 sat idle 14s") && e.title.contains("python (pid 4521)"),
+            "title must name the span and the holder, got: {}",
+            e.title
+        );
+        assert!(
+            e.title.contains("likely"),
+            "inference must hedge: {}",
+            e.title
+        );
+        assert!(
+            e.evidence.contains("92%")
+                && e.evidence.contains("31000..45000")
+                && e.evidence.contains("pid 4521")
+                && e.evidence.contains("6.0 GiB"),
+            "evidence must carry the raw numbers, got: {}",
+            e.evidence
+        );
+
+        // Continued activity must not replay the gap.
+        let after = drive(&mut engine, &dev, 46_000..=60_000, 93.0, &procs);
+        assert!(after.iter().all(|e| e.kind != EventKind::IdleGap));
+    }
+
+    /// A 5s trough is a normal scheduling hiccup, not a stall — below the floor, silent.
+    #[test]
+    fn idle_gap_below_minimum_duration_is_silent() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        let procs = vec![python_proc()];
+
+        let mut all = drive(&mut engine, &dev, 0..=30_000, 92.0, &procs);
+        all.extend(drive(&mut engine, &dev, 31_000..=35_000, 2.0, &procs));
+        all.extend(drive(&mut engine, &dev, 36_000..=40_000, 93.0, &procs));
+        assert!(
+            all.iter().all(|e| e.kind != EventKind::IdleGap),
+            "a 5s gap is below IDLE_GAP_MIN_MS and must not narrate"
+        );
+    }
+
+    /// A trough with no process attached is just an idle GPU — narrating a "stall"
+    /// with nobody there to stall would be confidently wrong.
+    #[test]
+    fn idle_gap_without_attached_process_is_silent() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        let mut all = drive(&mut engine, &dev, 0..=30_000, 92.0, &[]);
+        all.extend(drive(&mut engine, &dev, 31_000..=44_000, 2.0, &[]));
+        all.extend(drive(&mut engine, &dev, 45_000..=50_000, 93.0, &[]));
+        assert!(
+            all.iter().all(|e| e.kind != EventKind::IdleGap),
+            "no holder process means no stall narration"
+        );
+    }
+
+    /// If the big-memory holder exits mid-gap, the process_exited fact already tells
+    /// the story; an IdleGap on top of it would double-count the same incident.
+    #[test]
+    fn idle_gap_suppressed_when_holder_exits_mid_gap() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        let procs = vec![python_proc()];
+
+        let mut all = drive(&mut engine, &dev, 0..=30_000, 92.0, &procs);
+        all.extend(drive(&mut engine, &dev, 31_000..=36_000, 2.0, &procs));
+        // python exits with the gap still open; the rest of the gap runs holder-less.
+        all.extend(drive(&mut engine, &dev, 37_000..=44_000, 2.0, &[]));
+        all.extend(drive(&mut engine, &dev, 45_000..=50_000, 93.0, &[]));
+
+        assert!(
+            all.iter().any(|e| e.kind == EventKind::ProcessExited),
+            "the exit itself must still be narrated as a fact"
+        );
+        assert!(
+            all.iter().all(|e| e.kind != EventKind::IdleGap),
+            "holder exited mid-gap: the exit event covers it, IdleGap must stay silent"
+        );
+    }
+
+    /// Without ≥30s of sustained activity beforehand, a trough is not a training stall
+    /// (a GPU that was barely working cannot "stall").
+    #[test]
+    fn idle_gap_requires_prior_sustained_activity() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        let procs = vec![python_proc()];
+
+        // Only 10s of activity: never qualifies as "active".
+        let mut all = drive(&mut engine, &dev, 0..=10_000, 92.0, &procs);
+        all.extend(drive(&mut engine, &dev, 11_000..=24_000, 2.0, &procs));
+        all.extend(drive(&mut engine, &dev, 25_000..=30_000, 93.0, &procs));
+        assert!(
+            all.iter().all(|e| e.kind != EventKind::IdleGap),
+            "no sustained activity before the trough — no stall to narrate"
         );
     }
 }

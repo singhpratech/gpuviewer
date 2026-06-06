@@ -62,8 +62,17 @@ pub fn all_backends(force_mock: bool) -> Vec<Box<dyn GpuBackend>> {
         Err(e) => eprintln!("gpuviewer: nvidia backend skipped: {e}"),
     }
 
-    // TODO(v1): amd (sysfs/hwmon/gpu_metrics/fdinfo, root-dir parameterized)
-    // TODO(v1): intel (fdinfo i915 + xe dialects, sysfs freq)
+    #[cfg(target_os = "linux")]
+    match crate::amd::AmdBackend::init() {
+        Ok(b) => backends.push(Box::new(b)),
+        Err(e) => eprintln!("gpuviewer: amd backend skipped: {e}"),
+    }
+
+    #[cfg(target_os = "linux")]
+    match crate::intel::IntelBackend::init() {
+        Ok(b) => backends.push(Box::new(b)),
+        Err(e) => eprintln!("gpuviewer: intel backend skipped: {e}"),
+    }
 
     if backends.is_empty() {
         backends.push(Box::new(crate::mock::MockBackend::new()));

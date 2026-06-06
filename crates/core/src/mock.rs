@@ -116,6 +116,7 @@ impl GpuBackend for MockBackend {
                 max_sm_clock_mhz: Some(2_520),
                 temp_slowdown_c: Some(84.0),
                 driver_version: Some("mock 999.99".into()),
+                process_hint: None,
             })
         } else if *dev == self.ids[1] {
             Ok(StaticInfo {
@@ -128,6 +129,7 @@ impl GpuBackend for MockBackend {
                 max_sm_clock_mhz: Some(2_500),
                 temp_slowdown_c: Some(110.0),
                 driver_version: Some("mock amdgpu".into()),
+                process_hint: None,
             })
         } else {
             Err(BackendError::DeviceNotFound(dev.clone()))

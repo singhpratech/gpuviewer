@@ -1,0 +1,6 @@
+# SYNTHETIC fixture (see the fixtures README) mirroring the libdrm amdgpu.ids format
+# device_id,	revision_id,	product_name
+1.0.0
+73FF,	C1,	AMD Radeon RX 6600
+744C,	C8,	AMD Radeon RX 7900 XTX
+744C,	CC,	AMD Radeon RX 7900 XT

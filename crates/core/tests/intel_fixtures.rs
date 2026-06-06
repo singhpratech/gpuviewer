@@ -1,0 +1,363 @@
+#![cfg(target_os = "linux")]
+//! Intel backend fixture tests — run against the SYNTHETIC trees under `tests/fixtures/`
+//! (see the README there). The two driver dialects are tested separately because they
+//! disagree on everything that matters: fdinfo keys, utilization math (i915 busy-ns over
+//! wall time vs xe busy-cycles over total-cycles), and sysfs freq layout. Mixing them up
+//! is the classic Intel porting bug these tests exist to prevent.
+
+use std::path::{Path, PathBuf};
+
+use gpuviewer_core::intel::IntelBackend;
+use gpuviewer_core::{BackendError, DeviceId, GpuBackend, ProcessKind, Vendor};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+// ---- i915 dialect (Arc A770 dGPU, kernel 6.8 ABI) ----
+
+#[test]
+fn i915_enumeration_and_static_info() {
+    let mut b = IntelBackend::with_root(fixture("intel-i915-kernel6.8")).unwrap();
+    let devs = b.devices();
+    assert_eq!(devs, vec![DeviceId("0000:03:00.0".into())]);
+
+    let info = b.static_info(&devs[0]).unwrap();
+    assert_eq!(info.vendor, Vendor::Intel);
+    assert_eq!(info.backend, "intel");
+    // 8086:56a0 is in the well-known-id table.
+    assert_eq!(info.name, "Intel Arc A770");
+    // Dedicated VRAM from card-level lmem_total_bytes (16 GiB), bytes as-is.
+    assert_eq!(info.mem_total_bytes, Some(17_179_869_184));
+    // power1_max is MICROwatts: 190000000 µW must become 190000 mW (190 W).
+    assert_eq!(info.power_limit_mw, Some(190_000));
+    // gt_RP0_freq_mhz (2400) is the hardware max — NOT the gt_max_freq_mhz user cap,
+    // which this fixture deliberately sets lower (2000) so reading the wrong file fails.
+    assert_eq!(info.max_sm_clock_mhz, Some(2400));
+    assert_eq!(info.driver_version, None);
+    // The fixture root has no proc/self/status, so privilege is unknown → the backend
+    // must claim incompleteness rather than overpromise.
+    assert_eq!(
+        info.process_hint.as_deref(),
+        Some("showing your processes only — others need root or CAP_SYS_PTRACE (fdinfo)")
+    );
+}
+
+#[test]
+fn i915_dynamic_sample_prefers_actual_freq_and_stays_honest() {
+    let mut b = IntelBackend::with_root(fixture("intel-i915-kernel6.8")).unwrap();
+    let dev = b.devices().remove(0);
+
+    let s = b.refresh_dynamic(&dev).unwrap();
+    // gt_act_freq_mhz (measured, 1850) wins over gt_cur_freq_mhz (requested, 2100).
+    assert_eq!(s.sm_clock_mhz, Some(1850));
+    // Device-level busyness needs the perf PMU (root/CAP_PERFMON): honest None.
+    assert_eq!(s.util_pct, None);
+    // No device-wide VRAM-used counter on Intel: honest None.
+    assert_eq!(s.mem_used_bytes, None);
+    // hwmon has no temp on kernel 6.8 (the i915 gate is 6.12+) and never a fan max.
+    assert_eq!(s.temp_c, None);
+    assert_eq!(s.fan_pct, None);
+    // Power is derived from the cumulative energy counter: no baseline on the first
+    // sighting → None, never a fabricated 0 W.
+    assert_eq!(s.power_mw, None);
+    assert_eq!(s.mem_clock_mhz, None);
+    assert_eq!(s.encoder_pct, None);
+    assert_eq!(s.decoder_pct, None);
+    assert!(
+        !s.throttle.any(),
+        "no throttle_reason_* decoder yet — throttle bits must not be faked"
+    );
+}
+
+#[test]
+fn i915_act_freq_absence_falls_back_to_cur_freq() {
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-i915-freq-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.8"), &scratch);
+    std::fs::remove_file(scratch.join("sys/class/drm/card1/gt_act_freq_mhz")).unwrap();
+
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let s = b.refresh_dynamic(&dev).unwrap();
+    assert_eq!(s.sm_clock_mhz, Some(2100));
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn i915_act_freq_zero_means_gt_asleep_not_zero_mhz() {
+    // act_freq reads 0 while the GT is power-gated in RC6 — that is "not clocked right
+    // now", not a measured 0 MHz, and must surface as None (never as the requested
+    // cur_freq either: the GT is asleep, claiming the requested clock would be a lie).
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-i915-rc6-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.8"), &scratch);
+    std::fs::write(scratch.join("sys/class/drm/card1/gt_act_freq_mhz"), "0\n").unwrap();
+
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    assert_eq!(b.refresh_dynamic(&dev).unwrap().sm_clock_mhz, None);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn i915_power_appears_on_second_energy_sighting() {
+    // The energy1_input µJ counter only yields power as a delta between two sightings —
+    // this pins the per-device watermark plumbing in refresh_dynamic (the exact µJ/ms
+    // math is unit-tested; wall time here is real, so only Some-ness is asserted).
+    let scratch =
+        std::env::temp_dir().join(format!("gpuviewer-i915-energy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.8"), &scratch);
+    let energy = scratch.join("sys/class/drm/card1/device/hwmon/hwmon5/energy1_input");
+
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    assert_eq!(b.refresh_dynamic(&dev).unwrap().power_mw, None);
+
+    // Bump the cumulative counter by 6 J across a real wall delta: power must appear.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let cur: u64 = std::fs::read_to_string(&energy)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::fs::write(&energy, format!("{}\n", cur + 6_000_000)).unwrap();
+    let power = b.refresh_dynamic(&dev).unwrap().power_mw;
+    assert!(
+        power.is_some_and(|mw| mw > 0),
+        "second energy sighting must derive a positive power, got {power:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn i915_fdinfo_processes() {
+    let mut b = IntelBackend::with_root(fixture("intel-i915-kernel6.8")).unwrap();
+    let dev = b.devices().remove(0);
+
+    let procs = b.refresh_processes(&dev).unwrap();
+    assert_eq!(
+        procs.len(),
+        3,
+        "the pid on the other GPU's pdev must be filtered out"
+    );
+
+    let ffplay = &procs[0];
+    assert_eq!((ffplay.pid, ffplay.name.as_str()), (3100, "ffplay"));
+    // drm-engine-video > 0 ns is decisively media.
+    assert_eq!(ffplay.kind, ProcessKind::Graphics);
+    // Max across the pid's two fds: 786432 KiB → 805306368 bytes — never the 4096 KiB
+    // fd, and never a sum of the two.
+    assert_eq!(ffplay.mem_bytes, Some(805_306_368));
+
+    let blender = &procs[1];
+    assert_eq!((blender.pid, blender.name.as_str()), (5200, "blender"));
+    // Render-only could be 3D or pre-CCS GPGPU — Unknown, not a guess.
+    assert_eq!(blender.kind, ProcessKind::Unknown);
+    assert_eq!(blender.mem_bytes, Some(2_147_483_648));
+
+    let py = &procs[2];
+    assert_eq!((py.pid, py.name.as_str()), (6300, "python3"));
+    // drm-engine-compute > 0 ns is decisive.
+    assert_eq!(py.kind, ProcessKind::Compute);
+    assert_eq!(py.mem_bytes, Some(6_442_450_944));
+
+    // First sighting has no engine-ns baseline.
+    assert!(procs.iter().all(|p| p.util_pct.is_none()));
+}
+
+#[test]
+fn i915_util_is_render_ns_delta_over_wall_time() {
+    // Watermark plumbing needs a counter that moves, so this test works on a scratch
+    // copy of the fixture rather than the committed tree.
+    let scratch =
+        std::env::temp_dir().join(format!("gpuviewer-i915-fixture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.8"), &scratch);
+
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let first = b.refresh_processes(&dev).unwrap();
+    assert!(first.iter().all(|p| p.util_pct.is_none()));
+
+    // Advance ffplay's cumulative render-ns far past 100% of any plausible wall delta:
+    // utilization must clamp, proving delta/wall (not the raw counter) is reported.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let fd = scratch.join("proc/3100/fdinfo/7");
+    let bumped = std::fs::read_to_string(&fd).unwrap().replace(
+        "drm-engine-render:\t4500000000 ns",
+        "drm-engine-render:\t901500000000 ns",
+    );
+    std::fs::write(&fd, bumped).unwrap();
+
+    let second = b.refresh_processes(&dev).unwrap();
+    let ffplay = second.iter().find(|p| p.pid == 3100).unwrap();
+    assert_eq!(ffplay.util_pct, Some(100.0));
+    // blender's counter did not move: 0 busy-ns over the same wall = 0%.
+    let blender = second.iter().find(|p| p.pid == 5200).unwrap();
+    assert_eq!(blender.util_pct, Some(0.0));
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+// ---- xe dialect (Arc B580 dGPU, kernel 6.11 ABI) ----
+
+#[test]
+fn xe_enumeration_and_static_info() {
+    let mut b = IntelBackend::with_root(fixture("intel-xe-kernel6.11")).unwrap();
+    let devs = b.devices();
+    assert_eq!(devs, vec![DeviceId("0000:03:00.0".into())]);
+
+    let info = b.static_info(&devs[0]).unwrap();
+    assert_eq!(info.vendor, Vendor::Intel);
+    assert_eq!(info.name, "Intel Arc B580");
+    // xe exposes no VRAM-total sysfs — None is honest even on a dGPU with VRAM.
+    assert_eq!(info.mem_total_bytes, None);
+    assert_eq!(info.power_limit_mw, Some(190_000));
+    // tile0/gt0/freq0/rp0_freq (2850) is the hardware max — NOT the max_freq user cap,
+    // which this fixture deliberately sets lower (2600) so reading the wrong file fails.
+    assert_eq!(info.max_sm_clock_mhz, Some(2850));
+    assert_eq!(
+        info.process_hint.as_deref(),
+        Some("showing your processes only — others need root or CAP_SYS_PTRACE (fdinfo)")
+    );
+}
+
+#[test]
+fn xe_dynamic_sample_reads_tile_gt_freq() {
+    let mut b = IntelBackend::with_root(fixture("intel-xe-kernel6.11")).unwrap();
+    let dev = b.devices().remove(0);
+
+    let s = b.refresh_dynamic(&dev).unwrap();
+    // tile0/gt0/freq0/act_freq (measured, 2400) wins over cur_freq (requested, 2700).
+    assert_eq!(s.sm_clock_mhz, Some(2400));
+    assert_eq!(s.util_pct, None);
+    assert_eq!(s.mem_used_bytes, None);
+    // xe hwmon has no temp until 6.15 and no fan until 6.16 — None is the 6.11 truth.
+    assert_eq!(s.temp_c, None);
+    assert_eq!(s.fan_pct, None);
+    assert_eq!(s.power_mw, None); // first energy sighting has no baseline
+    assert!(!s.throttle.any());
+}
+
+#[test]
+fn xe_fdinfo_processes() {
+    let mut b = IntelBackend::with_root(fixture("intel-xe-kernel6.11")).unwrap();
+    let dev = b.devices().remove(0);
+
+    let procs = b.refresh_processes(&dev).unwrap();
+    assert_eq!(procs.len(), 2);
+
+    let shell = &procs[0];
+    assert_eq!((shell.pid, shell.name.as_str()), (2600, "gnome-shell"));
+    // rcs-only activity (vcs and ccs both 0 cycles): honestly Unknown, not a guess.
+    assert_eq!(shell.kind, ProcessKind::Unknown);
+    assert_eq!(shell.mem_bytes, Some(536_870_912)); // drm-total-vram0: 524288 KiB
+
+    let py = &procs[1];
+    assert_eq!((py.pid, py.name.as_str()), (4400, "python3"));
+    // drm-cycles-ccs > 0 is decisive.
+    assert_eq!(py.kind, ProcessKind::Compute);
+    // drm-total-vram0 (2097152 KiB) wins over drm-resident-vram0 (1048576 KiB).
+    assert_eq!(py.mem_bytes, Some(2_147_483_648));
+
+    // First sighting has no cycle baseline.
+    assert!(procs.iter().all(|p| p.util_pct.is_none()));
+}
+
+#[test]
+fn xe_util_is_cycles_delta_over_total_cycles_not_wall_time() {
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-xe-fixture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-xe-kernel6.11"), &scratch);
+
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let first = b.refresh_processes(&dev).unwrap();
+    assert!(first.iter().all(|p| p.util_pct.is_none()));
+
+    // Advance python3 by hand-picked deltas: +600,000 busy cycles over +1,200,000
+    // total cycles = exactly 50%. The second scan happens milliseconds after the
+    // first, so an implementation that wrongly divided by wall time (the i915 math —
+    // the classic xe porting bug) would clamp to 100% here, not produce 50%.
+    let fd = scratch.join("proc/4400/fdinfo/9");
+    let bumped = std::fs::read_to_string(&fd)
+        .unwrap()
+        .replace("drm-cycles-rcs:\t1000000", "drm-cycles-rcs:\t1600000")
+        .replace(
+            "drm-total-cycles-rcs:\t50000000",
+            "drm-total-cycles-rcs:\t51200000",
+        );
+    std::fs::write(&fd, bumped).unwrap();
+    // gnome-shell's base advances but its busy cycles do not: exactly 0%.
+    let fd = scratch.join("proc/2600/fdinfo/6");
+    let bumped = std::fs::read_to_string(&fd).unwrap().replace(
+        "drm-total-cycles-rcs:\t50000000",
+        "drm-total-cycles-rcs:\t51200000",
+    );
+    std::fs::write(&fd, bumped).unwrap();
+
+    let second = b.refresh_processes(&dev).unwrap();
+    let py = second.iter().find(|p| p.pid == 4400).unwrap();
+    assert_eq!(py.util_pct, Some(50.0));
+    let shell = second.iter().find(|p| p.pid == 2600).unwrap();
+    assert_eq!(shell.util_pct, Some(0.0));
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+// ---- degradation cases ----
+
+#[test]
+fn igpu_minimal_everything_optional_is_none() {
+    let mut b = IntelBackend::with_root(fixture("intel-igpu-minimal")).unwrap();
+    let devs = b.devices();
+    assert_eq!(devs, vec![DeviceId("0000:00:02.0".into())]);
+
+    let info = b.static_info(&devs[0]).unwrap();
+    assert_eq!(info.name, "Intel GPU [8086:46a6]"); // not in the table → PCI-id fallback
+                                                    // No lmem_total_bytes: the iGPU shares system RAM, which must NOT appear as VRAM.
+    assert_eq!(info.mem_total_bytes, None);
+    assert_eq!(info.power_limit_mw, None); // no hwmon at all — the normal iGPU case
+    assert_eq!(info.max_sm_clock_mhz, None);
+
+    let s = b.refresh_dynamic(&devs[0]).unwrap();
+    assert_eq!(s.util_pct, None);
+    assert_eq!(s.mem_used_bytes, None);
+    assert_eq!(s.temp_c, None);
+    assert_eq!(s.power_mw, None);
+    assert_eq!(s.fan_pct, None);
+    assert_eq!(s.sm_clock_mhz, None);
+    assert_eq!(s.mem_clock_mhz, None);
+
+    // No proc tree at all: an empty process list, never an error.
+    assert!(b.refresh_processes(&devs[0]).unwrap().is_empty());
+}
+
+#[test]
+fn no_intel_devices_is_a_clean_unavailable() {
+    // The fixtures directory itself has no sys/class/drm — init must report Unavailable,
+    // which the registry treats as a normal skipped backend.
+    match IntelBackend::with_root(fixture("")) {
+        Err(e) => assert!(matches!(e, BackendError::Unavailable(_))),
+        Ok(_) => panic!("expected Unavailable for a tree without sys/class/drm"),
+    }
+}
+
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap().flatten() {
+        let to = dst.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}

@@ -34,6 +34,7 @@ pub enum EventKind {
     ProcessAttached,
     ProcessExited,
     VramPressure,
+    IdleGap,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +57,15 @@ const VRAM_PRESSURE_FRAC: f64 = 0.85;
 const VRAM_MIN_SLOPE_BYTES_PER_MIN: f64 = 16.0 * 1024.0 * 1024.0;
 const VRAM_COOLDOWN_MS: u64 = 90_000;
 
+/// Idle-gap (training stall) thresholds: a gap only narrates after sustained activity,
+/// only once it lasted long enough to matter, and only if a real allocation stayed
+/// attached throughout — otherwise it is just an idle GPU, not a stall.
+const IDLE_ACTIVE_UTIL_PCT: f32 = 50.0;
+const IDLE_ACTIVE_MIN_MS: u64 = 30_000;
+const IDLE_GAP_UTIL_PCT: f32 = 10.0;
+const IDLE_GAP_MIN_MS: u64 = 10_000;
+const IDLE_HOLDER_MIN_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Default)]
 struct DevState {
     prev: Option<DynamicSample>,
@@ -66,6 +76,27 @@ struct DevState {
     pre_throttle_clock: Option<u32>,
     vram_window: VecDeque<(u64, u64)>,
     last_pressure_evt: Option<u64>,
+    /// ts when util first crossed `IDLE_ACTIVE_UTIL_PCT`; None while below it.
+    active_since: Option<u64>,
+    /// Latched after `IDLE_ACTIVE_MIN_MS` of sustained activity: a trough only reads
+    /// as a training stall if real work preceded it (a desktop idling is no story).
+    idle_eligible: bool,
+    idle_gap: Option<IdleGap>,
+}
+
+/// An idle gap in flight: narrated (or discarded) only once util recovers and the
+/// gap's duration is actually known.
+struct IdleGap {
+    start_ms: u64,
+    /// Util of the sample just before the drop, for the "92% → 2%" evidence.
+    pre_util_pct: f32,
+    /// Running mean of util inside the gap (sum and sample count).
+    util_sum: f64,
+    util_n: u32,
+    /// pid → (name, mem at gap start) for processes holding ≥ `IDLE_HOLDER_MIN_BYTES`
+    /// when the gap opened; pruned as they exit. Empty at gap end means nobody stayed
+    /// attached, so the process_exited event already tells the story.
+    holders: HashMap<u32, (String, u64)>,
 }
 
 #[derive(Default)]
@@ -105,6 +136,8 @@ impl EventEngine {
 
         throttle_events(st, device, &name, sample, temp_slowdown_c, &mut out);
         process_events(st, device, &name, sample.ts_ms, processes, &mut out);
+        // After process_events, so holder tracking sees this tick's process list.
+        idle_gap_events(st, device, &name, sample, &mut out);
         vram_pressure_events(st, device, &name, sample, mem_total, &mut out);
 
         st.prev = Some(sample.clone());
@@ -234,6 +267,104 @@ fn process_events(
     }
     st.seen_first_procs = true;
     st.procs = now.into_iter().map(|(k, v)| (k, v.clone())).collect();
+}
+
+fn idle_gap_events(
+    st: &mut DevState,
+    device: &DeviceId,
+    name: &str,
+    sample: &DynamicSample,
+    out: &mut Vec<Event>,
+) {
+    let Some(util) = sample.util_pct else {
+        // Utilization went unavailable: we can no longer see activity or idleness, so
+        // any gap claim from here on would be guesswork. Drop all tracking instead.
+        st.active_since = None;
+        st.idle_eligible = false;
+        st.idle_gap = None;
+        return;
+    };
+
+    if let Some(mut gap) = st.idle_gap.take() {
+        // Holders must stay attached for the WHOLE gap; one that exits mid-gap is
+        // already narrated by process_exited — an idle_gap on top would double-count.
+        gap.holders.retain(|pid, _| st.procs.contains_key(pid));
+
+        if util < IDLE_ACTIVE_UTIL_PCT {
+            gap.util_sum += util as f64;
+            gap.util_n += 1;
+            st.idle_gap = Some(gap);
+            return;
+        }
+
+        // Gap over — its duration is finally known, so decide whether it narrates.
+        let dur_ms = sample.ts_ms.saturating_sub(gap.start_ms);
+        let holder = gap
+            .holders
+            .iter()
+            .max_by_key(|(_, (_, mem))| *mem)
+            .map(|(pid, (pname, mem))| (*pid, pname.clone(), *mem));
+        if dur_ms >= IDLE_GAP_MIN_MS {
+            if let Some((pid, pname, mem)) = holder {
+                let dur = fmt_dur_ms(dur_ms);
+                let mean_util = gap.util_sum / gap.util_n.max(1) as f64;
+                out.push(Event {
+                    ts_ms: sample.ts_ms,
+                    device: device.clone(),
+                    kind: EventKind::IdleGap,
+                    severity: Severity::Info,
+                    confidence: Confidence::Likely,
+                    title: format!(
+                        "{name} sat idle {dur} while {pname} (pid {pid}) stayed attached \
+                         — likely a dataloader or checkpoint stall"
+                    ),
+                    evidence: format!(
+                        "util {:.0}% → mean {mean_util:.1}% over {dur} ({}..{} ms); \
+                         {pname} (pid {pid}) held {} for the whole gap",
+                        gap.pre_util_pct,
+                        gap.start_ms,
+                        sample.ts_ms,
+                        fmt_bytes(mem),
+                    ),
+                });
+            }
+        }
+        // Recovery starts a fresh activity clock: the next gap only narrates after the
+        // device has re-earned IDLE_ACTIVE_MIN_MS of sustained work.
+        st.active_since = Some(sample.ts_ms);
+        st.idle_eligible = false;
+        return;
+    }
+
+    if util >= IDLE_ACTIVE_UTIL_PCT {
+        let since = *st.active_since.get_or_insert(sample.ts_ms);
+        if sample.ts_ms.saturating_sub(since) >= IDLE_ACTIVE_MIN_MS {
+            st.idle_eligible = true;
+        }
+        return;
+    }
+
+    st.active_since = None;
+    if util >= IDLE_GAP_UTIL_PCT || !st.idle_eligible {
+        return;
+    }
+    // Gap opens. Capture who is attached with a real allocation right now; only they
+    // can anchor the "stayed attached" claim when the gap ends.
+    let holders: HashMap<u32, (String, u64)> = st
+        .procs
+        .values()
+        .filter_map(|p| {
+            let mem = p.mem_bytes?;
+            (mem >= IDLE_HOLDER_MIN_BYTES).then(|| (p.pid, (p.name.clone(), mem)))
+        })
+        .collect();
+    st.idle_gap = Some(IdleGap {
+        start_ms: sample.ts_ms,
+        pre_util_pct: st.prev.as_ref().and_then(|p| p.util_pct).unwrap_or(util),
+        util_sum: util as f64,
+        util_n: 1,
+        holders,
+    });
 }
 
 fn vram_pressure_events(

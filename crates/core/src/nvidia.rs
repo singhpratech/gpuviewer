@@ -9,6 +9,9 @@
 //! - Throttle mapping is edge-honest: persistent configuration states (GPU idle,
 //!   applications-clocks setting, display clocks) are deliberately NOT narrated as
 //!   throttling — only real slowdown reasons are.
+//! - WSL2 is detected once at init: per-process GPU info is N/A *at the driver level*
+//!   there, so `StaticInfo::process_hint` explains the empty process table up front
+//!   instead of crashing on it (nvtop #432 is the cautionary tale).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -29,12 +32,37 @@ fn opt<T, E>(r: Result<T, E>) -> Option<T> {
     r.ok()
 }
 
+/// WSL kernels self-identify via the release string (e.g.
+/// `5.15.167.4-microsoft-standard-WSL2`; WSL1-era kernels used capital-M `Microsoft`).
+#[cfg(any(target_os = "linux", test))]
+fn is_wsl(osrelease: &str) -> bool {
+    osrelease.to_ascii_lowercase().contains("microsoft")
+}
+
+/// `StaticInfo::process_hint` for environments where the process list is known-absent.
+/// WSL2 passes the GPU through but exposes no per-process info at the driver level —
+/// say so up front instead of rendering a silently-empty table. A failed read just means
+/// "nothing to explain"; this must never fail init.
+fn wsl_process_hint() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|rel| is_wsl(&rel)) {
+        return Some(
+            "per-process GPU info is unavailable under WSL2 (driver-level limitation) — \
+             device metrics are unaffected"
+                .into(),
+        );
+    }
+    None
+}
+
 pub struct NvidiaBackend {
     nvml: Nvml,
     /// (nvml index, stable id) established at init.
     devs: Vec<(u32, DeviceId)>,
     /// Per-device watermark for `process_utilization_stats` sampling.
     last_util_ts: HashMap<u32, u64>,
+    /// Set once at init: explanation for a known-incomplete process list (WSL2), if any.
+    process_hint: Option<String>,
 }
 
 impl NvidiaBackend {
@@ -72,6 +100,7 @@ impl NvidiaBackend {
             nvml,
             devs,
             last_util_ts: HashMap::new(),
+            process_hint: wsl_process_hint(),
         })
     }
 
@@ -158,6 +187,7 @@ impl GpuBackend for NvidiaBackend {
             temp_slowdown_c: opt(d.temperature_threshold(TemperatureThreshold::Slowdown))
                 .map(|t| t as f32),
             driver_version: opt(self.nvml.sys_driver_version()),
+            process_hint: self.process_hint.clone(),
         })
     }
 
@@ -245,5 +275,20 @@ impl GpuBackend for NvidiaBackend {
         }
 
         Ok(by_pid.into_values().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_wsl;
+
+    #[test]
+    fn is_wsl_matches_real_kernel_release_strings() {
+        // Current WSL2 naming and the WSL1-era capital-M variant must both match.
+        assert!(is_wsl("5.15.167.4-microsoft-standard-WSL2"));
+        assert!(is_wsl("4.4.0-19041-Microsoft"));
+        // Regular distro kernels must not.
+        assert!(!is_wsl("6.17.0-35-generic"));
+        assert!(!is_wsl(""));
     }
 }

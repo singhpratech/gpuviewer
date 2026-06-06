@@ -49,6 +49,9 @@ pub struct StaticInfo {
     /// Temperature at which the driver starts thermal slowdown, if exposed.
     pub temp_slowdown_c: Option<f32>,
     pub driver_version: Option<String>,
+    /// One-line explanation of why the process list may be incomplete or absent (WSL2
+    /// driver limitation, privilege wall); `None` when there is nothing to explain.
+    pub process_hint: Option<String>,
 }
 
 /// Decoded throttle/clocks-event reasons. Decoding is tolerant: unknown future bits land in

@@ -5,8 +5,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind};
+use ratatui::layout::Rect;
+use ratatui::{TerminalOptions, Viewport};
 
 use crate::collector::Collector;
+
+/// Viewport assumed when the terminal reports a 0×0 size (bare ptys: `script`, some CI).
+const FALLBACK_SIZE: (u16, u16) = (80, 24);
 
 pub struct App {
     pub selected: usize,
@@ -26,7 +31,22 @@ impl App {
     }
 
     pub fn run(mut self) -> Result<()> {
-        let mut terminal = ratatui::init();
+        // A bare pty (e.g. `script` captures) reports a 0×0 size; the fullscreen viewport
+        // would autoresize to an empty buffer and draw nothing. Pin a fixed 80×24 viewport
+        // instead — `Viewport::Fixed` is never autoresized, and a pty that can't report a
+        // size won't deliver meaningful resize events either. Real terminals report a
+        // nonzero size and keep the normal resize-tracking fullscreen path.
+        let zero_sized = ratatui::crossterm::terminal::size()
+            .map(|(w, h)| w == 0 || h == 0)
+            .unwrap_or(false);
+        let mut terminal = if zero_sized {
+            let (w, h) = FALLBACK_SIZE;
+            ratatui::init_with_options(TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, w, h)),
+            })
+        } else {
+            ratatui::init()
+        };
         let res = self.event_loop(&mut terminal);
         ratatui::restore();
         res

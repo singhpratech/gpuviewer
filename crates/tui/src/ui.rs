@@ -48,7 +48,7 @@ pub fn render(f: &mut Frame, app: &App, shared: &Shared) {
     }
 
     render_story(f, story_a, shared);
-    render_footer(f, footer_a, app);
+    render_footer(f, footer_a, app, shared.mock);
 }
 
 fn render_tabs(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
@@ -242,7 +242,7 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
     );
 }
 
-fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, _info: &StaticInfo) {
+fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &StaticInfo) {
     let mut procs = shared.processes[app.selected].clone();
     procs.sort_by_key(|p| std::cmp::Reverse(p.mem_bytes.unwrap_or(0)));
 
@@ -261,6 +261,15 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, _info
         })
         .collect();
 
+    let mut block = Block::default().borders(Borders::ALL).title(" processes ");
+    if let Some(hint) = &info.process_hint {
+        // Explain a known-incomplete process list (WSL2 driver limitation, privilege
+        // wall) right where the user is looking for the missing rows.
+        block = block.title_bottom(Line::styled(
+            format!(" {hint} "),
+            Style::default().fg(Color::DarkGray).italic(),
+        ));
+    }
     let table = Table::new(
         rows,
         [
@@ -278,7 +287,7 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, _info
                 .fg(Color::DarkGray),
         ),
     )
-    .block(Block::default().borders(Borders::ALL).title(" processes "));
+    .block(block);
     f.render_widget(table, area);
 }
 
@@ -329,12 +338,96 @@ fn event_line(e: &Event) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+fn render_footer(f: &mut Frame, area: Rect, app: &App, mock: bool) {
     let paused = if app.paused() { " · PAUSED" } else { "" };
+    // "(mock data)" must appear exactly when the data IS mock: a footer that calls
+    // live NVML data mock (or vice versa) is the confidently-wrong labeling this
+    // product exists to avoid.
+    let mock_tag = if mock { " (mock data)" } else { "" };
     let line = Line::from(format!(
-        " q quit · ←/→/tab device · p pause{paused}  —  gpuviewer (mock data)"
+        " q quit · ←/→/tab device · p pause{paused}  —  gpuviewer{mock_tag}"
     ))
     .style(Style::default().fg(Color::DarkGray))
     .alignment(Alignment::Left);
     f.render_widget(line, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use crate::app::App;
+    use crate::collector::{Collector, Engine};
+
+    /// The processes pane must surface `StaticInfo::process_hint` (the WSL2 / privilege
+    /// wall explanation) when present, and render unchanged when it is `None` — the mock
+    /// sets `None`, so only this test exercises the `Some` branch.
+    #[test]
+    fn process_hint_renders_in_processes_pane() {
+        // Long interval: the collector thread stays quiet while we drive draws by hand.
+        let collector = Collector::start(Engine::new(true), Duration::from_secs(3600));
+        let shared = Arc::clone(&collector.shared);
+        let app = App::new(collector);
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        // Baseline: no hint (mock default) renders without it.
+        {
+            let sh = shared.lock().unwrap();
+            terminal.draw(|f| super::render(f, &app, &sh)).unwrap();
+        }
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("processes"));
+        assert!(!screen.contains("your processes only"));
+
+        // With a hint on the selected device, the pane shows it.
+        shared.lock().unwrap().infos[0].process_hint = Some("your processes only".into());
+        {
+            let sh = shared.lock().unwrap();
+            terminal.draw(|f| super::render(f, &app, &sh)).unwrap();
+        }
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("your processes only"),
+            "process_hint missing from processes pane:\n{screen}"
+        );
+    }
+
+    /// The footer's "(mock data)" tag must track the actual data source — it was once
+    /// hardcoded, calling live NVML data mock. The mock engine asserts the tag; then
+    /// flipping `Shared::mock` (what a real backend produces) asserts its absence.
+    #[test]
+    fn footer_mock_tag_tracks_data_source() {
+        let collector = Collector::start(Engine::new(true), Duration::from_secs(3600));
+        let shared = Arc::clone(&collector.shared);
+        let app = App::new(collector);
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        // Mock engine: the footer says so.
+        {
+            let sh = shared.lock().unwrap();
+            terminal.draw(|f| super::render(f, &app, &sh)).unwrap();
+        }
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("(mock data)"),
+            "mock data must be labeled mock:\n{screen}"
+        );
+
+        // Live data must never carry the mock tag.
+        shared.lock().unwrap().mock = false;
+        {
+            let sh = shared.lock().unwrap();
+            terminal.draw(|f| super::render(f, &app, &sh)).unwrap();
+        }
+        let screen = terminal.backend().to_string();
+        assert!(
+            !screen.contains("(mock data)"),
+            "live data must not be labeled mock:\n{screen}"
+        );
+        assert!(screen.contains("gpuviewer"), "footer brand text missing");
+    }
 }
