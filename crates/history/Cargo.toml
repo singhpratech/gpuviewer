@@ -1,0 +1,10 @@
+[package]
+name = "gpuviewer-history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "History store for gpuviewer: RAM rings for the live window, SQLite rollups later"
+
+[dependencies]
+gpuviewer-core.workspace = true
