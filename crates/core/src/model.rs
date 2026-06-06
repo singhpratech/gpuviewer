@@ -116,12 +116,23 @@ pub enum ProcessKind {
 }
 
 impl ProcessKind {
+    /// nvidia-smi-style short code for the TUI process table.
     pub fn label(self) -> &'static str {
         match self {
             ProcessKind::Compute => "C",
             ProcessKind::Graphics => "G",
             ProcessKind::Both => "C+G",
             ProcessKind::Unknown => "?",
+        }
+    }
+
+    /// Prose form for event evidence ("new compute client", not "new C client").
+    pub fn prose(self) -> &'static str {
+        match self {
+            ProcessKind::Compute => "compute",
+            ProcessKind::Graphics => "graphics",
+            ProcessKind::Both => "compute+graphics",
+            ProcessKind::Unknown => "unknown-type",
         }
     }
 }

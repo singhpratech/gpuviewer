@@ -85,7 +85,10 @@ impl EventEngine {
     }
 
     fn short(&self, id: &DeviceId) -> String {
-        self.short_names.get(id).cloned().unwrap_or_else(|| id.0.clone())
+        self.short_names
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.0.clone())
     }
 
     pub fn observe(
@@ -186,7 +189,10 @@ fn process_events(
     if st.seen_first_procs {
         for (pid, p) in &now {
             if !st.procs.contains_key(pid) {
-                let mem = p.mem_bytes.map(|b| format!(", using {}", fmt_bytes(b))).unwrap_or_default();
+                let mem = p
+                    .mem_bytes
+                    .map(|b| format!(", using {}", fmt_bytes(b)))
+                    .unwrap_or_default();
                 out.push(Event {
                     ts_ms,
                     device: device.clone(),
@@ -194,14 +200,21 @@ fn process_events(
                     severity: Severity::Info,
                     confidence: Confidence::Fact,
                     title: format!("{} (pid {}) attached to {name}{mem}", p.name, pid),
-                    evidence: format!("new {} client in process list", p.kind.label()),
+                    evidence: format!("new {} client in process list", p.kind.prose()),
                 });
             }
         }
-        let gone: Vec<ProcessSample> =
-            st.procs.values().filter(|p| !now.contains_key(&p.pid)).cloned().collect();
+        let gone: Vec<ProcessSample> = st
+            .procs
+            .values()
+            .filter(|p| !now.contains_key(&p.pid))
+            .cloned()
+            .collect();
         for p in gone {
-            let freed = p.mem_bytes.map(|b| format!(", freeing {}", fmt_bytes(b))).unwrap_or_default();
+            let freed = p
+                .mem_bytes
+                .map(|b| format!(", freeing {}", fmt_bytes(b)))
+                .unwrap_or_default();
             out.push(Event {
                 ts_ms,
                 device: device.clone(),
@@ -212,7 +225,9 @@ fn process_events(
                 evidence: format!(
                     "pid {} no longer in process list; last seen holding {}",
                     p.pid,
-                    p.mem_bytes.map(fmt_bytes).unwrap_or_else(|| "unknown memory".into())
+                    p.mem_bytes
+                        .map(fmt_bytes)
+                        .unwrap_or_else(|| "unknown memory".into())
                 ),
             });
         }
@@ -234,6 +249,15 @@ fn vram_pressure_events(
     };
     if total == 0 {
         return;
+    }
+
+    // A sharp drop (process exit, allocator reset) invalidates the trend: an endpoint
+    // slope over a window straddling the old peak would understate the *current* climb
+    // rate — wrong in the dangerous direction. Restart the window instead.
+    if let Some(&(_, last_used)) = st.vram_window.back() {
+        if last_used.saturating_sub(used) > total / 20 {
+            st.vram_window.clear();
+        }
     }
 
     st.vram_window.push_back((sample.ts_ms, used));
@@ -310,7 +334,8 @@ fn t_span(a: &(u64, u64), b: &(u64, u64)) -> u64 {
 }
 
 fn fmt_dur_ms(ms: u64) -> String {
-    let s = ms / 1000;
+    // Round to nearest second — a 3.9s episode is "4s", not "3s".
+    let s = (ms + 500) / 1000;
     if s >= 60 {
         format!("{}m {}s", s / 60, s % 60)
     } else {

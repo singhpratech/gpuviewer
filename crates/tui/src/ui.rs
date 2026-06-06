@@ -60,7 +60,9 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
             Line::from(vec![
                 Span::styled(
                     format!(" {} ", i),
-                    Style::default().fg(Color::Black).bg(vendor_color(info.vendor)),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(vendor_color(info.vendor)),
                 ),
                 Span::raw(format!(" {} ", info.name)),
             ])
@@ -228,7 +230,11 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         .unwrap_or(0.0);
     f.render_widget(
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" fan · clock "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" fan · clock "),
+            )
             .ratio(fan_ratio)
             .gauge_style(Style::default().fg(Color::Blue))
             .label(format!("{fan} · {clk}")),
@@ -248,7 +254,9 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, _info
                 p.name.clone(),
                 p.kind.label().to_string(),
                 p.mem_bytes.map(fmt_bytes).unwrap_or_else(|| "—".into()),
-                p.util_pct.map(|u| format!("{u:.0}%")).unwrap_or_else(|| "—".into()),
+                p.util_pct
+                    .map(|u| format!("{u:.0}%"))
+                    .unwrap_or_else(|| "—".into()),
             ])
         })
         .collect();
@@ -264,8 +272,11 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, _info
         ],
     )
     .header(
-        Row::new(vec!["pid", "name", "type", "mem", "util"])
-            .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::DarkGray)),
+        Row::new(vec!["pid", "name", "type", "mem", "util"]).style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::DarkGray),
+        ),
     )
     .block(Block::default().borders(Borders::ALL).title(" processes "));
     f.render_widget(table, area);

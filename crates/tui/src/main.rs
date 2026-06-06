@@ -5,7 +5,7 @@
 //!   gpuviewer --json          stream one NDJSON frame per tick to stdout
 //!   gpuviewer --json --once   print a single frame and exit
 //!
-//! Flags: --mock (force the mock backend), --interval <ms> (default 1000).
+//! Flags: --mock (use only the simulated GPUs), --interval <ms> (default 1000, min 100).
 
 mod app;
 mod collector;
@@ -37,20 +37,31 @@ fn parse_args() -> Result<Args> {
             "--once" => args.once = true,
             "--mock" => args.mock = true,
             "--interval" => {
-                let ms: u64 = it
+                let v = it
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("--interval needs a value (ms)"))?
-                    .parse()?;
+                    .ok_or_else(|| anyhow::anyhow!("--interval needs a value (ms)"))?;
+                let ms: u64 = v
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("--interval: invalid value {v:?}: {e}"))?;
+                if ms < 100 {
+                    eprintln!("gpuviewer: --interval {ms} clamped to 100ms");
+                }
                 args.interval = Duration::from_millis(ms.max(100));
+            }
+            "--version" | "-V" => {
+                println!("gpuviewer {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
             }
             "--help" | "-h" => {
                 println!(
                     "gpuviewer — the GPU flight recorder\n\n\
-                     USAGE: gpuviewer [--json [--once]] [--mock] [--interval <ms>]\n\n\
+                     USAGE: gpuviewer [--json [--once]] [--mock] [--interval <ms>] [--help] [--version]\n\n\
                      --json          stream one NDJSON frame per tick to stdout\n\
                      --once          with --json: print a single frame and exit\n\
-                     --mock          force the mock backend (also used when no GPU is found)\n\
-                     --interval <ms> sampling interval, default 1000"
+                     --mock          use ONLY the simulated GPUs (deterministic; also the fallback when no GPU is found)\n\
+                     --interval <ms> sampling interval, default 1000, minimum 100\n\
+                     --version, -V   print version and exit\n\
+                     --help, -h      show this help"
                 );
                 std::process::exit(0);
             }

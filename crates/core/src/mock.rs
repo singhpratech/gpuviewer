@@ -161,7 +161,7 @@ impl TrainSim {
         self.tick += 1;
 
         // Idle gaps: every ~90 ticks, go idle for 8-20 ticks (checkpoint/validation pattern).
-        if self.idle_until == 0 && self.tick % 90 == 0 {
+        if self.idle_until == 0 && self.tick.is_multiple_of(90) {
             self.idle_until = self.tick + 8 + (self.rng.next() % 13);
         }
         let idle = self.idle_until > self.tick;

@@ -6,5 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Telemetry core for gpuviewer: vendor backends, data model, event derivation"
 
+[features]
+default = ["nvidia"]
+nvidia = ["dep:nvml-wrapper"]
+
 [dependencies]
 serde.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+nvml-wrapper = { version = "0.12", optional = true }

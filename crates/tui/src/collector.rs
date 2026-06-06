@@ -16,6 +16,8 @@ use serde::Serialize;
 pub struct FrameDevice {
     pub id: DeviceId,
     pub name: String,
+    /// Total VRAM, so JSON consumers can compute used/total without a second query.
+    pub mem_total_bytes: Option<u64>,
     pub sample: Option<DynamicSample>,
     pub processes: Vec<ProcessSample>,
 }
@@ -86,6 +88,7 @@ impl Engine {
             frame_devices.push(FrameDevice {
                 id: id.clone(),
                 name: info.name.clone(),
+                mem_total_bytes: info.mem_total_bytes,
                 sample,
                 processes,
             });
