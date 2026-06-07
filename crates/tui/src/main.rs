@@ -29,6 +29,8 @@ struct Args {
     interval: Duration,
     /// Adaptive idle backoff on (default); `--no-backoff` turns it off.
     backoff: bool,
+    /// Persistence on (default); `--no-persist` turns it off (and with it, replay/report).
+    persist: bool,
     /// Override history database path (else the XDG default).
     db: Option<PathBuf>,
     /// `--on-event 'CMD'`: shell command fired for every emitted event.
@@ -43,6 +45,7 @@ impl Default for Args {
             mock: false,
             interval: Duration::from_millis(1000),
             backoff: true,
+            persist: true,
             db: None,
             on_event: None,
         }
@@ -70,6 +73,7 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
       --interval <ms> sampling interval, default 1000, minimum 100\n  \
       --no-backoff    disable the adaptive low-power cadence (idle GPUs are normally polled\n                  \
                       slower so polling does not keep them awake)\n  \
+      --no-persist    do not record history (the replay view and `report` need the recording)\n  \
       --db <path>     history database path (default: $XDG_DATA_HOME/gpuviewer/history.db)\n  \
       --on-event <c>  run `sh -c <c>` for every emitted event, with GPV_EVENT_KIND,\n                  \
                       GPV_EVENT_SEVERITY, GPV_EVENT_CONFIDENCE, GPV_EVENT_TITLE,\n                  \
@@ -96,6 +100,7 @@ fn parse_args() -> Result<Args> {
             "--once" => args.once = true,
             "--mock" => args.mock = true,
             "--no-backoff" => args.backoff = false,
+            "--no-persist" => args.persist = false,
             "--interval" => {
                 let v = it
                     .next()
@@ -186,9 +191,10 @@ fn main() -> Result<()> {
     let args = parse_args()?;
     let config = EngineConfig {
         force_mock: args.mock,
-        // Always-on persistence in the live modes (the wedge feature). --mock records to a
-        // separate file so the demo/CI never pollute real flight history.
-        persist: true,
+        // Persistence is on by default in the live modes (the wedge feature; --no-persist
+        // opts out). --mock records to a separate file so the demo/CI never pollute real
+        // flight history.
+        persist: args.persist,
         db_path: args.db.clone(),
         interval: args.interval,
         on_event: args.on_event.clone(),
