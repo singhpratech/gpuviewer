@@ -121,6 +121,12 @@ const SPILLOVER_MAX_MEAN_UTIL_PCT: f64 = 15.0;
 const SPILLOVER_BUSY_UTIL_PCT: f32 = 30.0;
 const SPILLOVER_MIN_MEAN_CPU_PCT: f64 = 150.0;
 const SPILLOVER_MIN_CPU_SAMPLES: u32 = 3;
+/// Minimum observed-util coverage of the assessment window, as a percentage of its ticks.
+/// The "GPU stayed ~idle" half of the claim needs the same grounding as the CPU half: when
+/// util is `None` throughout (source cannot observe it), the mean would read as 0% and pass
+/// the idle gate with zero actual GPU evidence — exactly the confidently-wrong narration the
+/// honesty contract bans. Below half-window coverage the judgment is refused, silently.
+const SPILLOVER_MIN_UTIL_COVERAGE_PCT: u32 = 50;
 
 #[derive(Default)]
 struct DevState {
@@ -191,6 +197,9 @@ struct Spillover {
     util_n: u32,
     cpu_sum: f64,
     cpu_n: u32,
+    /// Total ticks the assessment has lived through, observed-util or not — the denominator
+    /// for the `SPILLOVER_MIN_UTIL_COVERAGE_PCT` floor.
+    tick_n: u32,
 }
 
 #[derive(Default)]
@@ -586,6 +595,8 @@ fn hang_events(
 /// is cancelled silently — never narrated — if the process exits mid-window, the GPU shows
 /// real use at any point, or (honesty rule) we never once saw its CPU: with no CPU
 /// visibility we cannot claim it is "burning CPU", so we say nothing rather than guess.
+/// The same honesty rule covers the GPU side: util must have been observed on at least
+/// half the window's ticks, else "the GPU is ~idle" would rest on no observation at all.
 fn spillover_events(
     st: &mut DevState,
     device: &DeviceId,
@@ -614,6 +625,7 @@ fn spillover_events(
                         util_n: 0,
                         cpu_sum: 0.0,
                         cpu_n: 0,
+                        tick_n: 0,
                     },
                 );
             }
@@ -640,6 +652,7 @@ fn spillover_events(
             // Exited mid-window: cancelled silently (its `process_exited` fact stands).
             return false;
         };
+        sp.tick_n += 1;
         if let Some(u) = sample.util_pct {
             sp.util_sum += u as f64;
             sp.util_n += 1;
@@ -654,10 +667,16 @@ fn spillover_events(
         }
 
         // Window closed — judge. Means require samples; no CPU sample at all means no CPU
-        // visibility, and we refuse to claim a CPU burn we never observed.
+        // visibility, and we refuse to claim a CPU burn we never observed. Symmetrically,
+        // util must have been *observed* on at least half the window's ticks: a blind
+        // window (util None throughout) would otherwise mean 0% and fabricate "the GPU
+        // is ~idle" with zero actual GPU evidence.
+        let util_grounded =
+            sp.util_n > 0 && sp.util_n * 100 >= sp.tick_n * SPILLOVER_MIN_UTIL_COVERAGE_PCT;
         let mean_util = sp.util_sum / sp.util_n.max(1) as f64;
         let mean_cpu = sp.cpu_sum / sp.cpu_n.max(1) as f64;
-        if sp.cpu_n >= SPILLOVER_MIN_CPU_SAMPLES
+        if util_grounded
+            && sp.cpu_n >= SPILLOVER_MIN_CPU_SAMPLES
             && mean_util < SPILLOVER_MAX_MEAN_UTIL_PCT
             && mean_cpu >= SPILLOVER_MIN_MEAN_CPU_PCT
         {
@@ -794,5 +813,162 @@ fn fmt_dur_ms(ms: u64) -> String {
         format!("{}m {}s", s / 60, s % 60)
     } else {
         format!("{s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! CPU-spillover observed-util coverage floor — regression tests for the honesty rule
+    //! that "the GPU is ~idle" must rest on real util observations, never on a mean over
+    //! zero (or too few) samples. The broader event-derivation suite lives in `lib.rs`;
+    //! these mirror its synthetic 1 Hz trace style.
+
+    use super::*;
+    use crate::model::ProcessKind;
+
+    /// A 1 Hz sample whose util may be absent — exercises the coverage-floor paths.
+    fn opt_sample(ts_ms: u64, util_pct: Option<f32>) -> DynamicSample {
+        DynamicSample {
+            ts_ms,
+            util_pct,
+            util_engine: None,
+            mem_used_bytes: Some(8 << 30),
+            power_mw: None,
+            temp_c: None,
+            fan_pct: None,
+            sm_clock_mhz: None,
+            mem_clock_mhz: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            throttle: Some(ThrottleReasons::default()),
+        }
+    }
+
+    /// Build a process holding `mem` bytes, with optional self-util and CPU%.
+    fn proc_with(
+        pid: u32,
+        name: &str,
+        mem: u64,
+        util_pct: Option<f32>,
+        cpu_pct: Option<f32>,
+    ) -> ProcessSample {
+        ProcessSample {
+            pid,
+            name: name.into(),
+            kind: ProcessKind::Compute,
+            mem_bytes: Some(mem),
+            util_pct,
+            cpu_pct,
+            container: None,
+        }
+    }
+
+    /// Drive a 1 Hz trace with an optional util value, holding `procs` constant across it.
+    fn drive_opt(
+        engine: &mut EventEngine,
+        dev: &DeviceId,
+        ts_range: std::ops::RangeInclusive<u64>,
+        util_pct: Option<f32>,
+        procs: &[ProcessSample],
+    ) -> Vec<Event> {
+        let mut out = Vec::new();
+        for ts in ts_range.step_by(1000) {
+            out.extend(engine.observe(dev, &opt_sample(ts, util_pct), procs, Some(16 << 30), None));
+        }
+        out
+    }
+
+    /// Util `None` on every tick of the window: the source cannot observe the GPU at all.
+    /// Before the coverage floor, the mean read as 0/max(1) = 0% and passed the idle gate —
+    /// narrating "the GPU is ~idle" with zero actual GPU evidence. Must stay silent.
+    #[test]
+    fn spillover_silent_when_util_unobserved_all_window() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        // Baseline tick with no procs so the model reads as freshly attached.
+        drive_opt(&mut engine, &dev, 0..=0, None, &[]);
+        // Hot CPU the whole window, but device util is None throughout.
+        let ollama = vec![proc_with(7777, "ollama", 12 << 30, Some(0.0), Some(310.0))];
+        let out = drive_opt(&mut engine, &dev, 1_000..=91_000, None, &ollama);
+        assert!(
+            out.iter().all(|e| e.kind != EventKind::CpuSpillover),
+            "util never observed — the GPU-idle claim has no evidence and must stay silent"
+        );
+    }
+
+    /// Util observed on fewer than half the window's ticks (31 of 91), all of them low:
+    /// the observed mean would pass the idle gate, but the coverage floor refuses the
+    /// judgment — too much of the window is a blind spot to mean it.
+    #[test]
+    fn spillover_silent_when_util_coverage_below_half_window() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        drive_opt(&mut engine, &dev, 0..=0, None, &[]);
+        let ollama = vec![proc_with(7777, "ollama", 12 << 30, Some(0.0), Some(310.0))];
+        // Blind for the first 60 ticks, observed-low for the last 31.
+        let mut out = drive_opt(&mut engine, &dev, 1_000..=60_000, None, &ollama);
+        out.extend(drive_opt(
+            &mut engine,
+            &dev,
+            61_000..=91_000,
+            Some(5.0),
+            &ollama,
+        ));
+        assert!(
+            out.iter().all(|e| e.kind != EventKind::CpuSpillover),
+            "31 of 91 ticks observed is below half-window coverage — must stay silent"
+        );
+    }
+
+    /// Coverage just over the floor (46 of 91 ticks observed, all low) restores the claim:
+    /// the floor blocks blindness, not legitimate partial visibility.
+    #[test]
+    fn spillover_fires_once_coverage_reaches_half_window() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+
+        drive_opt(&mut engine, &dev, 0..=0, None, &[]);
+        let ollama = vec![proc_with(7777, "ollama", 12 << 30, Some(0.0), Some(310.0))];
+        // Blind for 45 ticks, observed-low for 46: 46/91 clears the half-window floor.
+        let mut out = drive_opt(&mut engine, &dev, 1_000..=45_000, None, &ollama);
+        out.extend(drive_opt(
+            &mut engine,
+            &dev,
+            46_000..=91_000,
+            Some(5.0),
+            &ollama,
+        ));
+        let n = out
+            .iter()
+            .filter(|e| e.kind == EventKind::CpuSpillover)
+            .count();
+        assert_eq!(
+            n, 1,
+            "46 of 91 ticks observed clears the floor — the grounded claim must narrate once"
+        );
+    }
+
+    /// The fully-observed near-idle window still narrates: the floor must not silence the
+    /// textbook case it exists to protect.
+    #[test]
+    fn spillover_still_fires_with_observed_low_util() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+
+        drive_opt(&mut engine, &dev, 0..=0, Some(3.0), &[]);
+        let ollama = vec![proc_with(7777, "ollama", 12 << 30, Some(0.0), Some(310.0))];
+        let out = drive_opt(&mut engine, &dev, 1_000..=91_000, Some(5.0), &ollama);
+        let n = out
+            .iter()
+            .filter(|e| e.kind == EventKind::CpuSpillover)
+            .count();
+        assert_eq!(
+            n, 1,
+            "fully-observed near-idle GPU plus hot CPU must still narrate exactly once"
+        );
     }
 }

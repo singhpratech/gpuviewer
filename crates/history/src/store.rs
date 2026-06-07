@@ -24,6 +24,11 @@
 //! - A UNIQUE index over `(ts_ms, device_id, kind, title)` on the event log with
 //!   `INSERT OR IGNORE` — defense in depth behind the lock: even a pre-lock binary running
 //!   alongside a new one cannot land the same narration twice.
+//! - A forward-schema guard on every WRITE open: a database whose `PRAGMA user_version` is
+//!   GREATER than this build's [`SCHEMA_VERSION`] was written by a newer gpuviewer and is
+//!   refused with the file byte-for-byte untouched ([`StoreError::SchemaTooNew`]) — no
+//!   migration, no retention pruning, no downgrade re-stamp. Read-only opens still work
+//!   (refuse-to-WRITE is the contract; viewing newer history cannot corrupt it).
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -38,6 +43,11 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 /// the table shape changes so a future migration step can branch on it.
 /// v2: the event-dedupe UNIQUE index (`idx_events_dedupe`), added by
 /// [`SqliteStore::migrate_event_dedupe`] on open with pre-existing duplicates collapsed.
+///
+/// The stamp is guarded in BOTH directions: older files migrate forward, but a file
+/// stamped HIGHER than this constant was written by a NEWER gpuviewer, and every write
+/// open refuses it with the file untouched ([`StoreError::SchemaTooNew`]) — this build
+/// must never migrate, prune, or down-stamp a shape it has never seen.
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// Retention windows. Public because the UI tells the user how far back history reaches
@@ -206,6 +216,20 @@ pub enum StoreError {
         db_source: String,
         session_source: DataSource,
     },
+    /// A write open found the database stamped with a `PRAGMA user_version` GREATER than
+    /// this build's [`SCHEMA_VERSION`] — it was written by a NEWER gpuviewer. Refused
+    /// before any read-write connection exists: "migrating" a future schema (the
+    /// `init_schema` down-stamp, the dedupe migration's DELETE, retention pruning) would
+    /// silently corrupt history this build cannot understand — the one thing the product
+    /// promises to keep. The file is left byte-for-byte untouched, and read-only opens
+    /// are unaffected (refuse-to-WRITE is the contract).
+    SchemaTooNew {
+        path: PathBuf,
+        /// The `user_version` the file is stamped with.
+        db_version: u32,
+        /// The newest version this build understands ([`SCHEMA_VERSION`]).
+        supported: u32,
+    },
     /// Another live instance already holds the database's exclusive instance lock. Letting
     /// a second writer in would double-count every rollup bucket and insert every narrated
     /// event twice (the audit's duplicate-narration blocker), so a write open is refused
@@ -254,6 +278,18 @@ impl std::fmt::Display for StoreError {
                 f,
                 "refusing to record {session_source} data into {} — it contains {db_source} \
                  history (use --db elsewhere or --no-persist)",
+                path.display()
+            ),
+            StoreError::SchemaTooNew {
+                path,
+                db_version,
+                supported,
+            } => write!(
+                f,
+                "refusing to open {} for recording — its schema is v{db_version}, written \
+                 by a newer gpuviewer than this build (which understands up to \
+                 v{supported}); upgrade gpuviewer, or use --db elsewhere / --no-persist \
+                 (the file has not been modified)",
                 path.display()
             ),
             StoreError::Locked { path } => write!(
@@ -320,10 +356,22 @@ impl SqliteStore {
         // before `try_open_init` means two racing opens can never both initialize/write.
         let lock = Self::acquire_instance_lock(&path)?;
 
+        // Forward-schema guard SECOND, still before any read-write connection exists: a
+        // database stamped with a `user_version` from a NEWER gpuviewer must be refused
+        // with the file byte-for-byte untouched. Like `Locked`, the refusal must return
+        // here, where it can never reach the corruption machinery below — a future-schema
+        // file is healthy, just newer; quarantining (or "migrating") it would BE the
+        // history loss the guard exists to prevent.
+        Self::check_schema_not_newer(&path)?;
+
         let existed = path.exists();
         let (mut store, was_reset) = match Self::try_open_init(&path) {
             Ok(store) if !existed => (store, false),
             Ok(store) if store.quick_check_ok() => (store, false),
+            // The second guard layer (inside `try_open_init`, for files the read-only
+            // probe above could not read) passes its refusal through verbatim — never
+            // quarantine a healthy, merely-newer database as corrupt.
+            Err(e @ StoreError::SchemaTooNew { .. }) => return Err(e),
             // Open succeeded but the integrity check failed, or open/init itself failed:
             // either way the existing file is unusable. Rename it aside and start fresh.
             failed => {
@@ -415,6 +463,13 @@ impl SqliteStore {
 
     fn try_open_init(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
+        // Second forward-schema layer (the read-only probe in `open` is the first):
+        // every route to a read-write connection re-checks BEFORE the pragmas and
+        // `init_schema` run, because `init_schema` would re-stamp `user_version` DOWN
+        // and run migrations against a shape this build has never seen. A no-op on the
+        // fresh files `copy_window` and post-quarantine reopens create (version 0).
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        Self::refuse_if_newer(path, user_version)?;
         let store = Self {
             conn,
             path: path.to_path_buf(),
@@ -464,6 +519,48 @@ impl SqliteStore {
             }),
             Err(TryLockError::Error(error)) => Err(StoreError::LockIo { lock_path, error }),
         }
+    }
+
+    /// Forward-schema guard, first layer: probe `PRAGMA user_version` over a READ-ONLY
+    /// connection so a refusal provably leaves the file byte-identical — no WAL
+    /// checkpoint, no `-wal`/`-shm` creation, no pragma writes, and `init_schema` (the
+    /// down-stamp + migrations) never runs.
+    ///
+    /// Best-effort on an unreadable file: if the probe cannot open or read the pragma,
+    /// the verdict is left to the normal open path — `try_open_init` re-checks the
+    /// version on its read-write connection, and `quick_check` decides corruption. The
+    /// guard only ever REFUSES; it never rescues a file from the corruption machinery.
+    fn check_schema_not_newer(path: &Path) -> Result<(), StoreError> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let Ok(probe) = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return Ok(());
+        };
+        match probe.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)) {
+            Ok(v) => Self::refuse_if_newer(path, v),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Shared verdict for both forward-schema layers: a `user_version` beyond
+    /// [`SCHEMA_VERSION`] is refused; anything else (including a pre-versioning 0)
+    /// proceeds to the normal migrate-forward path.
+    fn refuse_if_newer(path: &Path, user_version: i64) -> Result<(), StoreError> {
+        if user_version > SCHEMA_VERSION as i64 {
+            return Err(StoreError::SchemaTooNew {
+                path: path.to_path_buf(),
+                // `user_version` is a signed 32-bit header field, so a value above
+                // SCHEMA_VERSION is in (SCHEMA_VERSION+1)..=i32::MAX — the cast is
+                // lossless everywhere this branch is reachable.
+                db_version: user_version as u32,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        Ok(())
     }
 
     fn init_pragmas(&self) -> Result<(), StoreError> {
@@ -1292,3 +1389,204 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts_ms);
 // duplicate narrations — and a failed init reads as corruption to `open`, which would
 // quarantine a perfectly healthy file. `migrate_event_dedupe` (which collapses the
 // duplicates first, in the same transaction) is the only place that creates it.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique, non-existent scratch db path (same convention as the store tests in
+    /// lib.rs: pid + counter under the temp dir); removed — with WAL/SHM/lock/corrupt
+    /// siblings — by Drop so a failing test still tidies up.
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let name = format!("gpuviewer-store-test-{}-{}.db", std::process::id(), n);
+            Scratch {
+                path: std::env::temp_dir().join(name),
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            for ext in ["-wal", "-shm", ".lock"] {
+                let mut p = self.path.as_os_str().to_os_string();
+                p.push(ext);
+                let _ = std::fs::remove_file(p);
+            }
+            if let (Some(dir), Some(stem)) = (
+                self.path.parent(),
+                self.path.file_name().and_then(|s| s.to_str()),
+            ) {
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for e in rd.flatten() {
+                        if let Some(n) = e.file_name().to_str() {
+                            if n.starts_with(&format!("{stem}.corrupt-")) {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stamp the database with a `user_version` exactly as a newer gpuviewer would leave
+    /// it, via a raw connection (no store code paths). Closing the connection checkpoints
+    /// the WAL, so the stamp lands in the main file before any snapshot is taken.
+    fn bump_user_version(path: &Path, v: u32) {
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "user_version", v).unwrap();
+    }
+
+    /// Read `user_version` without store code, read-only.
+    fn raw_user_version(path: &Path) -> i64 {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Forward-schema honesty (audit G9/P1-14): a database whose `user_version` is
+    /// GREATER than this build's `SCHEMA_VERSION` — written by a newer gpuviewer — is
+    /// refused on every write open with the upgrade message, and the refusal is a
+    /// provable no-op on the file: byte-identical afterwards (marker row and the bumped
+    /// version included), no migration, no downgrade re-stamp, no quarantine sibling.
+    #[test]
+    fn future_schema_db_is_refused_with_file_untouched() {
+        let scratch = Scratch::new();
+        let future_version = SCHEMA_VERSION + 7;
+
+        // A real recording with a marker row, closed cleanly, then stamped as a newer
+        // gpuviewer would leave it.
+        {
+            let (store, was_reset) =
+                SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+            assert!(!was_reset);
+            store
+                .register_device(
+                    &DeviceId("gpu-marker".into()),
+                    "Marker GPU",
+                    Vendor::Nvidia,
+                    Some(8 << 30),
+                )
+                .unwrap();
+        }
+        bump_user_version(&scratch.path, future_version);
+        let before = std::fs::read(&scratch.path).unwrap();
+
+        // Both write opens refuse with SchemaTooNew, naming the file and both versions
+        // and telling the user the database came from a newer gpuviewer.
+        let err = SqliteStore::open(&scratch.path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::SchemaTooNew { db_version, supported, .. }
+                    if db_version == future_version && supported == SCHEMA_VERSION
+            ),
+            "a future-schema db must refuse with SchemaTooNew, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer gpuviewer"),
+            "the refusal must say the db came from a newer version: {msg}"
+        );
+        assert!(
+            msg.contains(scratch.path.to_str().unwrap()),
+            "the refusal must name the file: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("v{future_version}"))
+                && msg.contains(&format!("v{SCHEMA_VERSION}")),
+            "the refusal must name both versions: {msg}"
+        );
+        let err = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap_err();
+        assert!(
+            matches!(err, StoreError::SchemaTooNew { .. }),
+            "the recording open must be refused identically, got: {err}"
+        );
+
+        // The refusals were no-ops on the file: byte-identical, still stamped with the
+        // future version, marker still present.
+        let after = std::fs::read(&scratch.path).unwrap();
+        assert!(
+            before == after,
+            "a refused open must leave the database byte-identical"
+        );
+        assert_eq!(raw_user_version(&scratch.path), future_version as i64);
+
+        // And no *.corrupt-* sibling: a merely-newer database must never reach the
+        // corruption machinery and be quarantined.
+        let dir = scratch.path.parent().unwrap();
+        let stem = scratch.path.file_name().unwrap().to_str().unwrap();
+        let quarantined = std::fs::read_dir(dir).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&format!("{stem}.corrupt-")))
+        });
+        assert!(
+            !quarantined,
+            "a future-schema database must never be quarantined as corrupt"
+        );
+    }
+
+    /// Refuse-to-WRITE is the contract: the same future-schema file still opens
+    /// read-only, so `report`/`view`/replay of newer history keep working — a reader
+    /// never migrates, prunes, or stamps, so it cannot corrupt anything.
+    #[test]
+    fn future_schema_db_still_opens_readonly() {
+        let scratch = Scratch::new();
+        {
+            let (store, _) = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+            store
+                .register_device(&DeviceId("gpu0".into()), "Kept GPU", Vendor::Amd, None)
+                .unwrap();
+        }
+        bump_user_version(&scratch.path, SCHEMA_VERSION + 1);
+
+        let reader = SqliteStore::open_readonly(&scratch.path).unwrap();
+        let devs = reader.devices().unwrap();
+        assert_eq!(devs.len(), 1, "newer history must still be viewable");
+        assert_eq!(devs[0].name, "Kept GPU");
+        assert_eq!(reader.data_source().unwrap(), Some(DataSource::Real));
+    }
+
+    /// The guard refuses strictly NEWER versions only: a file at exactly
+    /// `SCHEMA_VERSION` reopens for writing without friction — the boundary must not
+    /// be off by one, or every healthy reopen would brick.
+    #[test]
+    fn current_schema_version_reopens_for_writing() {
+        let scratch = Scratch::new();
+        {
+            let (store, _) = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+            store
+                .register_device(
+                    &DeviceId("gpu0".into()),
+                    "Same-Version GPU",
+                    Vendor::Intel,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(raw_user_version(&scratch.path), SCHEMA_VERSION as i64);
+
+        let (store, was_reset) =
+            SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+        assert!(
+            !was_reset,
+            "a same-version reopen must not look like a reset"
+        );
+        assert_eq!(store.devices().unwrap().len(), 1);
+    }
+}
