@@ -584,6 +584,11 @@ pub struct Shared {
     /// footer can show "low-power cadence 5s". Published via an atomic so the UI reads it
     /// without taking the (already heavily-held) Shared lock on the collector's hot path.
     pub effective_interval_ms: Arc<AtomicU64>,
+    /// Collector ticks folded into this state so far, bumped once per frame. The timeline
+    /// overview re-queries its cached window when this advances — and only then, keeping
+    /// SQLite off the render path. Stays 0 forever in [`Collector::stationary`] sessions:
+    /// a recording does not grow.
+    pub tick_seq: u64,
 }
 
 pub struct Collector {
@@ -610,6 +615,7 @@ impl Collector {
             db_path,
             interval_ms: interval.as_millis() as u64,
             effective_interval_ms: Arc::clone(&effective_interval_ms),
+            tick_seq: 0,
         }));
         let paused = Arc::new(AtomicBool::new(false));
 
@@ -634,6 +640,9 @@ impl Collector {
                         sh.processes[i] = fd.processes.clone();
                     }
                     sh.history.push_events(frame.events);
+                    // Publish the tick AFTER its data is folded in, so a reader seeing
+                    // the new seq always sees the new frame too.
+                    sh.tick_seq += 1;
                 } else {
                     // While paused we are not observing anything, so do not let the idle
                     // streak grow (it would back off on resume against stale state).
@@ -677,6 +686,7 @@ impl Collector {
                 db_path,
                 interval_ms: 1000,
                 effective_interval_ms: Arc::new(AtomicU64::new(1000)),
+                tick_seq: 0,
             })),
             paused: Arc::new(AtomicBool::new(false)),
         }
