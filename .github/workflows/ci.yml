@@ -4,13 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger for the one-off macos-probe job (cross-platform design §4.5).
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # fmt is style-only and platform-independent — one leg is enough.
+          - os: ubuntu-latest
+            lint: true
+          - os: windows-latest
+            lint: false
+          # Pinned to macos-15: macos-latest re-points to macos-26 starting 2026-06-15 —
+          # do not let the image change underneath a brand-new leg mid-rollout.
+          - os: macos-15
+            lint: false
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
@@ -19,11 +34,30 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      # Keys per-OS automatically (rustc host triple + job id). The three caches share
+      # the repo's 10 GB quota — monitor hit rates now that the matrix is 3-wide.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - run: cargo fmt --check
+      - if: matrix.lint
+        run: cargo fmt --check
 
+      # clippy runs on EVERY leg: -D warnings on ubuntu alone would never compile the
+      # cfg(windows)/cfg(macos) code paths at all.
       - run: cargo clippy --all-targets -- -D warnings
 
-      # All tests run against the mock backend — no GPU needed.
+      # All tests run against the mock backend — no GPU needed (the GPU-less runners
+      # exercise the absence-is-normal paths for free).
       - run: cargo test
+
+  # One-off ground-truth probe (design §4.5): dump the paravirt runner's IOAccelerator /
+  # AGXAccelerator inventory so the macOS backend's CI assertions are built on citation,
+  # not inference. Manual trigger only; every step is best-effort (the example does not
+  # exist until the macos-apple workstream lands it).
+  macos-probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: ioreg -r -c IOAccelerator -d 2 || true
+      - run: ioreg -r -c AGXAccelerator -d 2 || true
+      - run: cargo run -p gpuviewer-core --example macos_probe || true
