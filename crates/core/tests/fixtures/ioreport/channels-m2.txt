@@ -1,0 +1,13 @@
+# SYNTHETIC single-die channel inventory (M1/M2-shaped), modeled on macmon's documented
+# taxonomy. Decoys marked below MUST NOT match the GPU selectors in apple::parse.
+channel|Energy Model||CPU Energy|mJ
+channel|Energy Model||GPU Energy|mJ
+channel|Energy Model||ANE Energy|mJ
+# Decoy: contains "GPU" and "Energy" but not the substring "GPU Energy".
+channel|Energy Model||GPU SRAM Energy|mJ
+channel|GPU Stats|GPU Performance States|GPUPH|
+# Decoy: GPUPH name under the WRONG subgroup — must not be selected.
+channel|GPU Stats|GPU Core Performance States|GPUPH|
+channel|CPU Stats|CPU Core Performance States|ECPU0|
+channel|CPU Stats|CPU Complex Performance States|PCPU|
+channel|PMP|GPU|GPU busy|

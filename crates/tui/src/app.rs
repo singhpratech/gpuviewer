@@ -753,6 +753,7 @@ mod tests {
         DynamicSample {
             ts_ms,
             util_pct: Some(util),
+            util_engine: None,
             mem_used_bytes: Some(2 << 30),
             power_mw: Some(150_000),
             temp_c: Some(65.0),
@@ -761,7 +762,7 @@ mod tests {
             mem_clock_mhz: Some(8000),
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         }
     }
 
@@ -849,6 +850,7 @@ mod tests {
             temp_slowdown_c: None,
             driver_version: None,
             process_hint: None,
+            source_caveat: None,
         }];
         let collector = crate::collector::Collector::stationary(infos, Some(path.clone()));
         App::viewer(collector, store, "incident.gpvr".into())

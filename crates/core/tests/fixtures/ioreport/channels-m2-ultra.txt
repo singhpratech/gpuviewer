@@ -1,0 +1,10 @@
+# SYNTHETIC Ultra (two-die) inventory: DIE_N_ prefixes on the GPU channels — the rename
+# shape the design (§4.1 Tier C) requires contains-matching for. Decoy CPU dies included.
+channel|Energy Model||DIE_0_CPU Energy|mJ
+channel|Energy Model||DIE_1_CPU Energy|mJ
+channel|Energy Model||DIE_0_GPU Energy|mJ
+channel|Energy Model||DIE_1_GPU Energy|mJ
+channel|GPU Stats|GPU Performance States|DIE_0_GPUPH|
+channel|GPU Stats|GPU Performance States|DIE_1_GPUPH|
+channel|CPU Stats|CPU Core Performance States|DIE_0_ECPU0|
+channel|CPU Stats|CPU Core Performance States|DIE_1_ECPU0|

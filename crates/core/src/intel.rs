@@ -410,9 +410,14 @@ impl IntelDevice {
     /// stale 1 in a reason file while `status` is 0 (the limit cleared but the latched
     /// reason bit lingers). Trusting `status` means we only ever narrate a throttle that
     /// is actually happening now — a confidently-wrong throttle event would kill the
-    /// product's trust thesis. status==0 or an absent/garbage status file → default
-    /// (nothing claimed), REGARDLESS of what the reason files say.
-    fn throttle(&self) -> ThrottleReasons {
+    /// product's trust thesis.
+    ///
+    /// Observability split (§5.4): an absent/unreadable/garbage `status` file means this
+    /// kernel exposes no working throttle interface for the GT — **unobservable**,
+    /// `None`, never an asserted "not throttling". An explicit `0` IS an observation
+    /// (`Some(default)`: the hardware says no limit is active), REGARDLESS of what the
+    /// (possibly stale-latched) reason files say.
+    fn throttle(&self) -> Option<ThrottleReasons> {
         // Filenames differ per dialect; the meaning of each does not.
         let (dir, status, pl1, pl2, pl4, thermal, prochot, ratl, vr_thermalert, vr_tdc) =
             match self.dialect {
@@ -442,10 +447,15 @@ impl IntelDevice {
                 ),
             };
 
-        // status==0, missing, or garbage → not throttling now: default, full stop. The
-        // reason files are not even consulted (some report stale latched 1s).
-        if !read_throttle_bit(&dir.join(status)) {
-            return ThrottleReasons::default();
+        // Missing/unreadable status file: no throttle interface → unobservable (None).
+        // An explicit "0": observed not-throttling — the reason files are not even
+        // consulted (some report stale latched 1s). Garbage content is a broken
+        // interface, which is unobservable too — refusing beats guessing.
+        let status_raw = fs::read_to_string(dir.join(status)).ok()?;
+        match status_raw.trim() {
+            "1" => {}
+            "0" => return Some(ThrottleReasons::default()),
+            _ => return None,
         }
 
         // status==1: something IS limiting performance. Map each recognized reason file
@@ -464,12 +474,12 @@ impl IntelDevice {
         // bit this build doesn't map, or files the kernel didn't expose): assert the
         // honest minimum — throttling, cause unknown — rather than swallow the signal.
         if reasons.any() {
-            reasons
+            Some(reasons)
         } else {
-            ThrottleReasons {
+            Some(ThrottleReasons {
                 other: true,
                 ..ThrottleReasons::default()
-            }
+            })
         }
     }
 }
@@ -616,6 +626,8 @@ impl GpuBackend for IntelBackend {
             // kernel, and the uevent DRIVER= field is a name, not a version.
             driver_version: None,
             process_hint: self.process_hint.clone(),
+            // sysfs/fdinfo numbers carry their plain meanings — nothing to qualify.
+            source_caveat: None,
         })
     }
 
@@ -644,6 +656,7 @@ impl GpuBackend for IntelBackend {
             // root/CAP_PERFMON (xe PMU 6.15+), and summing fdinfo across clients we may
             // not be able to see would understate. None is the honest answer.
             util_pct: None,
+            util_engine: None,
             // No reliable per-device counter: an iGPU has no VRAM, and xe exposes no
             // device-wide VRAM-used sysfs — per-process fdinfo totals are not a device
             // total under a privilege wall.
@@ -662,9 +675,10 @@ impl GpuBackend for IntelBackend {
             decoder_pct: None,
             // Per-GT throttle ("performance limit") reasons, decoded per dialect from the
             // one-bit-per-file sysfs flags (i915 gt/gt0/throttle_reason_*, xe
-            // freq0/throttle/*). `status` is the gate — an absent file or status==0 yields
-            // the default, so no-throttle hardware reports honest silence. This is the
-            // metric intel_gpu_top still does not surface on xe.
+            // freq0/throttle/*). `status` is the gate — absent file → None (this kernel
+            // exposes no throttle interface: unobservable, §5.4); status==0 →
+            // Some(default): observed honest silence. This is the metric intel_gpu_top
+            // still does not surface on xe.
             throttle,
         })
     }

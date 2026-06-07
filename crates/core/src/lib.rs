@@ -8,6 +8,12 @@
 
 #[cfg(target_os = "linux")]
 pub mod amd;
+// macOS Apple Silicon backend (design §4). OS-facing tiers are macOS-only, but the module
+// also carries the pure IOReport/PerformanceStatistics parsing+maths layer, which must
+// compile and run its fixture tests on every OS (design §10) — hence the extra `test`
+// arm: non-test host builds never see this module, CI fixture tests always do.
+#[cfg(any(all(feature = "apple", target_os = "macos"), test))]
+pub mod apple;
 pub mod backend;
 pub mod events;
 #[cfg(target_os = "linux")]
@@ -18,12 +24,18 @@ pub mod model;
 pub mod nvidia;
 #[cfg(target_os = "linux")]
 pub mod proc_meta;
+// Deliberately no target_os fence (unlike the design §9 sketch): the module's
+// counter-instance grammar and aggregation math are pure and their unit tests must run
+// on every OS (design §10 — CI has no GPUs); everything that touches a Windows API is
+// cfg(windows) inside.
+#[cfg(feature = "wddm")]
+pub mod wddm;
 
 pub use backend::{all_backends, BackendError, GpuBackend};
 pub use events::{Confidence, Event, EventEngine, EventKind, Severity};
 pub use model::{
-    fmt_bytes, now_ms, DeviceId, DynamicSample, ProcessKind, ProcessSample, StaticInfo,
-    ThrottleReasons, Vendor,
+    fmt_bytes, normalize_pci_id, now_ms, DeviceId, DynamicSample, ProcessKind, ProcessSample,
+    StaticInfo, ThrottleReasons, Vendor,
 };
 #[cfg(target_os = "linux")]
 pub use proc_meta::{container_of, parse_cgroup, CpuTracker};
@@ -98,6 +110,7 @@ mod tests {
         let sample = DynamicSample {
             ts_ms: 1000,
             util_pct: Some(50.0),
+            util_engine: None,
             mem_used_bytes: Some(1024),
             power_mw: None,
             temp_c: None,
@@ -106,7 +119,7 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         };
         let events = engine.observe(&dev, &sample, &procs, Some(1 << 30), None);
         assert!(
@@ -123,6 +136,7 @@ mod tests {
             DynamicSample {
                 ts_ms,
                 util_pct: Some(90.0),
+                util_engine: None,
                 mem_used_bytes: Some(1 << 30),
                 power_mw: None,
                 temp_c: Some(80.0),
@@ -131,10 +145,10 @@ mod tests {
                 mem_clock_mhz: None,
                 encoder_pct: None,
                 decoder_pct: None,
-                throttle: ThrottleReasons {
+                throttle: Some(ThrottleReasons {
                     thermal,
                     ..Default::default()
-                },
+                }),
             }
         }
         let run = |end_clock: u32| -> Event {
@@ -176,6 +190,68 @@ mod tests {
         );
     }
 
+    /// Throttle going unobservable (`None`, §5.4) is a blind spot, not a state change:
+    /// no narration may fire off it, and an episode open when the blind spot starts is
+    /// dropped — narrating its "end" later off a blind spot would be a fabricated fact.
+    /// Mirrors the util-None blind-spot rule for idle gaps and hangs.
+    #[test]
+    fn throttle_none_never_narrates_and_resets_the_episode() {
+        fn sample(ts_ms: u64, throttle: Option<ThrottleReasons>) -> DynamicSample {
+            DynamicSample {
+                ts_ms,
+                util_pct: Some(90.0),
+                util_engine: None,
+                mem_used_bytes: Some(1 << 30),
+                power_mw: None,
+                temp_c: None,
+                fan_pct: None,
+                sm_clock_mhz: Some(2400),
+                mem_clock_mhz: None,
+                encoder_pct: None,
+                decoder_pct: None,
+                throttle,
+            }
+        }
+        let thermal = Some(ThrottleReasons {
+            thermal: true,
+            ..Default::default()
+        });
+        let quiet = Some(ThrottleReasons::default());
+
+        // A source that never observes throttle (wddm/apple): zero throttle events ever.
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("blind".into());
+        for ts in (1_000..=20_000).step_by(1000) {
+            let events = engine.observe(&dev, &sample(ts, None), &[], Some(1 << 34), None);
+            assert!(
+                events.iter().all(
+                    |e| e.kind != EventKind::ThrottleStart && e.kind != EventKind::ThrottleEnd
+                ),
+                "an unobservable source must never narrate throttle"
+            );
+        }
+
+        // An open episode interrupted by a blind spot is dropped: when observation
+        // returns quiet, NO ThrottleEnd fires (the end was never observed).
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("gap".into());
+        engine.observe(&dev, &sample(1_000, quiet), &[], Some(1 << 34), None);
+        let started = engine.observe(&dev, &sample(2_000, thermal), &[], Some(1 << 34), None);
+        assert!(started.iter().any(|e| e.kind == EventKind::ThrottleStart));
+        engine.observe(&dev, &sample(3_000, None), &[], Some(1 << 34), None);
+        let resumed = engine.observe(&dev, &sample(4_000, quiet), &[], Some(1 << 34), None);
+        assert!(
+            resumed.iter().all(|e| e.kind != EventKind::ThrottleEnd),
+            "an end never observed must not be narrated after a blind spot"
+        );
+        // And a throttle observed AFTER the blind spot opens a fresh episode normally.
+        let restarted = engine.observe(&dev, &sample(5_000, thermal), &[], Some(1 << 34), None);
+        assert!(
+            restarted.iter().any(|e| e.kind == EventKind::ThrottleStart),
+            "observation returning must re-arm the episode tracker"
+        );
+    }
+
     /// A sharp VRAM drop (allocator reset / process exit) must restart the trend window —
     /// an endpoint slope over a sawtooth understates the current climb rate.
     #[test]
@@ -184,6 +260,7 @@ mod tests {
         let mk = |ts_ms: u64, used: u64| DynamicSample {
             ts_ms,
             util_pct: Some(90.0),
+            util_engine: None,
             mem_used_bytes: Some(used),
             power_mw: None,
             temp_c: None,
@@ -192,7 +269,7 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         };
         let mut engine = EventEngine::new();
         let dev = DeviceId("test".into());
@@ -233,6 +310,7 @@ mod tests {
         let mk = |ts_ms: u64, used: u64| DynamicSample {
             ts_ms,
             util_pct: Some(90.0),
+            util_engine: None,
             mem_used_bytes: Some(used),
             power_mw: None,
             temp_c: None,
@@ -241,7 +319,7 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         };
         let proc_named = |pid: u32, name: &str, mem: Option<u64>| ProcessSample {
             pid,
@@ -297,6 +375,7 @@ mod tests {
         DynamicSample {
             ts_ms,
             util_pct: Some(util_pct),
+            util_engine: None,
             mem_used_bytes: Some(8 << 30),
             power_mw: None,
             temp_c: None,
@@ -305,7 +384,7 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         }
     }
 
@@ -479,6 +558,7 @@ mod tests {
         DynamicSample {
             ts_ms,
             util_pct,
+            util_engine: None,
             mem_used_bytes: Some(8 << 30),
             power_mw: None,
             temp_c: None,
@@ -487,7 +567,7 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         }
     }
 

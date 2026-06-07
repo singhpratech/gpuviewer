@@ -163,11 +163,17 @@ impl SampleAccum {
         self.temp.push(s.temp_c.map(|v| v as f64));
         self.fan.push(s.fan_pct.map(|v| v as f64));
         self.sm_clock.push(s.sm_clock_mhz.map(|v| v as f64));
-        let (any, thermal, power_cap, hw) = store::throttle_flags(&s.throttle);
-        self.throttle_n += any as u32;
-        self.throttle_thermal_n += thermal as u32;
-        self.throttle_power_n += power_cap as u32;
-        self.throttle_hw_n += hw as u32;
+        // `throttle: None` (source cannot observe — §5.4) increments nothing: the
+        // counters are counts of *observed-active* frames, so an unobservable source
+        // recording all day still reports zero — a gap, not an asserted "never
+        // throttled" tally.
+        if let Some(t) = s.throttle {
+            let (any, thermal, power_cap, hw) = store::throttle_flags(&t);
+            self.throttle_n += any as u32;
+            self.throttle_thermal_n += thermal as u32;
+            self.throttle_power_n += power_cap as u32;
+            self.throttle_hw_n += hw as u32;
+        }
     }
 
     fn to_rollup(&self, device_id: &DeviceId) -> Option<SampleRollup> {
@@ -445,6 +451,7 @@ mod tests {
         DynamicSample {
             ts_ms: ts,
             util_pct: Some(1.0),
+            util_engine: None,
             mem_used_bytes: None,
             power_mw: None,
             temp_c: None,
@@ -453,7 +460,7 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         }
     }
 
@@ -527,10 +534,16 @@ mod tests {
 
     /// A fully-populated sample at `ts_ms` with every metric present — the baseline a
     /// broken aggregate would corrupt visibly.
-    fn full_sample(ts_ms: u64, util: f32, mem: u64, throttle: ThrottleReasons) -> DynamicSample {
+    fn full_sample(
+        ts_ms: u64,
+        util: f32,
+        mem: u64,
+        throttle: Option<ThrottleReasons>,
+    ) -> DynamicSample {
         DynamicSample {
             ts_ms,
             util_pct: Some(util),
+            util_engine: None,
             mem_used_bytes: Some(mem),
             power_mw: Some(100_000),
             temp_c: Some(60.0),
@@ -660,7 +673,11 @@ mod tests {
         assert_eq!(r.temp_max_c, Some(80.0));
     }
 
-    /// Throttle counters tally per reason across the bucket's frames.
+    /// Throttle counters tally per reason across the bucket's frames — counts of
+    /// *observed-active* frames only: a `throttle: None` frame (source cannot observe,
+    /// §5.4) increments nothing, exactly like the `Default::default()` (= `None`)
+    /// frames below. An unobserved frame and an observed-quiet frame both leave the
+    /// counters alone; only observed-active frames count.
     #[test]
     fn throttle_counters_tally_per_reason() {
         let scratch = Scratch::new();
@@ -676,12 +693,15 @@ mod tests {
             hw_slowdown: true,
             ..Default::default()
         };
-        rec.observe(&d, &full_sample(1_000, 90.0, 1 << 30, thermal), &[]);
-        rec.observe(&d, &full_sample(2_000, 90.0, 1 << 30, thermal), &[]);
-        rec.observe(&d, &full_sample(3_000, 90.0, 1 << 30, hw), &[]);
+        rec.observe(&d, &full_sample(1_000, 90.0, 1 << 30, Some(thermal)), &[]);
+        rec.observe(&d, &full_sample(2_000, 90.0, 1 << 30, Some(thermal)), &[]);
+        rec.observe(&d, &full_sample(3_000, 90.0, 1 << 30, Some(hw)), &[]);
+        // One unobservable frame (None) and one observed-quiet frame (Some(all-false)):
+        // neither may increment any counter.
+        rec.observe(&d, &full_sample(4_000, 90.0, 1 << 30, None), &[]);
         rec.observe(
             &d,
-            &full_sample(4_000, 90.0, 1 << 30, Default::default()),
+            &full_sample(5_000, 90.0, 1 << 30, Some(ThrottleReasons::default())),
             &[],
         );
         rec.observe(
@@ -1069,19 +1089,169 @@ mod tests {
         assert_eq!(r.cpu_avg, Some(150.0)); // (100+200)/2
     }
 
+    // ===================================================================================
+    // Data-dir resolution — env-driven on EVERY OS (the design reason: hermetic tests and
+    // child-process redirection must work without a `--db` flag). Process env is
+    // process-global and the default test harness is multi-threaded, so every test that
+    // touches these variables holds `DataDirEnv` (lock + snapshot + restore-on-drop).
+    // ===================================================================================
+
+    /// Every variable any OS's `default_data_dir` chain reads. All are snapshotted and
+    /// restored together so a test for one OS's chain can never leak into another test.
+    const DATA_DIR_VARS: [&str; 4] = ["XDG_DATA_HOME", "HOME", "LOCALAPPDATA", "USERPROFILE"];
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes env-mutating tests and restores the previous values on drop (also on
+    /// panic — a failed assertion must not poison the environment for the next test).
+    struct DataDirEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl DataDirEnv {
+        fn new() -> Self {
+            // A previous test panicking while holding the lock poisons it; the env was
+            // still restored by its Drop, so the poison carries no information here.
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = DATA_DIR_VARS
+                .iter()
+                .map(|v| (*v, std::env::var_os(v)))
+                .collect();
+            Self { _lock: lock, saved }
+        }
+
+        fn set(&self, var: &str, value: impl AsRef<std::ffi::OsStr>) {
+            // SAFETY: ENV_LOCK serializes every env-mutating test in this binary, and no
+            // non-test code in this crate reads these variables concurrently.
+            unsafe { std::env::set_var(var, value) };
+        }
+
+        fn clear(&self, var: &str) {
+            // SAFETY: as in `set`.
+            unsafe { std::env::remove_var(var) };
+        }
+
+        /// Point every per-OS data-dir root at `dir` — the multi-var treatment: the
+        /// variables the local OS ignores are inert, and one helper keeps the redirect
+        /// correct on the whole CI matrix.
+        fn redirect_all(&self, dir: &std::path::Path) {
+            for var in DATA_DIR_VARS {
+                self.set(var, dir);
+            }
+        }
+    }
+
+    impl Drop for DataDirEnv {
+        fn drop(&mut self) {
+            for (var, value) in &self.saved {
+                // SAFETY: as in `set`; still under the held lock.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(var, v),
+                        None => std::env::remove_var(var),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Linux/other chain, BYTE-IDENTICAL to shipped v1 (existing users' history.db
+    /// must not move): XDG_DATA_HOME first, HOME/.local/share second, refusal third —
+    /// with empty meaning unset, never "rooted at the current directory".
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[test]
+    fn data_dir_linux_prefers_xdg_then_home_then_errors() {
+        let env = DataDirEnv::new();
+        env.set("XDG_DATA_HOME", "/scratch/xdg");
+        env.set("HOME", "/scratch/home"); // decoy: must lose to XDG
+        assert_eq!(
+            store::default_data_dir().unwrap(),
+            std::path::Path::new("/scratch/xdg/gpuviewer")
+        );
+        env.set("XDG_DATA_HOME", ""); // empty counts as unset
+        assert_eq!(
+            store::default_data_dir().unwrap(),
+            std::path::Path::new("/scratch/home/.local/share/gpuviewer")
+        );
+        env.clear("XDG_DATA_HOME");
+        env.set("HOME", "");
+        assert!(
+            matches!(store::default_data_dir(), Err(StoreError::NoDataDir)),
+            "with nothing to resolve from, the only honest answer is a refusal"
+        );
+    }
+
+    /// The Windows chain: LOCALAPPDATA first, USERPROFILE\AppData\Local second (service
+    /// accounts can lack LOCALAPPDATA), refusal third. XDG must be ignored — it is set on
+    /// plenty of Windows dev boxes (MSYS2/WSL spillover) and means nothing there.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn data_dir_windows_prefers_localappdata_then_userprofile_then_errors() {
+        let env = DataDirEnv::new();
+        env.set("XDG_DATA_HOME", "C:\\decoy-xdg"); // must be ignored on Windows
+        env.set("LOCALAPPDATA", "C:\\scratch\\Local");
+        env.set("USERPROFILE", "C:\\scratch\\profile"); // decoy: must lose to LOCALAPPDATA
+        assert_eq!(
+            store::default_data_dir().unwrap(),
+            std::path::Path::new("C:\\scratch\\Local\\gpuviewer")
+        );
+        env.set("LOCALAPPDATA", ""); // empty counts as unset…
+        assert_eq!(
+            store::default_data_dir().unwrap(),
+            std::path::Path::new("C:\\scratch\\profile\\AppData\\Local\\gpuviewer")
+        );
+        env.clear("LOCALAPPDATA"); // …and so does genuinely absent
+        assert_eq!(
+            store::default_data_dir().unwrap(),
+            std::path::Path::new("C:\\scratch\\profile\\AppData\\Local\\gpuviewer")
+        );
+        env.set("USERPROFILE", "");
+        assert!(matches!(
+            store::default_data_dir(),
+            Err(StoreError::NoDataDir)
+        ));
+    }
+
+    /// The macOS chain: HOME/Library/Application Support, else refusal. XDG must be
+    /// ignored — a half-XDG layout would scatter the history across two conventions.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn data_dir_macos_uses_home_library_application_support() {
+        let env = DataDirEnv::new();
+        env.set("XDG_DATA_HOME", "/decoy-xdg"); // must be ignored on macOS
+        env.set("HOME", "/scratch/home");
+        assert_eq!(
+            store::default_data_dir().unwrap(),
+            std::path::Path::new("/scratch/home/Library/Application Support/gpuviewer")
+        );
+        env.set("HOME", ""); // empty counts as unset…
+        assert!(matches!(
+            store::default_data_dir(),
+            Err(StoreError::NoDataDir)
+        ));
+        env.clear("HOME"); // …and so does genuinely absent
+        assert!(matches!(
+            store::default_data_dir(),
+            Err(StoreError::NoDataDir)
+        ));
+    }
+
     /// open_default selects a separate file for mock so simulated data can never contaminate
     /// real history. We only assert the filename, never touching the real history.db.
     #[test]
     fn mock_default_path_is_separate_from_real() {
-        // Point XDG at a scratch dir so the test never opens the user's real history.
+        // Redirect every per-OS data-dir root at a scratch dir so the test never opens
+        // the user's real history — on Linux, macOS, or Windows alike.
         let scratch_dir = std::env::temp_dir().join(format!(
             "gpuviewer-xdg-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let prev = std::env::var_os("XDG_DATA_HOME");
-        // SAFETY: single-threaded test; restored before returning.
-        unsafe { std::env::set_var("XDG_DATA_HOME", &scratch_dir) };
+        let env = DataDirEnv::new();
+        env.redirect_all(&scratch_dir);
 
         let (mock_store, _) = SqliteStore::open_default(true).unwrap();
         let (real_store, _) = SqliteStore::open_default(false).unwrap();
@@ -1103,18 +1273,13 @@ mod tests {
             mock_name, real_name,
             "mock and real must be different files"
         );
-        // Both must live under our scratch XDG dir (gpuviewer subdir), never the user's home.
+        // Both must live under our scratch dir (whatever per-OS subpath the resolution
+        // appends), never the user's home.
         assert!(mock_store.path().starts_with(&scratch_dir));
 
         drop(mock_store);
         drop(real_store);
-        // SAFETY: single-threaded test.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
+        drop(env); // restores the saved variables
         let _ = std::fs::remove_dir_all(&scratch_dir);
     }
 

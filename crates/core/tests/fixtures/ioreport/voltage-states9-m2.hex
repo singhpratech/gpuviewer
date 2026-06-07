@@ -1,0 +1,8 @@
+# SYNTHETIC pmgr voltage-states9 blob: little-endian (u32 freq, u32 voltage) rows.
+# Frequencies in Hz (M1/M2-era unit). Leading all-zero "off" row must be dropped.
+00 00 00 00 00 00 00 00    # freq=0 Hz (off row)         v=0
+00 e7 76 1a 63 02 00 00    # freq=444000000 Hz -> 444    v=611
+00 61 7a 24 9c 02 00 00    # freq=612000000 Hz -> 612    v=668
+00 1a 29 30 d8 02 00 00    # freq=808000000 Hz -> 808    v=728
+00 5a 6b 3f 16 03 00 00    # freq=1064000000 Hz -> 1064  v=790
+80 c9 53 53 5b 03 00 00    # freq=1398000000 Hz -> 1398  v=859

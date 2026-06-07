@@ -8,11 +8,58 @@ repository.workspace = true
 description = "Telemetry core for gpuviewer: vendor backends, data model, event derivation"
 
 [features]
-default = ["nvidia"]
+default = ["nvidia", "wddm", "apple"]
 nvidia = ["dep:nvml-wrapper"]
+# Effective on windows targets only (the `windows` dependency below is target-gated);
+# enabling it elsewhere just turns on the wddm module's pure, any-OS-tested half.
+wddm = ["dep:windows"]
+# macOS Apple Silicon backend (design §4/§8). dlopen2 + core-foundation are pre-staged
+# for the §4.6-gated Tier C (private libIOReport via dlopen2 Option<fn>); Tier A needs
+# only the objc2 family. They may be deferred to the unfreeze without breaking anything.
+apple = [
+    "dep:core-foundation",
+    "dep:dlopen2",
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+]
 
 [dependencies]
 serde.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-nvml-wrapper = { version = "0.12", optional = true }
+# legacy-functions: nvidia.rs's Windows pre-R510 fallback calls the _v2 process-list
+# methods, which nvml-wrapper gates behind this feature (harmless on Linux — it only
+# binds extra lazily-loaded symbols).
+nvml-wrapper = { version = "0.12", optional = true, features = ["legacy-functions"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# OS system libraries (pdh/gdi32/dxgi), not vendor SDKs — direct linking is allowed.
+# Pin the minor: the Wdk_* feature namespace has moved between windows-rs releases.
+windows = { version = "0.62.2", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Performance", # Pdh*
+    "Win32_Graphics_Dxgi",      # CreateDXGIFactory1 / DXGI_ADAPTER_DESC1
+    "Wdk_Graphics_Direct3D",    # D3DKMTOpenAdapterFromLuid / QueryAdapterInfo
+    # §3.5 process-name resolution (OpenProcess / QueryFullProcessImageNameW); needed by
+    # the wddm backend's process rows — absent from the design §8 feature list by omission.
+    "Win32_System_Threading",
+] }
+# Win32_Graphics_DXCore deliberately NOT enabled for v1.5 (prerelease telemetry states).
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10", optional = true }
+dlopen2 = { version = "0.8", optional = true }
+# DECISION (2026-06-07, reversing design §4.3/§8's `features = ["exception"]`): the
+# `exception` feature pulls objc2-exception-helper, which compiles an Objective-C shim
+# (try_catch.m) via cc-rs at build time. Rejected twice over: (1) the all-Rust dependency
+# rule — the only sanctioned compiled-C exception is rusqlite's bundled SQLite; (2) its
+# build script uses the HOST cc, so Linux gcc chokes on `-arch arm64`, breaking the
+# `cargo check -p gpuviewer-core --target aarch64-apple-darwin` gate. The hazard §4.3
+# named (paravirt runners raising NSInvalidArgumentException on MISSING selectors —
+# Godot #101773) is guarded in pure Rust instead: apple.rs checks `respondsToSelector:`
+# before every Metal call, so an unanswered selector is a None field, never a throw.
+# See the addendum in docs/design/cross-platform.md.
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }

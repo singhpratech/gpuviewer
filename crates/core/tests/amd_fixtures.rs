@@ -65,12 +65,12 @@ fn rx7900xtx_dynamic_sample_unit_conversions() {
     // carries an off-by-8 thermal decoy and a nonzero legacy throttle_status, so a decoder
     // that read the wrong offset (or fell back to the legacy ASIC-specific word) would set
     // thermal/other instead of power_cap and fail these assertions.
-    assert!(s.throttle.power_cap, "PPT0 bit decodes to power_cap");
-    assert!(
-        !s.throttle.thermal,
-        "no thermal bit set — decoy must be ignored"
-    );
-    assert!(!s.throttle.other, "indep is preferred over the legacy word");
+    let t = s
+        .throttle
+        .expect("gpu_metrics present → throttle observable");
+    assert!(t.power_cap, "PPT0 bit decodes to power_cap");
+    assert!(!t.thermal, "no thermal bit set — decoy must be ignored");
+    assert!(!t.other, "indep is preferred over the legacy word");
 }
 
 #[test]
@@ -192,8 +192,9 @@ fn igpu_minimal_everything_optional_is_none() {
     assert_eq!(s.fan_pct, None);
     assert_eq!(s.sm_clock_mhz, None);
     assert_eq!(s.mem_clock_mhz, None);
-    // No gpu_metrics node on this APU fixture: throttle decodes to the honest default.
-    assert!(!s.throttle.any());
+    // No gpu_metrics node on this APU fixture: the throttle source does not exist →
+    // None (unobservable, §5.4), never an asserted all-false "not throttling".
+    assert_eq!(s.throttle, None);
 
     // No proc tree at all: an empty process list, never an error.
     assert!(b.refresh_processes(&devs[0]).unwrap().is_empty());

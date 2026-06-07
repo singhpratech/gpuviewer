@@ -1,0 +1,8 @@
+# SYNTHETIC future-chip inventory whose energy channels report nanojoules — the unit
+# must be decoded from the channel's own label (mJ/uJ/nJ all observed across chips).
+# "MCPU" models the future-chip CPU rename the design (§4.1 Tier C) names; it must not
+# perturb GPU matching.
+channel|Energy Model||MCPU Energy|nJ
+channel|Energy Model||GPU Energy|nJ
+channel|Energy Model||ANE Energy|nJ
+channel|GPU Stats|GPU Performance States|GPUPH|

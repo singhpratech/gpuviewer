@@ -66,12 +66,14 @@ fn i915_dynamic_sample_prefers_actual_freq_and_stays_honest() {
     assert_eq!(s.mem_clock_mhz, None);
     assert_eq!(s.encoder_pct, None);
     assert_eq!(s.decoder_pct, None);
-    // The fixture's throttle_reason_status is 0 (quiescent GT): nothing claimed, even
-    // though every reason file is present. status is the gate.
-    assert!(
-        !s.throttle.any(),
-        "quiescent GT (status=0) must report no throttle"
-    );
+    // The fixture's throttle_reason_status is 0 (quiescent GT): an OBSERVED
+    // not-throttling — Some(all-false), even though every reason file is present.
+    // status is the gate, and its readability is the observability gate (None would
+    // mean "this kernel exposes no throttle interface").
+    let t = s
+        .throttle
+        .expect("status file present → throttle observable");
+    assert!(!t.any(), "quiescent GT (status=0) must report no throttle");
 }
 
 #[test]
@@ -245,8 +247,9 @@ fn xe_dynamic_sample_reads_tile_gt_freq() {
     assert_eq!(s.temp_c, None);
     assert_eq!(s.fan_pct, None);
     assert_eq!(s.power_mw, None); // first energy sighting has no baseline
-                                  // freq0/throttle/status is 0 in the fixture: quiescent, nothing claimed.
-    assert!(!s.throttle.any());
+                                  // freq0/throttle/status is 0 in the fixture: quiescent —
+                                  // an observed Some(all-false), not an unobservable None.
+    assert!(!s.throttle.expect("status present → observable").any());
 }
 
 #[test]
@@ -344,14 +347,22 @@ fn i915_throttle_thermal_then_thermal_plus_power_cap() {
     std::fs::write(i915_throttle(&scratch, "thermal"), "1\n").unwrap();
     let mut b = IntelBackend::with_root(&scratch).unwrap();
     let dev = b.devices().remove(0);
-    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    let t = b
+        .refresh_dynamic(&dev)
+        .unwrap()
+        .throttle
+        .expect("status=1 → observable");
     assert!(t.thermal, "thermal=1 must map to throttle.thermal");
     assert!(!t.power_cap, "no pl* bit set → power_cap must stay false");
     assert!(!t.hw_slowdown && !t.other);
 
     // Add pl1=1 → both thermal AND power_cap (pl1|pl2|pl4 → power_cap).
     std::fs::write(i915_throttle(&scratch, "pl1"), "1\n").unwrap();
-    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    let t = b
+        .refresh_dynamic(&dev)
+        .unwrap()
+        .throttle
+        .expect("status=1 → observable");
     assert!(t.thermal && t.power_cap, "thermal + pl1 → both");
 
     let _ = std::fs::remove_dir_all(&scratch);
@@ -370,7 +381,11 @@ fn xe_throttle_pl1_is_power_cap() {
     std::fs::write(xe_throttle(&scratch, "reason_pl1"), "1\n").unwrap();
     let mut b = IntelBackend::with_root(&scratch).unwrap();
     let dev = b.devices().remove(0);
-    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    let t = b
+        .refresh_dynamic(&dev)
+        .unwrap()
+        .throttle
+        .expect("status=1 → observable");
     assert!(t.power_cap, "reason_pl1=1 must map to throttle.power_cap");
     assert!(!t.thermal && !t.hw_slowdown && !t.other);
 
@@ -389,7 +404,11 @@ fn xe_throttle_ratl_and_vr_map_to_other() {
     std::fs::write(xe_throttle(&scratch, "reason_vr_tdc"), "1\n").unwrap();
     let mut b = IntelBackend::with_root(&scratch).unwrap();
     let dev = b.devices().remove(0);
-    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    let t = b
+        .refresh_dynamic(&dev)
+        .unwrap()
+        .throttle
+        .expect("status=1 → observable");
     assert!(t.other, "vr_tdc=1 must map to throttle.other");
     assert!(!t.thermal && !t.power_cap && !t.hw_slowdown);
 
@@ -408,7 +427,11 @@ fn throttle_status_zero_ignores_stale_reason_files() {
     std::fs::write(i915_throttle(&scratch, "thermal"), "1\n").unwrap();
     let mut b = IntelBackend::with_root(&scratch).unwrap();
     let dev = b.devices().remove(0);
-    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    let t = b
+        .refresh_dynamic(&dev)
+        .unwrap()
+        .throttle
+        .expect("status=0 is still an observation");
     assert!(
         !t.any(),
         "status=0 gates out a stale reason file: {:?}",
@@ -443,7 +466,11 @@ fn throttle_status_one_with_no_reason_files_is_other_only() {
     }
     let mut b = IntelBackend::with_root(&scratch).unwrap();
     let dev = b.devices().remove(0);
-    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    let t = b
+        .refresh_dynamic(&dev)
+        .unwrap()
+        .throttle
+        .expect("status=1 → observable");
     assert_eq!(
         (t.thermal, t.power_cap, t.hw_slowdown, t.other),
         (false, false, false, true),
@@ -455,8 +482,9 @@ fn throttle_status_one_with_no_reason_files_is_other_only() {
 
 #[test]
 fn throttle_garbage_status_does_not_panic_and_claims_nothing() {
-    // A truncated/garbage status file ("zz") is not "1": treat as absent → default, no
-    // panic. Even with a reason file set to 1, the gate keeps us silent.
+    // A truncated/garbage status file ("zz") is a broken interface: unobservable →
+    // None (§5.4), no panic. Even with a reason file set to 1, the gate keeps us
+    // silent — and None is silence, not an asserted "not throttling".
     let scratch =
         std::env::temp_dir().join(format!("gpuviewer-i915-garbage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
@@ -467,10 +495,9 @@ fn throttle_garbage_status_does_not_panic_and_claims_nothing() {
     let mut b = IntelBackend::with_root(&scratch).unwrap();
     let dev = b.devices().remove(0);
     let t = b.refresh_dynamic(&dev).unwrap().throttle;
-    assert!(
-        !t.any(),
-        "garbage status must claim nothing: {:?}",
-        t.labels()
+    assert_eq!(
+        t, None,
+        "garbage status is unobservable, not observed-quiet"
     );
 
     let _ = std::fs::remove_dir_all(&scratch);

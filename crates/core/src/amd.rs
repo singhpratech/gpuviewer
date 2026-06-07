@@ -12,8 +12,9 @@
 //!   backed by fixtures. `decode_gpu_metrics_throttle` parses it directly off the sysfs
 //!   blob (offsets derived from the in-tree kernel header — see that function). A blob that
 //!   is absent, truncated, of an unknown revision, or whose self-declared `structure_size`
-//!   is inconsistent decodes to `ThrottleReasons::default()`: no signal is honest, a
-//!   misread byte narrated as a throttle cause is not.
+//!   is inconsistent decodes to `None`: that source is unobservable, and an asserted
+//!   all-false would fabricate an "observed: not throttling" fact (§5.4) from bytes we
+//!   never understood.
 //! - Only SMU-backed sysfs is polled (`gpu_busy_percent`, hwmon) — never GRBM registers,
 //!   whose polling breaks GFXOFF (the monitor must not change what it measures).
 //! - Per-process attribution is DRM fdinfo (kernel 5.14+, standardized 5.19+): cumulative
@@ -417,8 +418,12 @@ fn v3_residency_layout(format: u8, content: u8) -> Option<V3ResidencyLayout> {
 /// The contract is *honest absence on any doubt*: a buffer too short for the header, a
 /// `structure_size` that disagrees with the version's known length (or is shorter than the
 /// fields we read), an unknown `(format, content)` revision, or an out-of-bounds field all
-/// yield `ThrottleReasons::default()`. We never wrap, never panic, and never narrate a byte
-/// we are not certain of.
+/// yield `None`. `Some` is returned only off a successfully decoded struct, because under
+/// §5.4 an all-false `ThrottleReasons` is an *observation* of quiet — emitting it from a
+/// blob we could not decode would fabricate a fact-grade "not throttling" forever on any
+/// kernel shipping a revision newer than this table. Garbage content is a broken interface,
+/// which is unobservable too — refusing beats guessing. We never wrap, never panic, and
+/// never narrate a byte we are not certain of.
 ///
 /// Mapping precedence: prefer `indep_throttle_status` (ASIC-independent bits) and split it
 /// into thermal / power_cap / hw_slowdown / other. v3_0 has no status word — its per-cause
@@ -426,10 +431,10 @@ fn v3_residency_layout(format: u8, content: u8) -> Option<V3ResidencyLayout> {
 /// ASIC-specific `throttle_status`, the per-bit meaning varies by ASIC and is not safe to
 /// map; a nonzero value reliably means "some throttler is active", so it surfaces as `other`
 /// alone rather than as a fabricated specific cause.
-pub fn decode_gpu_metrics_throttle(buf: &[u8]) -> ThrottleReasons {
+pub fn decode_gpu_metrics_throttle(buf: &[u8]) -> Option<ThrottleReasons> {
     // Common header: structure_size u16 @0, format_revision u8 @2, content_revision u8 @3.
     if buf.len() < HEADER_LEN {
-        return ThrottleReasons::default();
+        return None;
     }
     let structure_size = u16::from_le_bytes([buf[0], buf[1]]) as usize;
     let format = buf[2];
@@ -438,52 +443,53 @@ pub fn decode_gpu_metrics_throttle(buf: &[u8]) -> ThrottleReasons {
     // The blob must hold at least as many bytes as it claims, and the claim must be a real
     // header (a zeroed/garbage node reads structure_size 0). Both guards reject truncation.
     if structure_size < HEADER_LEN || buf.len() < structure_size {
-        return ThrottleReasons::default();
+        return None;
     }
 
     if let Some(layout) = throttle_layout(format, content) {
         // structure_size must match the version's known size exactly — a mismatch means we
         // are not looking at the struct we think we are, so we decode nothing.
         if structure_size != layout.size {
-            return ThrottleReasons::default();
+            return None;
         }
         if let Some(off) = layout.indep {
-            if let Some(bits) = read_u64_le(buf, off) {
-                return map_indep_throttle(bits);
-            }
-            return ThrottleReasons::default();
+            // An OOB read after the size gate would mean a wrong layout table, not a quiet
+            // GPU — propagate the doubt as None rather than asserting all-false.
+            return read_u64_le(buf, off).map(map_indep_throttle);
         }
         if let Some(off) = layout.legacy {
-            return match read_u32_le(buf, off) {
-                // Legacy throttle_status is ASIC-specific: nonzero = throttling, cause
-                // unmappable. Honest coarse signal beats both silence and a guessed column.
-                Some(v) if v != 0 => ThrottleReasons {
-                    other: true,
-                    ..Default::default()
-                },
-                _ => ThrottleReasons::default(),
-            };
+            // Legacy throttle_status is ASIC-specific: nonzero = throttling, cause
+            // unmappable. Honest coarse signal beats both silence and a guessed column;
+            // a decoded zero is a genuine observation of quiet.
+            return read_u32_le(buf, off).map(|v| ThrottleReasons {
+                other: v != 0,
+                ..Default::default()
+            });
         }
-        return ThrottleReasons::default();
+        // A known version that carries no throttle word has nothing to observe here.
+        return None;
     }
 
     if let Some(r) = v3_residency_layout(format, content) {
         if structure_size != r.size {
-            return ThrottleReasons::default();
+            return None;
         }
-        let any = |off: usize| read_u32_le(buf, off).is_some_and(|v| v != 0);
-        return ThrottleReasons {
-            thermal: any(r.thm_core) || any(r.thm_gfx) || any(r.thm_soc),
+        // Every counter must actually be readable: a missing field is layout doubt (None),
+        // never silently counted as "that throttler was quiet".
+        let any = |off: usize| read_u32_le(buf, off).map(|v| v != 0);
+        return Some(ThrottleReasons {
+            thermal: any(r.thm_core)? || any(r.thm_gfx)? || any(r.thm_soc)?,
             // SPL/FPPT/SPPT are the APU power limits.
-            power_cap: any(r.spl) || any(r.fppt) || any(r.sppt),
-            hw_slowdown: any(r.prochot),
+            power_cap: any(r.spl)? || any(r.fppt)? || any(r.sppt)?,
+            hw_slowdown: any(r.prochot)?,
             sync_boost: false,
             other: false,
-        };
+        });
     }
 
-    // Unknown future revision: decode nothing rather than guess offsets.
-    ThrottleReasons::default()
+    // Unknown future revision: we cannot observe throttling through a struct we cannot
+    // decode, so this is absence — not an asserted "no throttle".
+    None
 }
 
 /// The fdinfo keys this backend consumes. Anything missing (older kernel, non-DRM fd)
@@ -790,6 +796,8 @@ impl GpuBackend for AmdBackend {
             // kernel, and the uevent DRIVER= field is a name, not a version.
             driver_version: None,
             process_hint: self.process_hint.clone(),
+            // sysfs numbers carry their plain meanings — nothing to qualify.
+            source_caveat: None,
         })
     }
 
@@ -802,6 +810,7 @@ impl GpuBackend for AmdBackend {
             ts_ms: now_ms(),
             // SMU activity metric — duty-cycle-flavored like every vendor's "util".
             util_pct: read_parse(&p.join("gpu_busy_percent")),
+            util_engine: None, // device-wide number, not an engine headline
             mem_used_bytes: read_parse(&p.join("mem_info_vram_used")),
             power_mw: hwmon.and_then(power_mw),
             temp_c: hwmon.and_then(edge_temp_c),
@@ -818,12 +827,15 @@ impl GpuBackend for AmdBackend {
             // and units are a separate job — absent until that decoder lands.
             encoder_pct: None,
             decoder_pct: None,
-            // Throttle status lives in the versioned `gpu_metrics` binary node. An absent
-            // file (APUs/older kernels without the node) or anything the decoder cannot
-            // trust reads back as the default "no throttle signal" — honest, never faked.
+            // Throttle status lives in the versioned `gpu_metrics` binary node. An
+            // absent/unreadable file (APUs/older kernels without the node) means the
+            // source cannot observe throttling at all → `None` (§5.4), never an asserted
+            // all-false. A present blob the decoder cannot trust (truncated, lying
+            // structure_size, unknown future revision) is equally unobservable — the
+            // decoder returns None for those, so Some here always means "decoded".
             throttle: fs::read(p.join("gpu_metrics"))
-                .map(|buf| decode_gpu_metrics_throttle(&buf))
-                .unwrap_or_default(),
+                .ok()
+                .and_then(|buf| decode_gpu_metrics_throttle(&buf)),
         })
     }
 
@@ -1048,7 +1060,8 @@ mod tests {
     #[test]
     fn indep_thermal_bit_decodes_to_thermal_only() {
         // TEMP_HOTSPOT (bit 36) is purely thermal.
-        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_TEMP_HOTSPOT_BIT));
+        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_TEMP_HOTSPOT_BIT))
+            .expect("well-formed v1_3 must decode");
         assert!(t.thermal);
         assert!(!t.power_cap && !t.hw_slowdown && !t.sync_boost && !t.other);
     }
@@ -1056,14 +1069,16 @@ mod tests {
     #[test]
     fn indep_ppt_bit_decodes_to_power_cap_only() {
         // PPT0 (bit 0) is a package-power limit; the legacy/off-by-8 decoys must be ignored.
-        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_PPT0_BIT));
+        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_PPT0_BIT))
+            .expect("well-formed v1_3 must decode");
         assert!(t.power_cap);
         assert!(!t.thermal && !t.hw_slowdown && !t.sync_boost && !t.other);
     }
 
     #[test]
     fn indep_prochot_bit_decodes_to_hw_slowdown() {
-        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_PROCHOT_GFX_BIT));
+        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_PROCHOT_GFX_BIT))
+            .expect("well-formed v1_3 must decode");
         assert!(t.hw_slowdown);
         assert!(!t.thermal && !t.power_cap && !t.sync_boost && !t.other);
     }
@@ -1075,7 +1090,8 @@ mod tests {
             | (1 << SMU_THROTTLER_TDC_GFX_BIT)
             | (1 << SMU_THROTTLER_PROCHOT_CPU_BIT)
             | (1u64 << 60);
-        let t = decode_gpu_metrics_throttle(&build_v2_3(bits));
+        let t =
+            decode_gpu_metrics_throttle(&build_v2_3(bits)).expect("well-formed v2_3 must decode");
         assert!(t.thermal && t.power_cap && t.hw_slowdown);
         // The unrecognised bit lands in `other` (tolerant decoding), not dropped.
         assert!(t.other);
@@ -1086,65 +1102,70 @@ mod tests {
     fn legacy_only_nonzero_is_coarse_other_never_a_guessed_cause() {
         // v2_1 has no indep word: a nonzero ASIC-specific throttle_status is real, but its
         // per-bit meaning is unknowable cross-ASIC, so it surfaces as `other` alone.
-        let t = decode_gpu_metrics_throttle(&build_v2_1(0x0000_00FF));
+        let t = decode_gpu_metrics_throttle(&build_v2_1(0x0000_00FF))
+            .expect("well-formed v2_1 must decode");
         assert!(t.other);
         assert!(!t.thermal && !t.power_cap && !t.hw_slowdown && !t.sync_boost);
-        // Zero legacy status = not throttling.
+        // Zero legacy status in a decoded struct is an OBSERVED quiet — Some(all-false).
         assert_eq!(
             decode_gpu_metrics_throttle(&build_v2_1(0)),
-            ThrottleReasons::default()
+            Some(ThrottleReasons::default())
         );
     }
 
     #[test]
     fn v3_residency_counters_map_by_name() {
         // prochot residency → hw_slowdown, spl (power limit) → power_cap.
-        let t = decode_gpu_metrics_throttle(&build_v3_0(5, 9, 0));
+        let t = decode_gpu_metrics_throttle(&build_v3_0(5, 9, 0))
+            .expect("well-formed v3_0 must decode");
         assert!(t.hw_slowdown && t.power_cap);
         assert!(!t.thermal && !t.other);
         // thm_gfx residency → thermal.
-        let t = decode_gpu_metrics_throttle(&build_v3_0(0, 0, 3));
+        let t = decode_gpu_metrics_throttle(&build_v3_0(0, 0, 3))
+            .expect("well-formed v3_0 must decode");
         assert!(t.thermal);
         assert!(!t.hw_slowdown && !t.power_cap);
-        // All-zero residency = not throttling.
+        // All-zero residency in a decoded struct is an OBSERVED quiet — Some(all-false).
         assert_eq!(
             decode_gpu_metrics_throttle(&build_v3_0(0, 0, 0)),
-            ThrottleReasons::default()
+            Some(ThrottleReasons::default())
         );
     }
 
     #[test]
-    fn unknown_revision_decodes_to_default() {
+    fn unknown_revision_decodes_to_none() {
         // A well-formed header with a future (format=9, content=9) revision: no offsets we
-        // trust → default, never a guess at byte positions.
+        // trust → None, never a guess at byte positions and never a fabricated "observed
+        // quiet" (an asserted all-false here would be a permanent fact-grade lie on every
+        // kernel newer than the layout table — §5.4).
         let mut b = build_v1_3(1 << SMU_THROTTLER_PPT0_BIT);
         b[2] = 9;
         b[3] = 9;
         assert_eq!(
             decode_gpu_metrics_throttle(&b),
-            ThrottleReasons::default(),
-            "unknown revision must decode nothing"
+            None,
+            "unknown revision must be unobservable, not quiet"
         );
     }
 
     #[test]
-    fn truncated_blob_decodes_to_default_without_panic() {
-        // The corrupt/short-sysfs honesty case: every prefix length must yield default,
-        // never a panic and never a half-read word.
+    fn truncated_blob_decodes_to_none_without_panic() {
+        // The corrupt/short-sysfs honesty case: every prefix length must yield None,
+        // never a panic, never a half-read word, never an asserted all-false.
         let full = build_v1_3(1 << SMU_THROTTLER_PPT0_BIT);
         for len in 0..full.len() {
             assert_eq!(
                 decode_gpu_metrics_throttle(&full[..len]),
-                ThrottleReasons::default(),
-                "a {len}-byte prefix of a v1_3 blob must decode to default"
+                None,
+                "a {len}-byte prefix of a v1_3 blob must decode to None"
             );
         }
         // An empty buffer is the extreme of the same case.
-        assert_eq!(decode_gpu_metrics_throttle(&[]), ThrottleReasons::default());
+        assert_eq!(decode_gpu_metrics_throttle(&[]), None);
     }
 
     #[test]
-    fn lying_structure_size_decodes_to_default() {
+    fn lying_structure_size_decodes_to_none() {
         // structure_size claims a smaller struct than the version's real length: we are not
         // looking at the struct we think we are, so decode nothing even though a PPT bit is
         // physically present at @112.
@@ -1152,13 +1173,13 @@ mod tests {
         b[0..2].copy_from_slice(&100u16.to_le_bytes()); // real v1_3 is 120
         assert_eq!(
             decode_gpu_metrics_throttle(&b),
-            ThrottleReasons::default(),
+            None,
             "a structure_size that disagrees with the version size is not trusted"
         );
         // The mirror case: structure_size larger than the buffer (claims bytes we lack).
         let mut b = build_v1_3(1 << SMU_THROTTLER_PPT0_BIT);
         b[0..2].copy_from_slice(&200u16.to_le_bytes());
-        assert_eq!(decode_gpu_metrics_throttle(&b), ThrottleReasons::default());
+        assert_eq!(decode_gpu_metrics_throttle(&b), None);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+# SYNTHETIC GPUPH interval residencies (IOReportCreateSamplesDelta output shape: deltas,
+# not cumulative counters). 1,000,000 total ticks, 600,000 idle (OFF) -> 40% active.
+# P-state ticks pair index-wise with voltage-states9-m2.hex -> 798 MHz weighted.
+state|OFF|600000
+state|P1|100000
+state|P2|50000
+state|P3|150000
+state|P4|50000
+state|P5|50000

@@ -139,6 +139,7 @@ impl GpuBackend for MockBackend {
                 temp_slowdown_c: Some(84.0),
                 driver_version: Some("mock 999.99".into()),
                 process_hint: None,
+                source_caveat: None,
             })
         } else if *dev == self.ids[1] {
             Ok(StaticInfo {
@@ -152,6 +153,7 @@ impl GpuBackend for MockBackend {
                 temp_slowdown_c: Some(110.0),
                 driver_version: Some("mock amdgpu".into()),
                 process_hint: None,
+                source_caveat: None,
             })
         } else {
             Err(BackendError::DeviceNotFound(dev.clone()))
@@ -241,6 +243,7 @@ impl TrainSim {
         DynamicSample {
             ts_ms,
             util_pct: Some(util as f32),
+            util_engine: None,
             mem_used_bytes: Some(self.vram_python as u64 + 700 * 1024 * 1024),
             power_mw: Some(power as u32),
             temp_c: Some(self.temp_c as f32),
@@ -249,10 +252,12 @@ impl TrainSim {
             mem_clock_mhz: Some(10_500),
             encoder_pct: Some(0.0),
             decoder_pct: Some(0.0),
-            throttle: ThrottleReasons {
+            // The mock OBSERVES throttling by design (it scripts it) — always `Some`,
+            // never the unobservable `None` (design §5.4: mock stays Some).
+            throttle: Some(ThrottleReasons {
                 thermal: self.throttling,
                 ..Default::default()
-            },
+            }),
         }
     }
 
@@ -310,6 +315,7 @@ impl DesktopSim {
         DynamicSample {
             ts_ms,
             util_pct: Some(self.util_level as f32),
+            util_engine: None,
             mem_used_bytes: Some(used as u64),
             power_mw: Some(if self.ollama_present { 248_000 } else { 41_000 }),
             temp_c: Some(if self.ollama_present { 71.0 } else { 44.0 }),
@@ -318,7 +324,7 @@ impl DesktopSim {
             mem_clock_mhz: None, // exercise the Option path: not every metric exists
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         }
     }
 
@@ -394,7 +400,7 @@ mod tests {
             l.ts_ms = s.ts_ms;
             assert_eq!(*s, l, "sim state diverged at tick {i}");
             let _ = live.refresh_processes(&train).unwrap();
-            seeded_throttled |= s.throttle.any();
+            seeded_throttled |= s.throttle.is_some_and(|t| t.any());
         }
         assert!(
             seeded_throttled,

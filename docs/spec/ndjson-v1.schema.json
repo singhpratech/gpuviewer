@@ -47,12 +47,16 @@
     },
     "sample": {
       "type": "object",
-      "required": ["ts_ms", "util_pct", "mem_used_bytes", "power_mw", "temp_c", "fan_pct", "sm_clock_mhz", "mem_clock_mhz", "encoder_pct", "decoder_pct", "throttle"],
+      "required": ["ts_ms", "util_pct", "util_engine", "mem_used_bytes", "power_mw", "temp_c", "fan_pct", "sm_clock_mhz", "mem_clock_mhz", "encoder_pct", "decoder_pct", "throttle"],
       "properties": {
         "ts_ms": { "type": "integer", "minimum": 0 },
         "util_pct": {
           "type": ["number", "null"],
-          "description": "Duty-cycle (time >=1 kernel resident), NOT saturation."
+          "description": "Duty-cycle (time >=1 kernel resident), NOT saturation. Nominally 0-100, but engine-derived sources (Windows WDDM PDH with PDH_FMT_NOCAP100, per-engine busy% summed across pids) can honestly exceed 100 — no maximum is enforced; >100 is real data, not corruption."
+        },
+        "util_engine": {
+          "type": ["string", "null"],
+          "description": "Engine whose busy% util_pct reports when utilization is an engine headline (Windows WDDM busiest engine); null where utilization is device-wide. Open set — never an enum."
         },
         "mem_used_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "power_mw": { "type": ["integer", "null"], "minimum": 0 },
@@ -60,9 +64,18 @@
         "fan_pct": { "type": ["number", "null"] },
         "sm_clock_mhz": { "type": ["integer", "null"], "minimum": 0 },
         "mem_clock_mhz": { "type": ["integer", "null"], "minimum": 0 },
-        "encoder_pct": { "type": ["number", "null"] },
-        "decoder_pct": { "type": ["number", "null"] },
-        "throttle": { "$ref": "#/$defs/throttle" }
+        "encoder_pct": {
+          "type": ["number", "null"],
+          "description": "Video encoder utilization. Nominally 0-100; engine-derived sources can exceed 100 (see util_pct) — no maximum is enforced."
+        },
+        "decoder_pct": {
+          "type": ["number", "null"],
+          "description": "Video decoder utilization. Nominally 0-100; engine-derived sources can exceed 100 (see util_pct) — no maximum is enforced."
+        },
+        "throttle": {
+          "oneOf": [{ "$ref": "#/$defs/throttle" }, { "type": "null" }],
+          "description": "null = this source cannot observe throttling (blind spot, e.g. WDDM counters/macOS) — NOT 'not throttling'; an all-false object is an observed quiet."
+        }
       }
     },
     "throttle": {
@@ -87,7 +100,10 @@
         "name": { "type": "string" },
         "kind": { "enum": ["compute", "graphics", "both", "unknown"] },
         "mem_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "util_pct": { "type": ["number", "null"] },
+        "util_pct": {
+          "type": ["number", "null"],
+          "description": "Per-process GPU utilization. Nominally 0-100; engine-derived sources can exceed 100 (see the sample util_pct description) — no maximum is enforced."
+        },
         "cpu_pct": {
           "type": ["number", "null"],
           "description": "Percent of one core; 100.0 = one full core, can exceed 100 on multithreaded processes."

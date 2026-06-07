@@ -31,8 +31,11 @@ const DOCUMENTED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
 const DOCUMENTED_PROCESS_KINDS: &[&str] = &["compute", "graphics", "both", "unknown"];
 
 /// Run `gpuviewer --json --once --mock` and return stdout split into lines.
-/// XDG_DATA_HOME/HOME point at a scratch dir on the child process only: persistence is on
-/// by default, and a conformance test must never write into the user's real data dir.
+/// Every per-OS data-dir root (XDG_DATA_HOME on Linux, HOME on macOS, LOCALAPPDATA/
+/// USERPROFILE on Windows) points at a scratch dir on the child process only: persistence
+/// is on by default, and a conformance test must never write into the user's real data
+/// dir on ANY OS. The variables the local OS ignores are inert — resolution is env-based
+/// per OS, which is exactly what makes this redirection possible.
 fn run_once() -> Vec<String> {
     let dir = std::env::temp_dir().join(format!("gpuviewer-ndjson-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch data dir");
@@ -40,6 +43,8 @@ fn run_once() -> Vec<String> {
         .args(["--json", "--once", "--mock"])
         .env("XDG_DATA_HOME", &dir)
         .env("HOME", &dir)
+        .env("LOCALAPPDATA", &dir)
+        .env("USERPROFILE", &dir)
         .output()
         .expect("failed to spawn the gpuviewer binary");
     let _ = std::fs::remove_dir_all(&dir);
@@ -70,6 +75,24 @@ fn assert_frame_device(dev: &Value) {
         sample["util_pct"].is_number(),
         "mock util_pct must be a number (the mock always provides it): {sample:?}"
     );
+    // util_engine is additive-nullable: the key must be present (null on sources whose
+    // utilization is device-wide, like the mock).
+    assert!(
+        sample.contains_key("util_engine"),
+        "util_engine key must be present (null is fine): {sample:?}"
+    );
+    // throttle is nullable in the model (null = source cannot observe — a blind spot,
+    // not "not throttling"), but the mock OBSERVES throttling by design, so here it
+    // must be the five-boolean object the spec table describes.
+    let throttle = sample["throttle"]
+        .as_object()
+        .unwrap_or_else(|| panic!("mock throttle must be an observed object: {sample:?}"));
+    for key in ["thermal", "power_cap", "hw_slowdown", "sync_boost", "other"] {
+        assert!(
+            throttle.get(key).is_some_and(Value::is_boolean),
+            "throttle.{key} must be a boolean when throttle is observed: {throttle:?}"
+        );
+    }
     let procs = dev["processes"]
         .as_array()
         .unwrap_or_else(|| panic!("processes must be an array: {dev}"));
@@ -143,6 +166,57 @@ fn assert_event_line(v: &Value) {
             "a \"likely\" event must hedge in its title: {title:?}"
         );
     }
+}
+
+/// The §5.4 wire contract for unobservable throttle, pinned at the serde level (the mock
+/// always observes, so the binary run above cannot produce the null): a sample whose
+/// source cannot observe throttling serializes `"throttle": null` — never an all-false
+/// object — and a line missing the field (recorded before the change) deserializes to
+/// `None`. Same for the additive `util_engine`.
+#[test]
+fn unobservable_throttle_serializes_as_null_and_roundtrips() {
+    let sample = gpuviewer_core::DynamicSample {
+        ts_ms: 1,
+        util_pct: Some(97.0),
+        util_engine: Some("3D".into()),
+        mem_used_bytes: None,
+        power_mw: None,
+        temp_c: None,
+        fan_pct: None,
+        sm_clock_mhz: None,
+        mem_clock_mhz: None,
+        encoder_pct: None,
+        decoder_pct: None,
+        throttle: None,
+    };
+    let v = serde_json::to_value(&sample).expect("sample serializes");
+    assert!(
+        v.get("throttle").is_some_and(Value::is_null),
+        "unobservable throttle must be a JSON null, not an all-false object: {v}"
+    );
+    assert_eq!(v["util_engine"], "3D");
+
+    // An observed-quiet sample is the five-boolean object — the two states must be
+    // distinguishable on the wire.
+    let observed = gpuviewer_core::DynamicSample {
+        throttle: Some(gpuviewer_core::ThrottleReasons::default()),
+        ..sample.clone()
+    };
+    let v = serde_json::to_value(&observed).expect("sample serializes");
+    assert!(
+        v["throttle"].is_object(),
+        "observed quiet is an object: {v}"
+    );
+
+    // Pre-change lines (no throttle/util_engine keys at all) still deserialize: both
+    // default to None per the model's serde(default).
+    let old_line = r#"{"ts_ms":1,"util_pct":null,"mem_used_bytes":null,"power_mw":null,
+        "temp_c":null,"fan_pct":null,"sm_clock_mhz":null,"mem_clock_mhz":null,
+        "encoder_pct":null,"decoder_pct":null}"#;
+    let s: gpuviewer_core::DynamicSample =
+        serde_json::from_str(old_line).expect("pre-change sample lines must deserialize");
+    assert_eq!(s.throttle, None);
+    assert_eq!(s.util_engine, None);
 }
 
 #[test]
