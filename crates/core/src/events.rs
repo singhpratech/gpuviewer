@@ -80,6 +80,27 @@ const IDLE_GAP_UTIL_PCT: f32 = 10.0;
 const IDLE_GAP_MIN_MS: u64 = 10_000;
 const IDLE_HOLDER_MIN_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Hang-suspicion thresholds. The most confidently-wrong-prone inference in the product, so
+/// the bar is deliberately steep: VRAM held but engines flat-dead, the holder's own util
+/// also flat, and the whole pattern sustained for ten unbroken minutes before we dare say
+/// "likely hung". A live trough that recovers, or any GPU activity, must not trip it.
+const HANG_DEVICE_UTIL_PCT: f32 = 2.0;
+const HANG_PROC_UTIL_PCT: f32 = 2.0;
+const HANG_HOLDER_MIN_BYTES: u64 = 1024 * 1024 * 1024;
+const HANG_RESET_UTIL_PCT: f32 = 10.0;
+const HANG_MIN_MS: u64 = 600_000;
+
+/// CPU-spillover thresholds. A freshly-loaded model that sits on a near-idle GPU while its
+/// own process pegs multiple cores is the signature of a partial CPU offload (the model did
+/// not fit in VRAM). We assess over a fixed window so a model still warming up is not judged
+/// prematurely, and demand a high CPU bar plus a near-dead GPU before claiming it.
+const SPILLOVER_HOLDER_MIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const SPILLOVER_WINDOW_MS: u64 = 90_000;
+const SPILLOVER_MAX_MEAN_UTIL_PCT: f64 = 15.0;
+const SPILLOVER_BUSY_UTIL_PCT: f32 = 30.0;
+const SPILLOVER_MIN_MEAN_CPU_PCT: f64 = 150.0;
+const SPILLOVER_MIN_CPU_SAMPLES: u32 = 3;
+
 #[derive(Default)]
 struct DevState {
     prev: Option<DynamicSample>,
@@ -96,6 +117,10 @@ struct DevState {
     /// as a training stall if real work preceded it (a desktop idling is no story).
     idle_eligible: bool,
     idle_gap: Option<IdleGap>,
+    hang: Option<HangEpisode>,
+    /// Open CPU-spillover assessments keyed by the holder's pid; one per new big-memory
+    /// process, closed (and judged) when its window elapses or it is cancelled.
+    spillovers: HashMap<u32, Spillover>,
 }
 
 /// An idle gap in flight: narrated (or discarded) only once util recovers and the
@@ -111,6 +136,40 @@ struct IdleGap {
     /// when the gap opened; pruned as they exit. Empty at gap end means nobody stayed
     /// attached, so the process_exited event already tells the story.
     holders: HashMap<u32, (String, u64)>,
+    /// Set when a `HangSuspected` event fired while this gap was open. A hang is just an
+    /// idle gap that lasted long enough to look dead; narrating both for one trough would
+    /// double-count the same incident, so the gap stays silent on recovery.
+    hang_narrated: bool,
+}
+
+/// A hang suspicion in flight: VRAM held with both device and holder engines flat-dead,
+/// anchored to the largest qualifying holder. Emits once the pattern survives `HANG_MIN_MS`
+/// unbroken; reset (without emitting) the moment activity returns, the holder exits, or
+/// util goes unobservable.
+struct HangEpisode {
+    start_ms: u64,
+    /// The largest qualifying holder when the episode opened — the anchor of the narration.
+    /// A different (or larger) holder appearing later does not move the anchor; the claim is
+    /// about *this* allocation having gone quiet.
+    holder_pid: u32,
+    holder_name: String,
+    holder_mem: u64,
+    /// Running mean of device util across the episode, for the evidence line.
+    util_sum: f64,
+    util_n: u32,
+    /// Latched once the event has been emitted, so a sustained hang narrates exactly once.
+    fired: bool,
+}
+
+/// A CPU-spillover assessment in flight for one freshly-attached big-memory process.
+struct Spillover {
+    name: String,
+    mem_bytes: u64,
+    start_ms: u64,
+    util_sum: f64,
+    util_n: u32,
+    cpu_sum: f64,
+    cpu_n: u32,
 }
 
 #[derive(Default)]
@@ -149,8 +208,13 @@ impl EventEngine {
         let mut out = Vec::new();
 
         throttle_events(st, device, &name, sample, temp_slowdown_c, &mut out);
+        // Before process_events flips `seen_first_procs` / overwrites `st.procs`, so the
+        // newness diff that opens a spillover window sees this tick's arrivals.
+        spillover_events(st, device, &name, sample, processes, &mut out);
         process_events(st, device, &name, sample.ts_ms, processes, &mut out);
         // After process_events, so holder tracking sees this tick's process list.
+        hang_events(st, device, &name, sample, &mut out);
+        // After hang_events, so a hang that just fired can suppress the gap it lived in.
         idle_gap_events(st, device, &name, sample, &mut out);
         vram_pressure_events(st, device, &name, sample, mem_total, &mut out);
 
@@ -318,7 +382,7 @@ fn idle_gap_events(
             .iter()
             .max_by_key(|(_, (_, mem))| *mem)
             .map(|(pid, (pname, mem))| (*pid, pname.clone(), *mem));
-        if dur_ms >= IDLE_GAP_MIN_MS {
+        if dur_ms >= IDLE_GAP_MIN_MS && !gap.hang_narrated {
             if let Some((pid, pname, mem)) = holder {
                 let dur = fmt_dur_ms(dur_ms);
                 let mean_util = gap.util_sum / gap.util_n.max(1) as f64;
@@ -378,7 +442,213 @@ fn idle_gap_events(
         util_sum: util as f64,
         util_n: 1,
         holders,
+        hang_narrated: false,
     });
+}
+
+/// `HangSuspected` — VRAM held, engines flat-dead, holder alive: the job has likely hung.
+///
+/// An inference of the riskiest kind, so the gate is steep: the device must be effectively
+/// idle (`≤ HANG_DEVICE_UTIL_PCT`), a holder must be sitting on ≥ 1 GiB while its *own*
+/// engine activity is also flat (or unreported), and that exact pattern must survive a full
+/// `HANG_MIN_MS` without a break before we narrate. We anchor to the largest qualifying
+/// holder at episode start and never re-anchor: the claim is that *this* allocation went
+/// quiet. The episode is dropped (never narrated) the instant any premise stops holding —
+/// the device wakes up, the holder exits, util goes unobservable, or even a sub-throttle
+/// flicker of activity — because a hang we cannot stand fully behind is worse than silence.
+fn hang_events(
+    st: &mut DevState,
+    device: &DeviceId,
+    name: &str,
+    sample: &DynamicSample,
+    out: &mut Vec<Event>,
+) {
+    let Some(util) = sample.util_pct else {
+        // Util unobservable: we cannot see "zero engine activity", so we cannot claim a
+        // hang. Drop the episode rather than freeze a stale window across the blind spot.
+        st.hang = None;
+        return;
+    };
+
+    // The largest holder that is itself quiet: ≥ 1 GiB resident with its own util flat or
+    // simply not reported (a hung kernel reports no per-process util — absence is expected).
+    let candidate = st
+        .procs
+        .values()
+        .filter(|p| p.mem_bytes.unwrap_or(0) >= HANG_HOLDER_MIN_BYTES)
+        .filter(|p| p.util_pct.map(|u| u <= HANG_PROC_UTIL_PCT).unwrap_or(true))
+        .max_by_key(|p| p.mem_bytes.unwrap_or(0));
+    let condition = util <= HANG_DEVICE_UTIL_PCT && candidate.is_some();
+
+    if let Some(mut ep) = st.hang.take() {
+        // The anchored holder must still be alive; if it exited, `process_exited` already
+        // told the story and the premise ("process still alive") is gone.
+        let holder_alive = st.procs.contains_key(&ep.holder_pid);
+        if util > HANG_RESET_UTIL_PCT || !holder_alive || !condition {
+            // Any break ends the episode silently — continuity is the whole claim.
+            return;
+        }
+        ep.util_sum += util as f64;
+        ep.util_n += 1;
+        let elapsed = sample.ts_ms.saturating_sub(ep.start_ms);
+        if elapsed >= HANG_MIN_MS && !ep.fired {
+            ep.fired = true;
+            let mean_util = ep.util_sum / ep.util_n.max(1) as f64;
+            let dur = fmt_dur_ms(elapsed);
+            out.push(Event {
+                ts_ms: sample.ts_ms,
+                device: device.clone(),
+                kind: EventKind::HangSuspected,
+                severity: Severity::Warning,
+                confidence: Confidence::Likely,
+                title: format!(
+                    "{name}: {} (pid {}) likely hung — held {} for {dur} with zero GPU \
+                     activity, process still alive",
+                    ep.holder_name,
+                    ep.holder_pid,
+                    fmt_bytes(ep.holder_mem),
+                ),
+                evidence: format!(
+                    "device util mean {mean_util:.1}% over {dur} ({}..{} ms); \
+                     {} (pid {}) held {} throughout while its own engine activity stayed flat",
+                    ep.start_ms,
+                    sample.ts_ms,
+                    ep.holder_name,
+                    ep.holder_pid,
+                    fmt_bytes(ep.holder_mem),
+                ),
+            });
+            // A hang is an idle gap that lasted too long to look alive; if a gap is still
+            // open over this same trough, mute it so one incident is narrated once.
+            if let Some(gap) = st.idle_gap.as_mut() {
+                gap.hang_narrated = true;
+            }
+        }
+        st.hang = Some(ep);
+        return;
+    }
+
+    if condition {
+        let holder = candidate.expect("condition implies a candidate");
+        st.hang = Some(HangEpisode {
+            start_ms: sample.ts_ms,
+            holder_pid: holder.pid,
+            holder_name: holder.name.clone(),
+            holder_mem: holder.mem_bytes.unwrap_or(0),
+            util_sum: util as f64,
+            util_n: 1,
+            fired: false,
+        });
+    }
+}
+
+/// `CpuSpillover` — a freshly-loaded model whose GPU stays idle while its process burns
+/// CPU: the signature of a partial CPU offload (the model did not fit in VRAM).
+///
+/// We open a fixed `SPILLOVER_WINDOW_MS` assessment when a *new* process attaches holding
+/// ≥ 2 GiB, then judge at window close: narrate only if the GPU averaged near-idle while the
+/// process averaged multiple busy cores, with enough CPU samples to mean it. The assessment
+/// is cancelled silently — never narrated — if the process exits mid-window, the GPU shows
+/// real use at any point, or (honesty rule) we never once saw its CPU: with no CPU
+/// visibility we cannot claim it is "burning CPU", so we say nothing rather than guess.
+fn spillover_events(
+    st: &mut DevState,
+    device: &DeviceId,
+    name: &str,
+    sample: &DynamicSample,
+    processes: &[ProcessSample],
+    out: &mut Vec<Event>,
+) {
+    let now: HashMap<u32, &ProcessSample> = processes.iter().map(|p| (p.pid, p)).collect();
+
+    // Open a window for each newly-attached big-memory holder. Skip the first observation:
+    // those processes were already resident, not freshly loaded, so they are no story.
+    if st.seen_first_procs {
+        for (pid, p) in &now {
+            if st.procs.contains_key(pid) || st.spillovers.contains_key(pid) {
+                continue;
+            }
+            if p.mem_bytes.unwrap_or(0) >= SPILLOVER_HOLDER_MIN_BYTES {
+                st.spillovers.insert(
+                    *pid,
+                    Spillover {
+                        name: p.name.clone(),
+                        mem_bytes: p.mem_bytes.unwrap_or(0),
+                        start_ms: sample.ts_ms,
+                        util_sum: 0.0,
+                        util_n: 0,
+                        cpu_sum: 0.0,
+                        cpu_n: 0,
+                    },
+                );
+            }
+        }
+    }
+
+    if st.spillovers.is_empty() {
+        return;
+    }
+
+    // A device showing real use cancels every open assessment at once: the premise of the
+    // whole inference is that the GPU is idle, and one busy reading refutes it.
+    let gpu_busy = sample
+        .util_pct
+        .map(|u| u >= SPILLOVER_BUSY_UTIL_PCT)
+        .unwrap_or(false);
+
+    let mut to_emit: Vec<Event> = Vec::new();
+    st.spillovers.retain(|pid, sp| {
+        if gpu_busy {
+            return false;
+        }
+        let Some(p) = now.get(pid) else {
+            // Exited mid-window: cancelled silently (its `process_exited` fact stands).
+            return false;
+        };
+        if let Some(u) = sample.util_pct {
+            sp.util_sum += u as f64;
+            sp.util_n += 1;
+        }
+        if let Some(c) = p.cpu_pct {
+            sp.cpu_sum += c as f64;
+            sp.cpu_n += 1;
+        }
+
+        if sample.ts_ms.saturating_sub(sp.start_ms) < SPILLOVER_WINDOW_MS {
+            return true; // window still open
+        }
+
+        // Window closed — judge. Means require samples; no CPU sample at all means no CPU
+        // visibility, and we refuse to claim a CPU burn we never observed.
+        let mean_util = sp.util_sum / sp.util_n.max(1) as f64;
+        let mean_cpu = sp.cpu_sum / sp.cpu_n.max(1) as f64;
+        if sp.cpu_n >= SPILLOVER_MIN_CPU_SAMPLES
+            && mean_util < SPILLOVER_MAX_MEAN_UTIL_PCT
+            && mean_cpu >= SPILLOVER_MIN_MEAN_CPU_PCT
+        {
+            let span = fmt_dur_ms(sample.ts_ms.saturating_sub(sp.start_ms));
+            to_emit.push(Event {
+                ts_ms: sample.ts_ms,
+                device: device.clone(),
+                kind: EventKind::CpuSpillover,
+                severity: Severity::Warning,
+                confidence: Confidence::Likely,
+                title: format!(
+                    "{} (pid {pid}) loaded {} but {name} is ~idle while its CPU runs hot \
+                     — likely partial CPU offload (model may not fit in VRAM)",
+                    sp.name,
+                    fmt_bytes(sp.mem_bytes),
+                ),
+                evidence: format!(
+                    "over {span} ({}..{} ms): {name} util mean {mean_util:.1}%, \
+                     {} (pid {pid}) CPU mean {mean_cpu:.0}% of one core ({} samples)",
+                    sp.start_ms, sample.ts_ms, sp.name, sp.cpu_n,
+                ),
+            });
+        }
+        false // window done either way
+    });
+    out.extend(to_emit);
 }
 
 fn vram_pressure_events(
