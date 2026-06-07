@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/icon/gpuviewer.svg" width="128" alt="gpuviewer icon — a dark GPU-chip plate carrying a cyan utilization waveform that peaks and drops, crossed by an orange flight-recorder playhead">
+
 # gpuviewer
 
 ### — the GPU flight recorder —
