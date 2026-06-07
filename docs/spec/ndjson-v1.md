@@ -143,6 +143,8 @@ Emitted today:
 | `cpu_spillover`    | likely     | A GPU-attached process is burning CPU while the GPU sits idle — the classic CPU-bound dataloader. |
 | `device_lost`      | fact       | A registered device stopped answering its dynamic probe for 5 consecutive ticks; the device stays in `devices` with `sample: null`. Only the silence is asserted — the cause (driver reset, unplug, library death) is not. Added additively under rules (b)/(c). |
 | `device_returned`  | fact       | A device previously declared lost answered again. The samples between loss and return were never collected; that gap stays blank in history, never zero-filled. Added additively under rules (b)/(c). |
+| `recording_started` | fact      | A recording session began folding history into the database — recorder lifecycle, not device behavior; only emitted when persistence is on. `evidence` carries the binary version, tick interval, backend names/device count, and database name. If the previous session never wrote its stop mark, the title says so: it ended uncleanly (crash, kill, or power loss) and the gap size is unknowable. Rides the first frame after startup. Added additively under rules (b)/(c). |
+| `recording_stopped` | fact      | The recording session ended cleanly; time after this mark is gpuviewer not running, never the GPU sitting idle. Emission choice: this line is the stream's final event when stdout is still open at shutdown (`--once`, a fatal collector stop); after a consumer hangup the stream is already gone, so the mark is recording-only. A killed process writes no mark at all — the next `recording_started` narrates that. Added additively under rules (b)/(c). |
 
 ## Compatibility promise
 

@@ -11,7 +11,7 @@ use gpuviewer_core::{
     all_backends, now_ms, Confidence, DeviceId, DynamicSample, Event, EventEngine, EventKind,
     GpuBackend, ProcessSample, Severity, StaticInfo,
 };
-use gpuviewer_history::{HistoryStore, Recorder, SqliteStore};
+use gpuviewer_history::{DataSource, HistoryStore, Recorder, SqliteStore};
 use serde::Serialize;
 
 /// One collection tick's output for one device.
@@ -235,6 +235,59 @@ fn device_returned_event(
     }
 }
 
+/// The `recording_started` fact — the session-boundary mark on the recording's left edge.
+/// WHY: the timeline renders unrecorded time blank, and without boundary marks a blank
+/// stretch is ambiguous — "the GPU sat idle from 02:00–08:00" and "gpuviewer wasn't
+/// running" look identical, an honesty hole for a product whose thesis is the trustworthy
+/// recording. Info severity (routine lifecycle, not an alarm), FACT (the session opening
+/// is observed). `dangling_start_ms` is the previous session's start mark when it has no
+/// matching stop: that session died without flushing (crash, kill, power loss), and the
+/// asymmetry is itself flight-recorder information — narrated here because the dead
+/// session, by definition, could not narrate it.
+fn recording_started_event(
+    ts_ms: u64,
+    anchor: DeviceId,
+    interval: Duration,
+    backend_list: &str,
+    n_devices: usize,
+    db_name: &str,
+    dangling_start_ms: Option<u64>,
+) -> Event {
+    let title = match dangling_start_ms {
+        Some(_) => "recording started — previous session ended without a stop mark \
+                    (crash, kill, or power loss)"
+            .to_string(),
+        None => format!(
+            "recording started — gpuviewer {}",
+            env!("CARGO_PKG_VERSION")
+        ),
+    };
+    let devices_word = if n_devices == 1 { "device" } else { "devices" };
+    let mut evidence = format!(
+        "gpuviewer {}; interval {}; backends: {backend_list} ({n_devices} {devices_word}); \
+         db {db_name}",
+        env!("CARGO_PKG_VERSION"),
+        fmt_dur(interval),
+    );
+    if let Some(prev) = dangling_start_ms {
+        evidence.push_str(&format!(
+            "; the previous session's start mark at {} has no matching stop — it died \
+             without flushing (crash, kill, or power loss), so where its recording \
+             actually ends is unknown and the gap size is unknowable",
+            fmt_stamp(prev)
+        ));
+    }
+    Event {
+        ts_ms,
+        device: anchor,
+        kind: EventKind::RecordingStarted,
+        severity: Severity::Info,
+        confidence: Confidence::Fact,
+        title,
+        evidence,
+    }
+}
+
 /// A single backend `refresh_dynamic` probe taking longer than this is worth a one-line
 /// Info note ("nvidia probe took 1.2s — driver slow to respond"): NVML/sysfs calls can block
 /// (PCIe-throughput queries, a sleeping GPU waking) and a slow probe foreshadows a stall.
@@ -290,12 +343,25 @@ pub struct Engine {
     /// A pending `HistoryReset` to fold into the very first tick's events (the store reported
     /// it had to quarantine a corrupt file and start fresh — say so, once).
     pending_reset: Option<Event>,
+    /// The session's `recording_started` mark, queued to ride the first tick's frame so the
+    /// `--json` stream, `--on-event`, and the story feed all see it like any other event.
+    /// It is ALSO inserted into the store at construction (the mark must exist even if the
+    /// process dies before its first tick completes — a first probe can block for minutes);
+    /// the event log's UNIQUE dedupe index collapses the first tick's re-insert.
+    pending_session_start: Option<Event>,
     /// `--on-event` sink, shared with the JSON path so both modes fire it.
     sink: Option<EventSink>,
     /// Consecutive panicked ticks ([`Engine::tick_guarded`]); any clean tick resets it.
     consecutive_panics: u32,
     /// Per-device probe health (parallel to `devices`) — drives device-lost/returned.
     health: Vec<ProbeHealth>,
+    /// Unix-millis the session began — the basis of the stop mark's duration evidence.
+    session_start_ms: u64,
+    /// Clean ticks folded this session, for the stop mark's evidence.
+    frames_folded: u64,
+    /// Latched once [`Engine::finish`] wrote the stop mark, so the explicit shutdown paths
+    /// and `Drop` (which both call it) can never record the session's end twice.
+    finished: bool,
 }
 
 impl Engine {
@@ -353,12 +419,27 @@ impl Engine {
 
         // Open the store (best-effort) and register the discovered devices into it so a replay
         // session can label history even for a GPU later removed.
+        //
+        // The open is a RECORDING open claiming the data source the backends ACTUALLY are —
+        // not what the flags said. main.rs preflights an explicit --db against the flags,
+        // but the mock backend is also the automatic no-real-GPU fallback: that session
+        // records simulated data into a database the flags called "real". Claiming here,
+        // where the engine knows the truth, means a mismatched database gets ZERO writes —
+        // not even the device-identity upserts below — instead of leaking rows before a
+        // later check could refuse.
+        let session_start_ms = now_ms();
         let mut recorder = None;
         let mut db_path = None;
         let mut pending_reset = None;
+        let mut pending_session_start = None;
         if config.persist {
+            let source = if mock_in_use {
+                DataSource::Mock
+            } else {
+                DataSource::Real
+            };
             let opened = match &config.db_path {
-                Some(p) => SqliteStore::open(p),
+                Some(p) => SqliteStore::open_recording(p, source),
                 None => SqliteStore::open_default(mock_in_use),
             };
             match opened {
@@ -398,6 +479,57 @@ impl Engine {
                             ),
                         });
                     }
+
+                    // Session boundary: detect a dangling start mark BEFORE writing this
+                    // session's own, then record `recording_started`. Unclean iff the
+                    // newest start mark is strictly newer than every stop mark; a tie
+                    // reads clean — a confidently-wrong "previous session crashed" would
+                    // damage trust more than a missed one.
+                    let prev_start = rec
+                        .store()
+                        .latest_event_ms(Some(EventKind::RecordingStarted))
+                        .ok()
+                        .flatten();
+                    let prev_stop = rec
+                        .store()
+                        .latest_event_ms(Some(EventKind::RecordingStopped))
+                        .ok()
+                        .flatten();
+                    let dangling = prev_start.filter(|s| *s > prev_stop.unwrap_or(0));
+                    // Backends as the recording will actually see them: only those that
+                    // registered at least one device, in collection order.
+                    let mut backend_names: Vec<&'static str> = Vec::new();
+                    for (bi, _, _) in &devices {
+                        let n = backends[*bi].name();
+                        if !backend_names.contains(&n) {
+                            backend_names.push(n);
+                        }
+                    }
+                    let backend_list = if backend_names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        backend_names.join(", ")
+                    };
+                    let db_name = db_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "history.db".into());
+                    let anchor = devices
+                        .first()
+                        .map(|(_, id, _)| id.clone())
+                        .unwrap_or_else(|| DeviceId("collector".into()));
+                    let start_ev = recording_started_event(
+                        session_start_ms,
+                        anchor,
+                        config.interval,
+                        &backend_list,
+                        devices.len(),
+                        &db_name,
+                        dangling,
+                    );
+                    rec.record_events(std::slice::from_ref(&start_ev));
+                    pending_session_start = Some(start_ev);
                     recorder = Some(rec);
                 }
                 Err(e) => {
@@ -419,9 +551,13 @@ impl Engine {
             last_tick_end: None,
             last_slow_note: HashMap::new(),
             pending_reset,
+            pending_session_start,
             sink,
             consecutive_panics: 0,
             health,
+            session_start_ms,
+            frames_folded: 0,
+            finished: false,
         }
     }
 
@@ -454,11 +590,7 @@ impl Engine {
             let gap = now_instant.duration_since(prev_end);
             if is_stall(gap, self.interval) {
                 let last_good = fmt_clock(now_ms().saturating_sub(gap.as_millis() as u64));
-                let anchor = self
-                    .devices
-                    .first()
-                    .map(|(_, id, _)| id.clone())
-                    .unwrap_or_else(|| DeviceId("collector".into()));
+                let anchor = self.anchor_device();
                 events.push(Event {
                     ts_ms: now_ms(),
                     device: anchor,
@@ -483,6 +615,12 @@ impl Engine {
         // A pending HistoryReset rides out on the first tick, before any device events.
         if let Some(reset) = self.pending_reset.take() {
             events.push(reset);
+        }
+        // The session's start mark rides the first tick too — already in the store (the
+        // dedupe index swallows the re-insert below), but the stream, `--on-event`, and
+        // the story feed only see events that travel in a frame.
+        if let Some(start) = self.pending_session_start.take() {
+            events.push(start);
         }
 
         for (di, (bi, id, info)) in self.devices.iter().enumerate() {
@@ -592,12 +730,23 @@ impl Engine {
         }
 
         self.last_tick_end = Some(Instant::now());
+        self.frames_folded += 1;
 
         Frame {
             ts_ms: now_ms(),
             devices: frame_devices,
             events,
         }
+    }
+
+    /// The `device` anchor for collector-scoped events (stall, panic, session boundary):
+    /// the first registered device, or a stable placeholder when none exists. One helper
+    /// so every recorder-lifecycle fact follows the same convention.
+    fn anchor_device(&self) -> DeviceId {
+        self.devices
+            .first()
+            .map(|(_, id, _)| id.clone())
+            .unwrap_or_else(|| DeviceId("collector".into()))
     }
 
     /// [`Engine::tick`] behind a panic firewall — the fix for the audit's tick-panic
@@ -666,11 +815,7 @@ impl Engine {
     /// while collection will retry; Critical when this panic spent the budget and
     /// collection stops here.
     fn panic_event(&self, summary: &str, fatal: bool) -> Event {
-        let anchor = self
-            .devices
-            .first()
-            .map(|(_, id, _)| id.clone())
-            .unwrap_or_else(|| DeviceId("collector".into()));
+        let anchor = self.anchor_device();
         let n = self.consecutive_panics;
         if fatal {
             Event {
@@ -693,13 +838,79 @@ impl Engine {
                 kind: EventKind::CollectorStall,
                 severity: Severity::Warning,
                 confidence: Confidence::Fact,
-                title: "collector tick panicked — frame dropped, the recording has a hole".into(),
+                // The count is in the TITLE, not just the evidence: two consecutive
+                // panics can land in the same millisecond, and the event log's dedupe
+                // key is (ts, device, kind, title) — identical titles would collapse two
+                // distinct dropped frames into one narration. Distinct events must
+                // narrate distinctly.
+                title: format!(
+                    "collector tick panicked ({n}/{MAX_CONSECUTIVE_PANICS}) — frame \
+                     dropped, the recording has a hole"
+                ),
                 evidence: format!(
                     "panic: {summary}; consecutive panic {n} of {MAX_CONSECUTIVE_PANICS} \
                      tolerated, collection retries next tick; run with RUST_BACKTRACE=1 \
                      for a backtrace"
                 ),
             }
+        }
+    }
+
+    /// End the recording session cleanly: write the `recording_stopped` mark, fire it
+    /// through `--on-event`, and flush the partial rollup tail. Returns the stop event
+    /// when one was written by THIS call so the `--json` path can put it on the stream
+    /// while stdout is still open; the TUI path records it without emitting (the session
+    /// is over, nobody is watching the feed).
+    ///
+    /// Idempotent — explicit shutdown paths and `Drop` may both arrive here, and the
+    /// session's end must land exactly once. A SIGKILL/OOM-kill/power loss skips this
+    /// entirely and writes nothing: that is exactly the asymmetry the next session's
+    /// unclean-start narration covers.
+    pub fn finish(&mut self) -> Option<Event> {
+        let stop = if self.recorder.is_some() && !self.finished {
+            self.finished = true;
+            let ev = self.stop_event();
+            if let Some(rec) = &mut self.recorder {
+                rec.record_events(std::slice::from_ref(&ev));
+            }
+            if let Some(sink) = &mut self.sink {
+                sink.fire(&ev);
+            }
+            Some(ev)
+        } else {
+            None
+        };
+        self.flush();
+        stop
+    }
+
+    /// The `recording_stopped` fact — the session-boundary mark on the recording's right
+    /// edge, twin of `recording_started`. Info/FACT for the same reasons; the evidence
+    /// spells out what the mark means for the timeline: time past it is "gpuviewer not
+    /// running", never "the GPU sat idle".
+    fn stop_event(&self) -> Event {
+        let now = now_ms();
+        let dur = Duration::from_millis(now.saturating_sub(self.session_start_ms));
+        let frames_word = if self.frames_folded == 1 {
+            "frame"
+        } else {
+            "frames"
+        };
+        Event {
+            ts_ms: now,
+            device: self.anchor_device(),
+            kind: EventKind::RecordingStopped,
+            severity: Severity::Info,
+            confidence: Confidence::Fact,
+            title: format!("recording stopped — clean shutdown after {}", fmt_dur(dur)),
+            evidence: format!(
+                "session started {}; {} {frames_word} folded over {}; the partial rollup \
+                 tail was flushed; time between this mark and the next recording_started \
+                 is gpuviewer not running, not the GPU sitting idle",
+                fmt_stamp(self.session_start_ms),
+                self.frames_folded,
+                fmt_dur(dur),
+            ),
         }
     }
 
@@ -714,8 +925,9 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // The tail of the recording would otherwise be lost on a clean exit (Ctrl-C / `q`).
-        self.flush();
+        // The tail of the recording (and its stop mark) would otherwise be lost on a clean
+        // exit — `finish` is idempotent, so paths that already called it lose nothing.
+        let _ = self.finish();
     }
 }
 
@@ -838,6 +1050,17 @@ fn fmt_clock(ms: u64) -> String {
         .single()
         .map(|t| t.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| "--:--:--".into())
+}
+
+/// Date + time of day, for session-boundary narration: a dangling start mark can be days
+/// old, where a bare HH:MM:SS would be ambiguous.
+fn fmt_stamp(ms: u64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_millis_opt(ms as i64)
+        .single()
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "????-??-?? --:--:--".into())
 }
 
 /// Whether a single device's frame reads as idle for the adaptive-backoff decision. Pure so
@@ -1055,7 +1278,26 @@ pub struct Shared {
 pub struct Collector {
     pub shared: Arc<Mutex<Shared>>,
     pub paused: Arc<AtomicBool>,
+    /// Cooperative stop flag for the collection thread ([`Collector::shutdown`]). The
+    /// thread exits its loop on the next slice boundary, dropping the [`Engine`] — whose
+    /// `Drop` writes the session's `recording_stopped` mark and flushes the rollup tail.
+    stop: Arc<AtomicBool>,
+    /// The collection thread's handle (`None` for [`Collector::stationary`] sessions),
+    /// so `shutdown` can wait — boundedly — for the recording tail to land.
+    handle: Option<std::thread::JoinHandle<()>>,
 }
+
+/// The collection thread sleeps its (possibly backoff-stretched, up to 10s) cadence in
+/// slices of this size so a shutdown request is noticed within one slice instead of one
+/// whole cadence — quitting the TUI must not hang for seconds on a sleeping collector.
+const SLEEP_SLICE: Duration = Duration::from_millis(100);
+
+/// How long [`Collector::shutdown`] waits for the collection thread to finish before
+/// giving up. The thread normally reacts within one [`SLEEP_SLICE`]; the budget exists
+/// for a tick blocked inside a backend probe (the stall scenario) — quit must not wedge
+/// on a hung driver, and a missing stop mark is exactly what the next session's
+/// unclean-start narration reports.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 impl Collector {
     /// Spawn the background collection thread. `backoff` enables the adaptive idle cadence
@@ -1081,12 +1323,19 @@ impl Collector {
             lost: vec![None; n],
         }));
         let paused = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let s = Arc::clone(&shared);
         let p = Arc::clone(&paused);
-        std::thread::spawn(move || {
+        let st = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
             let mut cadence = Backoff::new(backoff, interval, n);
             loop {
+                // Cooperative shutdown: returning drops `engine`, whose Drop writes the
+                // `recording_stopped` mark and flushes the recording tail.
+                if st.load(Ordering::Relaxed) {
+                    return;
+                }
                 let effective = if !p.load(Ordering::Relaxed) {
                     // The guarded tick runs BEFORE the Shared lock is taken (as tick()
                     // always did), so even a panic that somehow escaped the firewall
@@ -1165,11 +1414,58 @@ impl Collector {
                     cadence.skip()
                 };
                 effective_interval_ms.store(effective.as_millis() as u64, Ordering::Relaxed);
-                std::thread::sleep(effective);
+                // Sleep the cadence in slices so shutdown is noticed promptly (see
+                // [`SLEEP_SLICE`]); the effective cadence itself is unchanged.
+                let deadline = Instant::now() + effective;
+                loop {
+                    if st.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    std::thread::sleep((deadline - now).min(SLEEP_SLICE));
+                }
             }
         });
 
-        Self { shared, paused }
+        Self {
+            shared,
+            paused,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Ask the collection thread to stop and wait — boundedly — for it to finish, so a
+    /// clean quit ends with the `recording_stopped` mark and the rollup tail on disk.
+    /// The wait is capped at [`SHUTDOWN_GRACE`]: a tick wedged inside a hung backend
+    /// probe must not wedge quit with it (the thread still drops the engine — and writes
+    /// the mark — whenever the probe finally returns; if the process dies first, the next
+    /// session narrates the missing stop mark, which is the honest record of what
+    /// happened). A no-op for [`Collector::stationary`] sessions, which have no thread.
+    pub fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            // Joining a finished thread cannot block; a panicked collector already
+            // narrated itself (panic firewall), so the result carries nothing new.
+            let _ = handle.join();
+        } else {
+            eprintln!(
+                "gpuviewer: the collector did not stop within {}s (a backend probe is \
+                 likely blocked); exiting without the recording's stop mark — the next \
+                 session will report it",
+                SHUTDOWN_GRACE.as_secs()
+            );
+        }
     }
 
     /// A collector with NO engine and NO background thread, for the file viewer
@@ -1195,6 +1491,8 @@ impl Collector {
                 lost: vec![None; n],
             })),
             paused: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
         }
     }
 }
@@ -1706,7 +2004,7 @@ mod tests {
 
     fn cleanup_db(path: &PathBuf) {
         let _ = std::fs::remove_file(path);
-        for ext in ["-wal", "-shm"] {
+        for ext in ["-wal", "-shm", ".lock"] {
             let mut p = path.as_os_str().to_os_string();
             p.push(ext);
             let _ = std::fs::remove_file(p);
@@ -2213,6 +2511,367 @@ mod tests {
             vec![10_000, 10_000 * (N as u64 + 2)],
             "only the good ticks produced rollups — the lost stretch is a blank gap"
         );
+        cleanup_db(&path);
+    }
+
+    // ---- session boundaries (recording_started / recording_stopped) ----
+
+    /// The new kinds' wire tokens must match the spec/schema/suite spelling exactly —
+    /// pinned here like the device-lifecycle tokens, since the conformance suite covers
+    /// the mock run's shape, not every spelling source.
+    #[test]
+    fn session_boundary_kinds_use_documented_wire_tokens() {
+        assert_eq!(env_token(EventKind::RecordingStarted), "recording_started");
+        assert_eq!(env_token(EventKind::RecordingStopped), "recording_stopped");
+    }
+
+    /// The audit's recording-visibility hole, closed end to end: one Engine
+    /// create→tick→finish cycle lands exactly one start mark (with auditable evidence:
+    /// version, interval, backends, device count, db name) and exactly one stop mark
+    /// (duration + frames folded) — and `finish` stays idempotent across the Drop that
+    /// follows it. A second, clean session must then start WITHOUT indicting its
+    /// predecessor.
+    #[test]
+    fn session_start_and_stop_marks_land_in_the_store() {
+        let path = scratch_db();
+        let mut engine = flaky_engine(Some(path.clone()), |_| false);
+        for _ in 0..3 {
+            assert!(matches!(engine.tick_guarded(), TickOutcome::Frame(_)));
+        }
+        assert!(
+            engine.finish().is_some(),
+            "finish must return the stop mark it wrote"
+        );
+        drop(engine); // Drop calls finish again — the mark must not double.
+
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let events = store.events_between(0, now_ms() + 60_000).unwrap();
+        let starts: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::RecordingStarted)
+            .collect();
+        let stops: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::RecordingStopped)
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "exactly one start mark (the first tick's re-insert is deduped)"
+        );
+        assert_eq!(
+            stops.len(),
+            1,
+            "exactly one stop mark (finish is idempotent across Drop)"
+        );
+
+        let start = starts[0];
+        assert_eq!(start.severity, Severity::Info);
+        assert_eq!(start.confidence, Confidence::Fact);
+        assert_eq!(start.device.0, "flaky:0", "anchored like CollectorStall");
+        assert!(
+            start.title.contains("recording started"),
+            "title: {}",
+            start.title
+        );
+        assert!(
+            !start.title.contains("without a stop mark"),
+            "a fresh database has no predecessor to indict: {}",
+            start.title
+        );
+        assert!(
+            start.evidence.contains(env!("CARGO_PKG_VERSION")),
+            "evidence must carry the binary version: {}",
+            start.evidence
+        );
+        assert!(
+            start.evidence.contains("interval 1.0s"),
+            "evidence must carry the tick interval: {}",
+            start.evidence
+        );
+        assert!(
+            start.evidence.contains("flaky (1 device)"),
+            "evidence must carry backend names and device count: {}",
+            start.evidence
+        );
+        let db_name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            start.evidence.contains(db_name),
+            "evidence must carry the db basename: {}",
+            start.evidence
+        );
+
+        let stop = stops[0];
+        assert_eq!(stop.severity, Severity::Info);
+        assert_eq!(stop.confidence, Confidence::Fact);
+        assert_eq!(stop.device.0, "flaky:0");
+        assert!(
+            stop.title.contains("recording stopped"),
+            "title: {}",
+            stop.title
+        );
+        assert!(
+            stop.evidence.contains("3 frames folded"),
+            "evidence must count the session's frames: {}",
+            stop.evidence
+        );
+        assert!(stop.ts_ms >= start.ts_ms, "the stop mark follows the start");
+        drop(store);
+
+        // A clean predecessor: the next session must start plainly. (The 2ms separator
+        // is not a race wait — it only guarantees the two start marks land on distinct
+        // millisecond timestamps, so the dedupe index cannot collapse them.)
+        std::thread::sleep(Duration::from_millis(2));
+        drop(flaky_engine(Some(path.clone()), |_| false));
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let events = store.events_between(0, now_ms() + 60_000).unwrap();
+        let second_start = events
+            .iter()
+            .filter(|e| e.kind == EventKind::RecordingStarted)
+            .max_by_key(|e| e.ts_ms)
+            .unwrap();
+        assert!(
+            !second_start.title.contains("without a stop mark"),
+            "a cleanly-stopped predecessor must not be narrated as a crash: {}",
+            second_start.title
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::RecordingStopped)
+                .count(),
+            2,
+            "both sessions wrote their stop marks"
+        );
+        cleanup_db(&path);
+    }
+
+    /// The unclean-shutdown asymmetry: a session that died without its stop mark
+    /// (SIGKILL, OOM kill, power loss — simulated by inserting a dangling start mark)
+    /// is narrated by the NEXT session's start event, title and evidence both, because
+    /// the dead session by definition could not narrate itself.
+    #[test]
+    fn unclean_shutdown_is_narrated_by_the_next_start() {
+        let path = scratch_db();
+        {
+            // Simulate the kill: the previous session's start mark exists, its stop
+            // mark never landed. (The store handle drops here, releasing the lock.)
+            let (mut store, _) = SqliteStore::open(&path).unwrap();
+            store
+                .insert_events(&[Event {
+                    ts_ms: 1_000,
+                    device: DeviceId("flaky:0".into()),
+                    kind: EventKind::RecordingStarted,
+                    severity: Severity::Info,
+                    confidence: Confidence::Fact,
+                    title: "recording started — gpuviewer (previous session)".into(),
+                    evidence: "test fixture".into(),
+                }])
+                .unwrap();
+        }
+
+        drop(flaky_engine(Some(path.clone()), |_| false));
+
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let events = store.events_between(0, now_ms() + 60_000).unwrap();
+        let new_start = events
+            .iter()
+            .filter(|e| e.kind == EventKind::RecordingStarted)
+            .max_by_key(|e| e.ts_ms)
+            .expect("the new session must write its own start mark");
+        assert!(new_start.ts_ms > 1_000, "must be the NEW session's mark");
+        assert_eq!(
+            new_start.confidence,
+            Confidence::Fact,
+            "the missing stop mark is observed, not inferred"
+        );
+        assert!(
+            new_start
+                .title
+                .contains("previous session ended without a stop mark"),
+            "the title must narrate the unclean predecessor: {}",
+            new_start.title
+        );
+        assert!(
+            new_start.title.contains("crash, kill, or power loss"),
+            "the title names the possible causes without asserting one: {}",
+            new_start.title
+        );
+        assert!(
+            new_start.evidence.contains("gap size is unknowable"),
+            "the evidence must state the gap cannot be sized: {}",
+            new_start.evidence
+        );
+        cleanup_db(&path);
+    }
+
+    /// Stream visibility: the start mark rides the FIRST tick's frame (that is how the
+    /// `--json` stream, `--on-event`, and the story feed see it) and never repeats; a
+    /// live-only session (no recorder) has no boundary marks at all — the marks describe
+    /// the recording, and there is none.
+    #[test]
+    fn start_mark_rides_the_first_frame_only() {
+        let path = scratch_db();
+        let mut engine = flaky_engine(Some(path.clone()), |_| false);
+        let TickOutcome::Frame(first) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .filter(|e| e.kind == EventKind::RecordingStarted)
+                .count(),
+            1,
+            "the start mark must ride the first frame"
+        );
+        let TickOutcome::Frame(second) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(
+            second
+                .events
+                .iter()
+                .all(|e| e.kind != EventKind::RecordingStarted),
+            "the start mark must not repeat"
+        );
+        drop(engine);
+        cleanup_db(&path);
+
+        let mut live_only = flaky_engine(None, |_| false);
+        let TickOutcome::Frame(frame) = live_only.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(
+            frame.events.iter().all(|e| {
+                e.kind != EventKind::RecordingStarted && e.kind != EventKind::RecordingStopped
+            }),
+            "a live-only session records nothing, so it must not claim a recording began"
+        );
+        assert!(
+            live_only.finish().is_none(),
+            "no recorder, no stop mark to write"
+        );
+    }
+
+    /// The TUI quit path: `Collector::shutdown` stops the thread cooperatively, which
+    /// drops the engine and writes the stop mark — a quit must read as a clean session
+    /// end, never as a crash, to the next session.
+    #[test]
+    fn collector_shutdown_writes_the_stop_mark() {
+        let path = scratch_db();
+        let engine = flaky_engine(Some(path.clone()), |_| false);
+        let mut collector = Collector::start(engine, Duration::from_millis(5), false);
+
+        // Bounded wait for at least one folded frame, so the session resembles a real one.
+        let mut ticked = false;
+        for _ in 0..1000 {
+            if collector.shared.lock().unwrap().tick_seq > 0 {
+                ticked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(ticked, "the collector must tick before the shutdown");
+
+        collector.shutdown();
+
+        // The mark lands when the engine drops. `shutdown` waits boundedly; poll the
+        // store rather than assume the join won the race (a wedged thread writes the
+        // mark whenever it finally exits).
+        let mut found = false;
+        for _ in 0..1000 {
+            let store = SqliteStore::open_readonly(&path).unwrap();
+            let events = store.events_between(0, now_ms() + 60_000).unwrap();
+            if events.iter().any(|e| e.kind == EventKind::RecordingStopped) {
+                found = true;
+                break;
+            }
+            drop(store);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            found,
+            "a TUI-style quit must write the recording_stopped mark"
+        );
+        cleanup_db(&path);
+    }
+
+    // ---- engine-side data-source claim (the mock-fallback --db hole) ----
+
+    /// The narrow no-GPU→mock-fallback case: the engine opens the store knowing its
+    /// backends are mock, so a real-stamped --db is refused AT THE OPEN — zero writes,
+    /// including the device-identity upserts that used to leak before main.rs's
+    /// post-construction check could refuse.
+    #[test]
+    fn mock_fallback_engine_refuses_a_real_stamped_db_with_zero_writes() {
+        let path = scratch_db();
+        drop(SqliteStore::open_recording(&path, DataSource::Real).unwrap());
+
+        let engine = Engine::with_backends(
+            vec![Box::new(gpuviewer_core::mock::MockBackend::new())],
+            EngineConfig {
+                persist: true,
+                db_path: Some(path.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(engine.mock_in_use(), "precondition: the fallback shape");
+        assert!(
+            engine.db_path().is_none(),
+            "the engine must not hold a recorder on a mismatched database"
+        );
+        drop(engine);
+
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        assert_eq!(
+            store.data_source().unwrap(),
+            Some(DataSource::Real),
+            "the stamp survives untouched"
+        );
+        assert!(
+            store.devices().unwrap().is_empty(),
+            "ZERO writes — not even device-identity rows may leak"
+        );
+        assert!(
+            store
+                .events_between(0, now_ms() + 60_000)
+                .unwrap()
+                .is_empty(),
+            "no events either — including session marks"
+        );
+        cleanup_db(&path);
+    }
+
+    /// The engine stamps a fresh --db with what the backends ACTUALLY are, not what the
+    /// flags said: mock backends claim mock, real (non-mock) backends claim real.
+    #[test]
+    fn engine_stamps_a_fresh_db_with_the_backends_actual_source() {
+        let path = scratch_db();
+        let engine = Engine::with_backends(
+            vec![Box::new(gpuviewer_core::mock::MockBackend::new())],
+            EngineConfig {
+                persist: true,
+                db_path: Some(path.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(engine.db_path().is_some());
+        drop(engine);
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        assert_eq!(store.data_source().unwrap(), Some(DataSource::Mock));
+        drop(store);
+        cleanup_db(&path);
+
+        let path = scratch_db();
+        drop(flaky_engine(Some(path.clone()), |_| false));
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        assert_eq!(
+            store.data_source().unwrap(),
+            Some(DataSource::Real),
+            "a non-mock backend set claims real"
+        );
+        drop(store);
         cleanup_db(&path);
     }
 

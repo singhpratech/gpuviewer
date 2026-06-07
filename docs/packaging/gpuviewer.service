@@ -1,0 +1,94 @@
+# gpuviewer — boot-time GPU flight recording (systemd user unit)
+#
+# Runs `gpuviewer --json` headless so the history database records from the moment you
+# log in. The NDJSON stream has no consumer here, so stdout goes to /dev/null — the
+# SQLite recording is the point; stderr stays on the journal so collector diagnostics
+# (lock losses, store errors, panic narrations) remain visible:
+#
+#   journalctl --user -u gpuviewer
+#
+# Safe alongside the interactive TUI: every recording open takes an exclusive
+# per-database instance lock, so while this unit holds the recording, a `gpuviewer` you
+# open by hand runs live-only (it says so on stderr and in the footer) — no
+# double-recording, ever. `report`, replay, and `view` are read-only and run
+# concurrently with the unit (WAL). Stop the unit and the next interactive session
+# records again; session boundaries are themselves recorded as `recording_started` /
+# `recording_stopped` events, so `report` shows exactly when the recorder ran.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp gpuviewer.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now gpuviewer.service
+#
+# To keep recording across logout/before login (otherwise user units stop with your
+# session):
+#   loginctl enable-linger $USER
+#
+# ExecStart assumes the binary at ~/.cargo/bin/gpuviewer (where `cargo install` puts
+# it). If yours lives elsewhere (`command -v gpuviewer`), adjust the path — user units
+# do not expand $PATH in ExecStart.
+
+[Unit]
+Description=gpuviewer — GPU flight recorder (headless recording)
+Documentation=https://github.com/singhpratech/gpuviewer
+
+[Service]
+ExecStart=%h/.cargo/bin/gpuviewer --json
+
+# The recording is the point; the stream has no consumer. stderr keeps diagnostics on
+# the journal.
+StandardOutput=null
+StandardError=journal
+
+# A crashed recorder should come back — the next start narrates the unclean stop mark
+# in the recording itself. A clean `systemctl --user stop` stays stopped.
+Restart=on-failure
+RestartSec=5
+
+# A monitor must never compete with the workloads it watches.
+Nice=10
+
+# ---- hardening (deliberately mild) ----
+# The collector needs, at minimum: read access to /sys/class/drm + hwmon and to
+# /proc/<pid>/fdinfo of YOUR processes (per-process GPU attribution), dlopen of
+# libnvidia-ml.so.1 from the distro's library dirs, the /dev/nvidia* and /dev/dri/*
+# device nodes, and write access to $XDG_DATA_HOME/gpuviewer (the history database).
+# Stronger sandboxing than the directives below is known to break one of those:
+#
+#   - ProtectSystem=strict / ProtectHome=*  would block the history db under
+#     ~/.local/share/gpuviewer.
+#   - ProtectProc=invisible / ProcSubset=pid  would hide other processes' /proc
+#     entries and gut per-process attribution (the same wall as running unprivileged,
+#     but self-inflicted).
+#   - PrivateDevices=yes  removes /dev/nvidia* and /dev/dri/*, killing NVML and any
+#     DRM access outright.
+#   - MemoryDenyWriteExecute=yes  can break dlopen on some proprietary driver stacks.
+#
+# Note: the mount-namespace-backed directives (ProtectSystem, ProtectKernel*,
+# PrivateTmp) require unprivileged user namespaces in a *user* unit — default-on for
+# mainstream distros; comment them out if your kernel disables them and the unit fails
+# to start.
+
+# The recorder never needs privilege escalation.
+NoNewPrivileges=yes
+# /usr, /boot, /etc read-only — gpuviewer only reads libraries from there. (Not
+# `strict`: the history db lives under $HOME.)
+ProtectSystem=full
+# No writing kernel tunables, no module loading, no cgroup edits; *reading* sysfs —
+# which the AMD/Intel backends rely on — stays allowed.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# gpuviewer makes no network connections; AF_UNIX stays open for local plumbing
+# (e.g. nss lookups), everything else is refused. If you add `--on-event` with a
+# network hook (curl, ntfy), append AF_INET AF_INET6 here.
+RestrictAddressFamilies=AF_UNIX
+# A private /tmp: gpuviewer keeps nothing there, so nothing can be planted there.
+PrivateTmp=yes
+# No realtime scheduling, no personality changes — a recorder needs neither.
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

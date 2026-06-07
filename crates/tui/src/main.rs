@@ -350,10 +350,13 @@ fn main() -> Result<()> {
     // Contamination guard (the mock/--db hole): recording is always-on, and --db can point
     // a --mock session at ANY database — including a user's real history.db. Every recording
     // database carries a real/mock stamp; preflight the explicit --db here so a cross-mode
-    // open is refused with one clean error BEFORE the engine writes a single row. Both the
-    // TUI and --json paths flow through this. The default paths need no preflight: the
-    // engine resolves them per mode through `open_default`, which applies the same stamp
-    // rule itself (and mock already gets its own file there).
+    // open is refused with one clean error before any backend is even probed. The engine's
+    // own recording open claims the session's ACTUAL source again (it knows whether the
+    // backends are mock, including the no-GPU fallback the flags cannot see), so a
+    // mismatched database never receives a single row either way; this preflight exists
+    // for the clean error message and the deterministic lock decision below. The default
+    // paths need no preflight: the engine resolves them per mode through `open_default`,
+    // which applies the same stamp rule itself (and mock already gets its own file there).
     let session_source = if args.mock {
         DataSource::Mock
     } else {
@@ -408,11 +411,14 @@ fn main() -> Result<()> {
 
     // The preflight assumed --mock tells the whole story, but the mock backend is also the
     // automatic fallback when no real GPU is found — that session records simulated data
-    // too. With an explicit --db just verified/stamped "real", ticking would contaminate
-    // it, so refuse before the first tick (no samples or events have been recorded yet; a
-    // default-path session already switched to history-mock.db inside the engine).
-    // `persist`, not `args.persist`: a lock loser records nothing, so there is nothing to
-    // contaminate — bailing would wrongly kill its live-only session.
+    // too. The engine's own recording open claims the data source the backends ACTUALLY
+    // are, so with an explicit --db just verified/stamped "real" that claim was refused
+    // and the database got ZERO writes (not even device-identity rows). What remains here
+    // is the verdict: the user asked to record real history into their --db and there is
+    // no real GPU to record — that deserves a loud startup error, not a session that
+    // silently runs live-only. `persist`, not `args.persist`: a lock loser records
+    // nothing, so there is nothing to refuse — bailing would wrongly kill its live-only
+    // session.
     if persist && !args.mock && engine.mock_in_use() {
         if let Some(db) = &args.db {
             bail!(
@@ -472,11 +478,14 @@ fn run_json(mut engine: Engine, interval: Duration, once: bool) -> Result<()> {
                     event: &event,
                 })?;
                 if !emit_line(&line) {
-                    engine.flush();
+                    // Consumer gone: end the session (stop mark + tail), recording-only.
+                    engine.finish();
                     return Ok(());
                 }
                 if fatal {
-                    engine.flush();
+                    // The stream is still open on this path, so the session's stop mark
+                    // goes out as the final line before the loud exit.
+                    emit_stop_mark(&mut engine);
                     bail!(
                         "collector stopped: {MAX_CONSECUTIVE_PANICS} consecutive tick \
                          panics — stream ended (panic details on stderr above)"
@@ -502,17 +511,36 @@ fn run_json(mut engine: Engine, interval: Duration, once: bool) -> Result<()> {
         for line in &lines {
             if !emit_line(line) {
                 // The consumer hung up (`--json | head` is a normal way to grab a frame).
-                // End the run cleanly, persisting the partial tail like any other exit.
-                engine.flush();
+                // End the run cleanly, persisting the tail (and the session's stop mark —
+                // recording-only here: stdout is already gone) like any other exit.
+                engine.finish();
                 return Ok(());
             }
         }
         if once {
-            // Persist the partial tail before exiting so a one-shot run still records.
-            engine.flush();
+            // The session ends here, and stdout is still open: the stop mark is the
+            // stream's final line (the spec documents this emission choice), then the
+            // partial tail persists like any other exit.
+            emit_stop_mark(&mut engine);
             return Ok(());
         }
         std::thread::sleep(interval);
+    }
+}
+
+/// End the recording session and, when a stop mark was written, put it on the NDJSON
+/// stream as the final event line. Emission is best-effort — `finish` already persisted
+/// the mark, and a consumer that vanished between the last frame and this line loses
+/// nothing from the recording.
+fn emit_stop_mark(engine: &mut Engine) {
+    if let Some(event) = engine.finish() {
+        if let Ok(line) = serde_json::to_string(&EventLine {
+            v: 1,
+            kind: "event",
+            event: &event,
+        }) {
+            let _ = emit_line(&line);
+        }
     }
 }
 

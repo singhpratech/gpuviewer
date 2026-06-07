@@ -104,6 +104,16 @@ No GPU? No problem — `--mock` (also the automatic fallback) runs the full TUI 
 GPUs. Mock data is always labeled "(mock data)" and records to a separate database, never
 your real history.
 
+**Boot-time recording.** "Always-on" means by virtue of normal use — there is deliberately
+no daemon. If you want the recording running from login instead, run the headless stream
+under a systemd user unit; a ready-made example with mild, GPU-safe hardening (and a
+comment explaining every directive) ships at
+[`docs/packaging/gpuviewer.service`](docs/packaging/gpuviewer.service) —
+`systemctl --user enable --now gpuviewer.service`. The per-database instance lock makes
+this safe alongside the interactive TUI: while the unit holds the recording, a TUI you
+open by hand runs live-only (and says so), and `report`/replay/`view` read the same
+history concurrently.
+
 **Scripting and agents.** One NDJSON frame per tick plus that tick's narrated events, every
 metric nullable, versioned and conformance-tested:
 
@@ -330,8 +340,10 @@ and `demo` to `history-demo.db` — your real history is never polluted by simul
 
 Deliberately not chasing: fan/OC control (LACT owns it), a daemon/client split ("always-on"
 means by virtue of normal use — for boot-time recording, run `gpuviewer --json` under your
-own systemd user unit), cluster views, and eBPF causal tracing (we hand off to profilers:
-"idle gap at 02:14:31 — if recurring, capture a trace").
+own systemd user unit; an example ships at
+[`docs/packaging/gpuviewer.service`](docs/packaging/gpuviewer.service)), cluster views, and
+eBPF causal tracing (we hand off to profilers: "idle gap at 02:14:31 — if recurring,
+capture a trace").
 
 ## License
 

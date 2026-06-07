@@ -274,6 +274,12 @@ impl App {
         };
         let res = self.event_loop(&mut terminal);
         ratatui::restore();
+        // A detached collector thread would be killed mid-recording when main returns —
+        // losing the partial rollup tail AND the session's `recording_stopped` mark, so
+        // every TUI quit would read as a crash to the next session. Stop it cooperatively
+        // (bounded — see `Collector::shutdown`) after the terminal is restored, so the
+        // screen is back even if the wait runs its full grace.
+        self.collector.shutdown();
         res
     }
 

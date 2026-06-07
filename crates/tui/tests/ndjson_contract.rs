@@ -23,6 +23,8 @@ const DOCUMENTED_KINDS: &[&str] = &[
     "cpu_spillover",
     "device_lost",
     "device_returned",
+    "recording_started",
+    "recording_stopped",
 ];
 
 const DOCUMENTED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
@@ -183,8 +185,8 @@ fn json_once_emits_one_conformant_frame_then_only_events() {
         assert_frame_device(dev);
     }
 
-    // Everything after the frame is this tick's events (often zero on a single tick:
-    // the first observation suppresses the attach-flood by design).
+    // Everything after the frame is this tick's events (often zero device-derived ones
+    // on a single tick: the first observation suppresses the attach-flood by design).
     for v in &parsed[1..] {
         assert_eq!(
             v["type"], "event",
@@ -192,4 +194,22 @@ fn json_once_emits_one_conformant_frame_then_only_events() {
         );
         assert_event_line(v);
     }
+
+    // Session-boundary marks: a --once run is a complete recording session (persistence
+    // is on, pointed at the scratch dir), so its start mark rides the first tick's
+    // events and its stop mark is the stream's FINAL line — the spec's documented
+    // emission choice for `recording_stopped` while stdout is still open.
+    let kinds: Vec<&str> = parsed[1..]
+        .iter()
+        .filter_map(|v| v["kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"recording_started"),
+        "the session's start mark must be on the stream: {kinds:?}"
+    );
+    assert_eq!(
+        parsed.last().unwrap()["kind"],
+        "recording_stopped",
+        "the stop mark must be the stream's final line on a --once run: {kinds:?}"
+    );
 }
