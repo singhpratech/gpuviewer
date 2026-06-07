@@ -88,6 +88,8 @@ mod tests {
             kind: ProcessKind::Compute,
             mem_bytes: Some(1024),
             util_pct: None,
+            cpu_pct: None,
+            container: None,
         }];
         let sample = DynamicSample {
             ts_ms: 1000,
@@ -243,6 +245,8 @@ mod tests {
             kind: ProcessKind::Compute,
             mem_bytes: Some(6 << 30),
             util_pct: None,
+            cpu_pct: None,
+            container: None,
         }
     }
 

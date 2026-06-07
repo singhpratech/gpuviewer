@@ -255,6 +255,8 @@ impl GpuBackend for NvidiaBackend {
                         kind,
                         mem_bytes: mem,
                         util_pct: None,
+                        cpu_pct: None,
+                        container: None,
                     });
             }
         }

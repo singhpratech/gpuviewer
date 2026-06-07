@@ -35,6 +35,20 @@ pub enum EventKind {
     ProcessExited,
     VramPressure,
     IdleGap,
+    // The variants below are reserved: documented in docs/spec/ndjson-v1.md so consumers
+    // can prepare for them, but nothing emits them yet.
+    /// The collector itself fell behind its tick cadence — the recording has a hole, and
+    /// the recorder must say so rather than let the gap masquerade as device idleness.
+    CollectorStall,
+    /// History was truncated or restarted (ring wrap on resize, store re-init); consumers
+    /// must not treat the discontinuity as device behavior.
+    HistoryReset,
+    /// Device stopped answering queries while a workload was attached — possibly a hung
+    /// kernel or driver. An inference by nature: always `Confidence::Likely`.
+    HangSuspected,
+    /// A GPU-attached process is burning CPU while the GPU sits idle — the classic
+    /// CPU-bound dataloader. An inference: always `Confidence::Likely`.
+    CpuSpillover,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

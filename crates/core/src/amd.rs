@@ -516,6 +516,8 @@ impl GpuBackend for AmdBackend {
                 },
                 mem_bytes: agg.vram_kib.and_then(kib_to_bytes),
                 util_pct,
+                cpu_pct: None,
+                container: None,
             });
         }
         // Drop watermarks for pids that vanished from this device (exited processes).

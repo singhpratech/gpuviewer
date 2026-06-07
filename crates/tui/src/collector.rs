@@ -23,8 +23,9 @@ pub struct FrameDevice {
     pub processes: Vec<ProcessSample>,
 }
 
-/// One collection tick across all devices.
-#[derive(Serialize)]
+/// One collection tick across all devices. Internal shape only: `--json` serializes the
+/// envelope structs in `main.rs` instead (events go out as separate lines, per
+/// docs/spec/ndjson-v1.md), so this deliberately does not derive `Serialize`.
 pub struct Frame {
     pub ts_ms: u64,
     pub devices: Vec<FrameDevice>,

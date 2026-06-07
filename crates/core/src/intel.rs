@@ -632,6 +632,8 @@ impl GpuBackend for IntelBackend {
                 kind: agg.kind(),
                 mem_bytes: agg.local_mem_bytes(),
                 util_pct,
+                cpu_pct: None,
+                container: None,
             });
         }
         // Drop watermarks for pids that vanished from this device (exited processes).
