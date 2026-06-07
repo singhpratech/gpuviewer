@@ -575,15 +575,14 @@ pub struct Shared {
     /// True when the data is simulated (mock backend active) — drives the footer's
     /// "(mock data)" tag, which must track the actual data source.
     pub mock: bool,
-    /// The on-disk history path (`None` when not persisting), for the replay view. Published
-    /// here for the replay-UI agent to consume; not yet read inside this crate.
-    #[allow(dead_code)]
+    /// The on-disk history path (`None` when not persisting), for the replay view.
     pub db_path: Option<PathBuf>,
+    /// The configured tick interval in millis — the footer compares the effective cadence
+    /// against this to decide whether low-power backoff is active.
+    pub interval_ms: u64,
     /// Current effective tick interval in millis — stretched under low-power backoff so the
     /// footer can show "low-power cadence 5s". Published via an atomic so the UI reads it
     /// without taking the (already heavily-held) Shared lock on the collector's hot path.
-    /// Consumed by the replay-UI footer (separate agent); written every loop here.
-    #[allow(dead_code)]
     pub effective_interval_ms: Arc<AtomicU64>,
 }
 
@@ -609,6 +608,7 @@ impl Collector {
             history: HistoryStore::new(1800, 5000),
             mock,
             db_path,
+            interval_ms: interval.as_millis() as u64,
             effective_interval_ms: Arc::clone(&effective_interval_ms),
         }));
         let paused = Arc::new(AtomicBool::new(false));
@@ -657,6 +657,32 @@ impl Collector {
         });
 
         Self { shared, paused }
+    }
+}
+
+/// A collector with NO background thread, for UI tests: `Collector::start` ticks the mock
+/// once at spawn, which would race assertions that mutate `Shared` directly. Tests own the
+/// entire `Shared` state instead and drive draws/keys by hand.
+#[cfg(test)]
+pub(crate) fn test_collector(db_path: Option<PathBuf>) -> Collector {
+    let engine = Engine::new(EngineConfig {
+        force_mock: true,
+        ..Default::default()
+    });
+    let infos = engine.static_infos();
+    let n = infos.len();
+    Collector {
+        shared: Arc::new(Mutex::new(Shared {
+            infos,
+            latest: vec![None; n],
+            processes: vec![Vec::new(); n],
+            history: HistoryStore::new(1800, 5000),
+            mock: true,
+            db_path,
+            interval_ms: 1000,
+            effective_interval_ms: Arc::new(AtomicU64::new(1000)),
+        })),
+        paused: Arc::new(AtomicBool::new(false)),
     }
 }
 
