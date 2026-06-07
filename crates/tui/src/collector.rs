@@ -971,10 +971,19 @@ impl EventSink {
         // instead of `sh` everywhere: Git-for-Windows drops an sh.exe onto the PATH of CI
         // runners and many dev boxes, so a Unix-only dispatch would pass CI green and then
         // fail on exactly the user machines that have no sh at all.
+        //
+        // WHY raw_arg instead of args(["/C", ..]): std's argument quoting targets
+        // CommandLineToArgvW, but cmd.exe parses its line with its own rules. A hook
+        // command containing spaces gets wrapped in quotes with its inner quotes
+        // backslash-escaped — cmd understands neither, so e.g. a quoted redirect target
+        // decays into a broken path (the first Windows CI run failed exactly there).
+        // raw_arg hands the user's command to cmd verbatim, as if typed after `cmd /C `.
         #[cfg(windows)]
         let mut command = {
+            use std::os::windows::process::CommandExt;
             let mut c = Command::new("cmd");
-            c.args(["/C", &self.cmd]);
+            c.arg("/C");
+            c.raw_arg(&self.cmd);
             c
         };
         #[cfg(not(windows))]
