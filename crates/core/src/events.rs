@@ -35,10 +35,9 @@ pub enum EventKind {
     ProcessExited,
     VramPressure,
     IdleGap,
-    // The variants below are reserved: documented in docs/spec/ndjson-v1.md so consumers
-    // can prepare for them, but nothing emits them yet.
     /// The collector itself fell behind its tick cadence — the recording has a hole, and
     /// the recorder must say so rather than let the gap masquerade as device idleness.
+    /// Emitted by the tui collector (the engine owns tick timing, not this module).
     CollectorStall,
     /// History was truncated or restarted (ring wrap on resize, store re-init); consumers
     /// must not treat the discontinuity as device behavior.
@@ -706,10 +705,14 @@ fn vram_pressure_events(
 
     let headroom = total.saturating_sub(used) as f64;
     let eta_min = headroom / slope_per_min;
+    // Only name a "largest holder" when at least one process has a *known* size —
+    // with mem_bytes all-None (WSL2, unprivileged fdinfo) max_by_key would crown an
+    // arbitrary process on zero evidence.
     let grower = st
         .procs
         .values()
-        .max_by_key(|p| p.mem_bytes.unwrap_or(0))
+        .filter(|p| p.mem_bytes.is_some())
+        .max_by_key(|p| p.mem_bytes)
         .map(|p| format!(" (largest holder: {} pid {})", p.name, p.pid))
         .unwrap_or_default();
 

@@ -8,7 +8,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// Every event `kind` documented in docs/spec/ndjson-v1.md — emitted and reserved alike.
+/// Every event `kind` documented in docs/spec/ndjson-v1.md — all emitted today.
 /// A kind on the wire that is not in this list is a spec violation, not a new feature.
 const DOCUMENTED_KINDS: &[&str] = &[
     "throttle_start",
