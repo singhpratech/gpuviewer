@@ -119,5 +119,8 @@ macOS per-process GPU (OS-prohibited — see below).
 - The NDJSON contract has a conformance suite (`crates/tui/tests/ndjson_contract.rs`) that
   runs the built binary and asserts the output against `docs/spec/ndjson-v1.md` +
   `ndjson-v1.schema.json`. Stream changes must update spec, schema, and suite together.
-- NVML loader plumbing tested against a CI-built stub `.so` exporting NVML symbols.
+- NVML loader plumbing tested against a stub `.so` exporting a subset of NVML symbols:
+  `crates/core/tests/nvml_stub_loader.rs` (Linux-only) compiles `tests/nvml_stub/stub.rs`
+  with bare `rustc` at test time and asserts `lib_path` init plus both degradation modes
+  (`NOT_SUPPORTED` return and missing symbol → `None`, never failure).
 - Real-hardware smoke tests are a manual pre-release checklist, not CI.
