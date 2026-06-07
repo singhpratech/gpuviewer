@@ -71,3 +71,21 @@ new captures taken per kernel/driver release.
   enumeration files: no hwmon (the normal iGPU case), no `lmem_*` (shares system RAM,
   which must never be reported as VRAM), no freq files, no `/proc` tree. Every
   optional metric must come back `None` without an error.
+- `intel-i915-kernel6.12-arc/` — the Arc A770 i915 tree advanced to the kernel 6.12 ABI,
+  where i915 dGPU hwmon temps/fans landed: `temp1_input` = 61000 milli-°C is the REAL
+  package sensor (i915's documented channel), `temp2_input` = 53000 is a DECOY a
+  wrong-dialect read would pick up, and `fan1_input` = 2100 RPM has no `fan1_max`
+  reference so `fan_pct` must stay `None`. Also carries a per-GT `gt/gt0/rps_act_freq_mhz`
+  decoy (1500, differing from the card-level `gt_act_freq_mhz` 1850 — proves which freq
+  file is read) and an rc6 residency decoy pair (`gt/gt0/rc6_residency_ms` 480000 vs the
+  legacy `power/rc6_residency_ms` 480250) pre-staged for future GT-awake% work.
+- `intel-xe-kernel6.15-bmg/` — the Arc B580 xe tree advanced to the kernel 6.15 ABI,
+  where xe hwmon temps landed. xe's channel layout differs from i915's: the package
+  sensor is `temp2_input` = 58000 milli-°C (REAL), `temp3_input` = 64000 is the VRAM
+  sensor (DECOY as device temp — a different physical claim), and `temp1_input` = 47000
+  is a pure DECOY: real xe hwmon exposes NO temp1, but the historical bug read i915's
+  temp1 channel on both dialects, so the file exists precisely to catch that wrong code
+  path. Channel-choice decoys `power2_max` (220 W pkg) / `energy2_input` assert the card
+  channel (`power1_max`/`energy1_input`) stays preferred; `fan1_input` = 1450 RPM with no
+  max asserts `fan_pct` stays `None`; `freq0/rpa_freq` (2200) is a freq-file decoy; and
+  `tile0/gt0/gtidle/idle_residency_ms` is pre-staged for future GT-awake% work.
