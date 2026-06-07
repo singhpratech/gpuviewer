@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpuviewer_core::{
-    all_backends, now_ms, Confidence, DeviceId, DynamicSample, Event, EventEngine, EventKind,
-    GpuBackend, ProcessSample, Severity, StaticInfo,
+    all_backends, normalize_pci_id, now_ms, Confidence, DeviceId, DynamicSample, Event,
+    EventEngine, EventKind, GpuBackend, ProcessSample, Severity, StaticInfo,
 };
 use gpuviewer_history::{DataSource, HistoryStore, Recorder, SqliteStore};
 use serde::Serialize;
@@ -19,7 +19,9 @@ use serde::Serialize;
 pub struct FrameDevice {
     pub id: DeviceId,
     pub name: String,
-    /// Total VRAM, so JSON consumers can compute used/total without a second query.
+    /// Total device memory, so JSON consumers can compute used/total without a second
+    /// query. VRAM on discrete boards; a working-set budget on unified-memory devices
+    /// (the spec and the per-device `source_caveat` carry that label).
     pub mem_total_bytes: Option<u64>,
     pub sample: Option<DynamicSample>,
     pub processes: Vec<ProcessSample>,
@@ -34,28 +36,9 @@ pub struct Frame {
     pub events: Vec<Event>,
 }
 
-/// Normalize a PCI address (`domain:bus:dev.func`) for cross-backend dedupe: NVML reports
-/// `00000000:01:00.0` while sysfs reports `0000:01:00.0` — the same physical GPU. Lowercase
-/// everything; trim/zero-pad the domain to 4 hex digits (a genuinely >16-bit domain keeps
-/// its extra digits — both sources print those the same way). Returns `None` for anything
-/// that isn't a PCI address (`mock:…`, `nvml:0` fallback ids) — those are never deduped:
-/// wrongly merging two distinct devices is worse than listing one twice.
-fn normalize_pci_id(id: &str) -> Option<String> {
-    let id = id.to_ascii_lowercase();
-    let (domain, rest) = id.split_once(':')?;
-    let (bus, devfn) = rest.split_once(':')?;
-    let (dev, func) = devfn.split_once('.')?;
-    // Each segment must be pure hex of plausible width (catches embedded extra `:`/`.`
-    // too, since those aren't hex digits).
-    let hex = |s: &str, max: usize| {
-        !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_hexdigit())
-    };
-    if !hex(domain, 8) || !hex(bus, 2) || !hex(dev, 2) || !hex(func, 1) {
-        return None;
-    }
-    let domain = format!("{:0>4}", domain.trim_start_matches('0'));
-    Some(format!("{domain}:{bus:0>2}:{dev:0>2}.{func}"))
-}
+// `normalize_pci_id` (cross-backend dedupe key) moved to `gpuviewer-core::model` per
+// design cross-platform.md §5.4, so the Windows backends' LUID↔PCI matching and this
+// collector share one rule; re-exported from core and imported above.
 
 /// How long a between-tick gap must reach before the next tick narrates a `CollectorStall`:
 /// the larger of three intervals or five seconds. A blocked backend probe leaves a hole in
@@ -305,11 +288,12 @@ pub struct EngineConfig {
     pub force_mock: bool,
     /// Open the SQLite store and record. Off → live-only, the monitor still runs.
     pub persist: bool,
-    /// Override the history database path (else the XDG default, mock-separated).
+    /// Override the history database path (else the per-OS default, mock-separated).
     pub db_path: Option<PathBuf>,
     /// The configured tick interval — the basis of the stall-gap threshold.
     pub interval: Duration,
-    /// Shell command run for every emitted event (`sh -c CMD`), or `None`.
+    /// Shell command run for every emitted event (`sh -c CMD`; `cmd /C CMD` on Windows),
+    /// or `None`.
     pub on_event: Option<String>,
 }
 
@@ -931,9 +915,10 @@ impl Drop for Engine {
     }
 }
 
-/// Fire-and-forget runner for the `--on-event` shell command. Each emitted event spawns
-/// `sh -c CMD` with the event surfaced through `GPV_EVENT_*` environment variables; the child
-/// is reaped lazily (a `try_wait` sweep on the next fire) so a slow hook never blocks a tick.
+/// Fire-and-forget runner for the `--on-event` shell command. Each emitted event spawns the
+/// platform shell (`sh -c CMD`; `cmd /C CMD` on Windows) with the event surfaced through
+/// `GPV_EVENT_*` environment variables; the child is reaped lazily (a `try_wait` sweep on
+/// the next fire) so a slow hook never blocks a tick.
 ///
 /// Rate-capped at [`SINK_MAX_PER_MIN`] spawns per rolling minute: a throttle-flapping GPU can
 /// produce a burst of events, and an unbounded fan-out of curl/notify-send processes would be
@@ -982,10 +967,23 @@ impl EventSink {
         self.warned = false;
 
         let json = serde_json::to_string(event).unwrap_or_default();
-        let mut command = Command::new("sh");
+        // The hook runs through the OS's native shell. WHY a dedicated Windows branch
+        // instead of `sh` everywhere: Git-for-Windows drops an sh.exe onto the PATH of CI
+        // runners and many dev boxes, so a Unix-only dispatch would pass CI green and then
+        // fail on exactly the user machines that have no sh at all.
+        #[cfg(windows)]
+        let mut command = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", &self.cmd]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut c = Command::new("sh");
+            c.args(["-c", &self.cmd]);
+            c
+        };
         command
-            .arg("-c")
-            .arg(&self.cmd)
             .env("GPV_EVENT_KIND", env_token(event.kind))
             .env("GPV_EVENT_SEVERITY", env_token(event.severity))
             .env("GPV_EVENT_CONFIDENCE", env_token(event.confidence))
@@ -1111,7 +1109,8 @@ fn util_less_activity(prev: Option<&DynamicSample>, s: &DynamicSample) -> bool {
         return true;
     }
     // An asserted throttle reason means the device is being limited, hence working.
-    if s.throttle.any() {
+    // (`None` — throttle unobservable on this source — asserts nothing either way.)
+    if s.throttle.is_some_and(|t| t.any()) {
         return true;
     }
     // The remaining signals are deltas against the last good sample; with no baseline yet
@@ -1522,6 +1521,7 @@ mod tests {
         DynamicSample {
             ts_ms: 1_000,
             util_pct: util,
+            util_engine: None,
             mem_used_bytes: None,
             power_mw: None,
             temp_c: None,
@@ -1530,7 +1530,9 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            // Most scripted ticks model an observing source that sees no throttle;
+            // the bare-sample "no signal at all" test overrides this to None.
+            throttle: Some(ThrottleReasons::default()),
         }
     }
 
@@ -1577,43 +1579,8 @@ mod tests {
         (Some(s), vec![proc(Some(1.0))])
     }
 
-    #[test]
-    fn normalize_pci_id_unifies_nvml_and_sysfs_forms() {
-        // NVML's 8-hex-digit domain and sysfs's 4-digit domain are the same device.
-        assert_eq!(
-            normalize_pci_id("00000000:01:00.0").as_deref(),
-            Some("0000:01:00.0")
-        );
-        assert_eq!(
-            normalize_pci_id("0000:01:00.0").as_deref(),
-            Some("0000:01:00.0")
-        );
-        // NVML historically uppercases hex; normalization is case-insensitive.
-        assert_eq!(
-            normalize_pci_id("00000000:0A:00.0").as_deref(),
-            Some("0000:0a:00.0")
-        );
-        // A non-zero domain survives the trim/pad in both spellings.
-        assert_eq!(
-            normalize_pci_id("00000001:03:00.0").as_deref(),
-            Some("0001:03:00.0")
-        );
-        assert_eq!(
-            normalize_pci_id("0001:03:00.0").as_deref(),
-            Some("0001:03:00.0")
-        );
-    }
-
-    #[test]
-    fn normalize_pci_id_rejects_non_pci_ids() {
-        // Mock and index-fallback ids must never dedupe against anything.
-        assert_eq!(normalize_pci_id("mock:0000:01:00.0"), None);
-        assert_eq!(normalize_pci_id("nvml:0"), None);
-        assert_eq!(normalize_pci_id(""), None);
-        assert_eq!(normalize_pci_id("0000:01:00"), None); // no function part
-        assert_eq!(normalize_pci_id("0000:01:00.0.1"), None); // trailing junk
-        assert_eq!(normalize_pci_id("0000:01:02:00.0"), None); // extra segment
-    }
+    // normalize_pci_id's unit tests moved to gpuviewer-core::model with the function
+    // (design §5.4) — extended there with the wddm:/apple: refuse-to-dedupe cases.
 
     // ---- stall-gap threshold (pure) ----
 
@@ -1708,7 +1675,12 @@ mod tests {
     /// signal must be backoff-eligible — unknown is not "busy".
     #[test]
     fn util_less_device_with_no_activity_signal_is_backoff_eligible() {
-        // Bare sample (everything None, no throttle): no signal at all.
+        // Bare sample (everything None, throttle unobservable too — the wddm shape):
+        // no signal at all.
+        let mut bare = sample(None);
+        bare.throttle = None;
+        assert!(device_is_idle(None, Some(&bare), &[]));
+        // An observing source reporting "no throttle" is equally signal-less.
         assert!(device_is_idle(None, Some(&sample(None)), &[]));
         // The ubiquitous iGPU shape: a quiet compositor attached is not activity…
         assert!(device_is_idle(
@@ -1764,7 +1736,10 @@ mod tests {
 
         // An asserted throttle reason — the throttle-onset worry behind the old rule.
         let mut thr = sample(None);
-        thr.throttle.thermal = true;
+        thr.throttle = Some(ThrottleReasons {
+            thermal: true,
+            ..Default::default()
+        });
         assert!(!device_is_idle(None, Some(&thr), &[]));
     }
 
@@ -1885,9 +1860,10 @@ mod tests {
 
     // ---- --on-event sink ----
 
-    /// The hook receives the event through the GPV_EVENT_* environment. We run
-    /// `sh -c 'printenv GPV_EVENT_KIND > <tmpfile>'` for a synthetic event and read the file
-    /// back, after waiting for the (detached) child — proving the env wiring, not just spawn.
+    /// The hook receives the event through the GPV_EVENT_* environment. We echo
+    /// GPV_EVENT_KIND to a tmpfile through this OS's real shell dispatch (`sh -c` /
+    /// `cmd /C`) for a synthetic event and read the file back, after waiting for the
+    /// (detached) child — proving the env wiring, not just spawn.
     #[test]
     fn event_sink_passes_event_through_environment() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1899,7 +1875,14 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&out);
 
-        let mut sink = EventSink::new(format!("printenv GPV_EVENT_KIND > {}", out.display()));
+        // Per-OS hook command: each side must only ever run under its own dispatch (`cmd`
+        // expands %VAR%, `sh` expands via printenv). No space before cmd's `>` — cmd's
+        // echo would copy a trailing space into the file.
+        #[cfg(windows)]
+        let cmd = format!("echo %GPV_EVENT_KIND%> \"{}\"", out.display());
+        #[cfg(not(windows))]
+        let cmd = format!("printenv GPV_EVENT_KIND > \"{}\"", out.display());
+        let mut sink = EventSink::new(cmd);
         sink.fire(&Event {
             ts_ms: 42,
             device: DeviceId("0000:01:00.0".into()),
@@ -1958,6 +1941,7 @@ mod tests {
                 temp_slowdown_c: None,
                 driver_version: None,
                 process_hint: None,
+                source_caveat: None,
             })
         }
         fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {
@@ -2219,6 +2203,7 @@ mod tests {
                 temp_slowdown_c: None,
                 driver_version: None,
                 process_hint: None,
+                source_caveat: None,
             })
         }
         fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {

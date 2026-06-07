@@ -1,0 +1,6 @@
+# SYNTHETIC blob exercising the magnitude-based unit normalization: kHz rows plus an
+# already-MHz row (no real chip mixes units — this file only covers decoder branches).
+00 00 00 00 00 00 00 00    # freq=0 (off row)            v=0
+88 ef 05 00 58 02 00 00    # freq=389000 kHz -> 389 MHz  v=600
+50 04 0b 00 8a 02 00 00    # freq=722000 kHz -> 722 MHz  v=650
+e6 03 00 00 bc 02 00 00    # freq=998 (already MHz)      v=700

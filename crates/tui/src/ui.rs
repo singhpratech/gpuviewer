@@ -154,13 +154,20 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         .and_then(|s| s.util_pct)
         .map(|u| format!("{u:.0}%"))
         .unwrap_or_else(|| "—".into());
+    // When the source's utilization is an engine headline (WDDM busiest engine), the
+    // engine's name rides with the number — "Copy 97%" reads differently from "3D 97%".
+    let engine_tag = shared.latest[app.selected]
+        .as_ref()
+        .and_then(|s| s.util_engine.as_deref())
+        .map(|e| format!(" ({e})"))
+        .unwrap_or_default();
     let util_segs = wave_segments(&util_pts, 1.0, app.chart_style);
     let ds = style_datasets(&util_segs, app.chart_style, Color::Cyan);
     let chart = Chart::new(ds)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" util {latest_util}{stale_tag} ")),
+                .title(format!(" util {latest_util}{engine_tag}{stale_tag} ")),
         )
         .x_axis(Axis::default().bounds([-CHART_WINDOW_S, 0.0]))
         .y_axis(
@@ -211,7 +218,9 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
             power_limit_mw: info.power_limit_mw,
             temp_c: latest.and_then(|s| s.temp_c),
             temp_slowdown_c: info.temp_slowdown_c,
-            throttling: latest.map(|s| s.throttle.any()).unwrap_or(false),
+            // None = this source cannot observe throttling (§5.4) — rendered as an
+            // explicit "throttle n/a", never as an implied "not throttling".
+            throttling: latest.and_then(|s| s.throttle).map(|t| t.any()),
             fan_pct: latest.and_then(|s| s.fan_pct),
             sm_clock_mhz: latest.and_then(|s| s.sm_clock_mhz),
         },
@@ -306,7 +315,7 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
             power_limit_mw: info.power_limit_mw,
             temp_c: at.and_then(|r| r.temp_max_c),
             temp_slowdown_c: info.temp_slowdown_c,
-            throttling: at.map(|r| r.throttle_n > 0).unwrap_or(false),
+            throttling: at.map(|r| r.throttle_n > 0),
             fan_pct: at.and_then(|r| r.fan_max_pct),
             sm_clock_mhz: at.and_then(|r| r.sm_clock_avg),
         },
@@ -440,11 +449,21 @@ fn render_vram_chart(
     let ds = style_datasets(&segs, ctx.style, Color::Magenta);
     let y_max = if total_gib > 0.0 { total_gib } else { 1.0 };
     let y_max_label = format!("{y_max:.0}G");
+    let mut block = Block::default().borders(Borders::ALL).title(format!(
+        " vram {} / {total_label}{} ",
+        ctx.headline, ctx.title_tag
+    ));
+    // The §5.4 mandatory honesty label, rendered exactly where the qualified number is:
+    // on Apple the "total" is a unified-memory working-set budget, on WDDM the headline
+    // util is a busiest-engine duty-cycle — without this line the chart would mislabel.
+    if let Some(caveat) = &info.source_caveat {
+        block = block.title_bottom(Line::styled(
+            format!(" {caveat} "),
+            Style::default().fg(Color::DarkGray).italic(),
+        ));
+    }
     let chart = Chart::new(ds)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " vram {} / {total_label}{} ",
-            ctx.headline, ctx.title_tag
-        )))
+        .block(block)
         .x_axis(Axis::default().bounds(ctx.x_bounds))
         .y_axis(
             Axis::default()
@@ -551,6 +570,7 @@ fn render_timeline(f: &mut Frame, app: &App, shared: &Shared, w: &TimelineWindow
         util_top,
         Color::Cyan,
         format!(" util % — peak per col, 1 col ≈ {col_label} — TIMELINE "),
+        None,
     );
 
     // VRAM strip, scaled to the device total — but never below the observed peak: a
@@ -580,6 +600,8 @@ fn render_timeline(f: &mut Frame, app: &App, shared: &Shared, w: &TimelineWindow
         vram_top,
         Color::Magenta,
         format!(" vram / {total_label} — peak per col, 1 col ≈ {col_label} — TIMELINE "),
+        // Same §5.4 label as the live/replay chart — the qualified number is the same.
+        info.and_then(|i| i.source_caveat.as_deref()),
     );
 
     render_timeline_lane(f, lane_a, w, ncols, cursor_col);
@@ -601,6 +623,7 @@ fn render_timeline_strip(
     y_max: f64,
     color: Color,
     title: String,
+    caveat: Option<&str>,
 ) {
     let pts: Vec<(f64, f64)> = cols
         .iter()
@@ -612,8 +635,15 @@ fn render_timeline_strip(
         .graph_type(GraphType::Bar)
         .style(Style::default().fg(color))
         .data(&pts)];
+    let mut block = Block::default().borders(Borders::ALL).title(title);
+    if let Some(caveat) = caveat {
+        block = block.title_bottom(Line::styled(
+            format!(" {caveat} "),
+            Style::default().fg(Color::DarkGray).italic(),
+        ));
+    }
     let chart = Chart::new(ds)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(block)
         .x_axis(Axis::default().bounds([0.0, (cols.len().max(2) - 1) as f64]))
         .y_axis(Axis::default().bounds([0.0, y_max.max(1.0)]));
     f.render_widget(chart, area);
@@ -771,9 +801,11 @@ struct GaugeValues {
     power_limit_mw: Option<u32>,
     temp_c: Option<f32>,
     temp_slowdown_c: Option<f32>,
-    /// Whether the temp gauge flags throttling (live: current bits; replay: any throttled
-    /// frame in the cursor's bucket).
-    throttling: bool,
+    /// Whether the temp gauge flags throttling. `Some(true)`: observed active (live:
+    /// current bits; replay: ≥1 observed-active frame in the cursor's bucket).
+    /// `Some(false)`: observed quiet. `None`: unobservable on this source (§5.4) — the
+    /// gauge says "throttle n/a" instead of implying quiet.
+    throttling: Option<bool>,
     fan_pct: Option<f32>,
     sm_clock_mhz: Option<u32>,
 }
@@ -809,12 +841,13 @@ fn render_gauges(f: &mut Frame, area: Rect, v: &GaugeValues) {
             let max = v.temp_slowdown_c.unwrap_or(95.0) as f64;
             (
                 (t as f64 / max).clamp(0.0, 1.0),
-                if v.throttling {
-                    format!("{t:.0}°C ⚠ THROTTLING")
-                } else {
-                    format!("{t:.0}°C")
+                match v.throttling {
+                    Some(true) => format!("{t:.0}°C ⚠ THROTTLING"),
+                    Some(false) => format!("{t:.0}°C"),
+                    // Unobservable ≠ quiet: say so where the flag would appear.
+                    None => format!("{t:.0}°C · throttle n/a"),
                 },
-                if v.throttling {
+                if v.throttling == Some(true) {
                     Color::Red
                 } else {
                     Color::Green
@@ -1405,6 +1438,78 @@ mod tests {
         );
     }
 
+    /// `StaticInfo::source_caveat` (§5.4 — the Apple working-set-budget label, the WDDM
+    /// duty-cycle wording) must render on the VRAM chart, right where the qualified
+    /// number is; the mock sets `None`, so only this test exercises the `Some` branch.
+    #[test]
+    fn source_caveat_renders_on_the_vram_chart() {
+        let collector = Collector::start(mock_engine(), Duration::from_secs(3600), false);
+        let shared = Arc::clone(&collector.shared);
+        let app = App::new(collector);
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+
+        // Baseline: no caveat (mock default) renders without it.
+        {
+            let sh = shared.lock().unwrap();
+            terminal.draw(|f| super::render(f, &app, &sh)).unwrap();
+        }
+        let screen = terminal.backend().to_string();
+        assert!(!screen.contains("working-set budget"));
+
+        shared.lock().unwrap().infos[0].source_caveat =
+            Some("unified-memory working-set budget".into());
+        {
+            let sh = shared.lock().unwrap();
+            terminal.draw(|f| super::render(f, &app, &sh)).unwrap();
+        }
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("unified-memory working-set budget"),
+            "source_caveat missing from the chart area:\n{screen}"
+        );
+    }
+
+    /// A source that cannot observe throttling (`throttle: None`, §5.4) must read
+    /// "throttle n/a" on the temp gauge — an explicit blind spot, never an implied
+    /// "not throttling".
+    #[test]
+    fn unobservable_throttle_reads_na_not_quiet() {
+        // Stationary collector: no tick thread to overwrite the injected sample.
+        let collector = test_collector(None);
+        let shared = Arc::clone(&collector.shared);
+        let app = App::new(collector);
+
+        // A sample with a temperature but no throttle observability (the wddm shape —
+        // synthetic here because the mock always observes).
+        shared.lock().unwrap().latest[0] = Some(DynamicSample {
+            ts_ms: gpuviewer_core::now_ms(),
+            util_pct: Some(50.0),
+            util_engine: None,
+            mem_used_bytes: Some(1 << 30),
+            power_mw: None,
+            temp_c: Some(60.0),
+            fan_pct: None,
+            sm_clock_mhz: None,
+            mem_clock_mhz: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            throttle: None,
+        });
+        let screen = draw(&app, &shared);
+        assert!(
+            screen.contains("throttle n/a"),
+            "unobservable throttle must be labeled n/a:\n{screen}"
+        );
+        assert!(!screen.contains("THROTTLING"));
+
+        // Observed-quiet: no n/a label, no flag — the plain reading.
+        shared.lock().unwrap().latest[0].as_mut().unwrap().throttle =
+            Some(ThrottleReasons::default());
+        let screen = draw(&app, &shared);
+        assert!(!screen.contains("throttle n/a"));
+        assert!(!screen.contains("THROTTLING"));
+    }
+
     /// The footer's "(mock data)" tag must track the actual data source — it was once
     /// hardcoded, calling live NVML data mock. The mock engine asserts the tag; then
     /// flipping `Shared::mock` (what a real backend produces) asserts its absence.
@@ -1556,6 +1661,7 @@ mod tests {
         shared.lock().unwrap().latest[0] = Some(DynamicSample {
             ts_ms: gpuviewer_core::now_ms().saturating_sub(34_000),
             util_pct: Some(72.0),
+            util_engine: None,
             mem_used_bytes: Some(4 << 30),
             power_mw: None,
             temp_c: None,
@@ -1564,7 +1670,7 @@ mod tests {
             mem_clock_mhz: None,
             encoder_pct: None,
             decoder_pct: None,
-            throttle: ThrottleReasons::default(),
+            throttle: Some(ThrottleReasons::default()),
         });
 
         // Alive: no stale affordances anywhere.

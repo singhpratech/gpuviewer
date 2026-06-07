@@ -43,8 +43,16 @@ pub trait GpuBackend: Send {
     fn refresh_processes(&mut self, dev: &DeviceId) -> Result<Vec<ProcessSample>, BackendError>;
 }
 
-/// Explicit registry — no constructor/inventory magic. Real backends (nvidia, amd, intel)
-/// register here as they land; each one's failed init is logged and skipped.
+/// Explicit registry — no constructor/inventory magic. Each backend's failed init is
+/// logged and skipped.
+///
+/// Registry order is load-bearing (design cross-platform.md §3.7/§9):
+/// **nvidia → amd → intel → wddm → apple**. The collector dedupes devices across
+/// backends by normalized PCI address, first backend wins — so NVML (the richer source)
+/// must register before wddm to claim NVIDIA boards, and AMD/Intel adapters — plus
+/// NVIDIA boards on driverless/broken-NVML machines — fall through to wddm. No new
+/// dedupe mechanism here: synthetic non-PCI ids (`wddm:…`, `apple:…`, `mock:…`) never
+/// dedupe by design — a double listing is visible and honest, a wrong merge is not.
 ///
 /// `force_mock` returns ONLY the mock backend — its purpose is deterministic CI/demo
 /// output, so real devices must not leak in. Otherwise the mock is the fallback when no
@@ -72,6 +80,23 @@ pub fn all_backends(force_mock: bool) -> Vec<Box<dyn GpuBackend>> {
     match crate::intel::IntelBackend::init() {
         Ok(b) => backends.push(Box::new(b)),
         Err(e) => eprintln!("gpuviewer: intel backend skipped: {e}"),
+    }
+
+    // wddm registers LAST among Windows backends (§3.7): the collector's first-wins PCI
+    // dedupe lets NVML claim NVIDIA boards first; AMD/Intel adapters — and NVIDIA boards
+    // on driverless/broken-NVML machines — fall through to wddm. Synthetic `wddm:` ids
+    // never dedupe by design.
+    #[cfg(all(feature = "wddm", target_os = "windows"))]
+    match crate::wddm::WddmBackend::init() {
+        Ok(b) => backends.push(Box::new(b)),
+        Err(e) => eprintln!("gpuviewer: wddm backend skipped: {e}"),
+    }
+
+    // Registry order per design §9: nvidia → amd → intel → (wddm) → apple.
+    #[cfg(all(feature = "apple", target_os = "macos"))]
+    match crate::apple::AppleBackend::init() {
+        Ok(b) => backends.push(Box::new(b)),
+        Err(e) => eprintln!("gpuviewer: apple backend skipped: {e}"),
     }
 
     if backends.is_empty() {

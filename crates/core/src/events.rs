@@ -252,11 +252,25 @@ fn throttle_events(
     temp_slowdown_c: Option<f32>,
     out: &mut Vec<Event>,
 ) {
-    let prev_any = st.prev.as_ref().map(|p| p.throttle.any()).unwrap_or(false);
-    let now_any = sample.throttle.any();
+    // Throttle unobservable on this source (`None` ≠ "not throttling" — design §5.4):
+    // neither a start nor an end can be asserted, so drop the open episode silently —
+    // the same blind-spot rule util uses for idle gaps and hangs. Narrating an "end"
+    // off a blind spot would be a fabricated fact.
+    let Some(throttle) = sample.throttle else {
+        st.throttle_since = None;
+        st.pre_throttle_clock = None;
+        return;
+    };
+    let prev_any = st
+        .prev
+        .as_ref()
+        .and_then(|p| p.throttle)
+        .map(|t| t.any())
+        .unwrap_or(false);
+    let now_any = throttle.any();
 
     if !prev_any && now_any {
-        let labels = sample.throttle.labels().join(", ");
+        let labels = throttle.labels().join(", ");
         let pre_clock = st.prev.as_ref().and_then(|p| p.sm_clock_mhz);
         st.pre_throttle_clock = pre_clock;
         st.throttle_since = Some(sample.ts_ms);
@@ -274,7 +288,7 @@ fn throttle_events(
             ts_ms: sample.ts_ms,
             device: device.clone(),
             kind: EventKind::ThrottleStart,
-            severity: severity_for(&sample.throttle),
+            severity: severity_for(&throttle),
             confidence: Confidence::Fact,
             title: format!("{name} began throttling ({labels}){clocks}"),
             evidence: format!("throttle bits: [{labels}]{temp_part}"),

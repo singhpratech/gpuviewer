@@ -227,7 +227,21 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::NoDataDir => {
-                write!(f, "no data directory (set $XDG_DATA_HOME or $HOME)")
+                // Per-OS advice naming the variables this OS's resolution actually reads
+                // (see `default_data_dir`) — telling a Windows user to set $XDG_DATA_HOME
+                // would be a dead end.
+                #[cfg(target_os = "windows")]
+                {
+                    write!(f, "no data directory (set %LOCALAPPDATA% or %USERPROFILE%)")
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    write!(f, "no data directory (set $HOME)")
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    write!(f, "no data directory (set $XDG_DATA_HOME or $HOME)")
+                }
             }
             StoreError::OutputExists(p) => {
                 write!(f, "refusing to overwrite existing file {}", p.display())
@@ -312,7 +326,13 @@ impl SqliteStore {
             Ok(store) if store.quick_check_ok() => (store, false),
             // Open succeeded but the integrity check failed, or open/init itself failed:
             // either way the existing file is unusable. Rename it aside and start fresh.
-            _ => {
+            failed => {
+                // Bind and drop the failed store BEFORE the rename: a `_` arm would keep
+                // the scrutinee — an open SQLite connection — alive through the arm.
+                // POSIX rename tolerates that, but SQLite's win32 VFS opens the file
+                // without FILE_SHARE_DELETE, so on Windows the rename would hit a sharing
+                // violation and corrupt-db RECOVERY would become a hard startup FAILURE.
+                drop(failed);
                 Self::quarantine(&path)?;
                 (Self::try_open_init(&path)?, true)
             }
@@ -1136,20 +1156,54 @@ fn now_ms_wall() -> u64 {
         .unwrap_or(0)
 }
 
-/// `$XDG_DATA_HOME/gpuviewer` or `~/.local/share/gpuviewer`, creating nothing here (the
-/// caller's `open` makes the dir). Errors only when neither variable is set.
-fn default_data_dir() -> Result<PathBuf, StoreError> {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
+/// Default per-OS data dir, creating nothing here (the caller's `open` makes the dir):
+/// Linux `$XDG_DATA_HOME/gpuviewer` (else `~/.local/share/gpuviewer`), Windows
+/// `%LOCALAPPDATA%\gpuviewer`, macOS `~/Library/Application Support/gpuviewer`.
+///
+/// Resolved from ENVIRONMENT VARIABLES on every OS — deliberately not the Windows Known
+/// Folder API: child processes must be able to redirect it via env, which the hermetic
+/// test pattern (and `--db`-less CI runs) depends on. The trade-off (ignoring
+/// registry-redirected/roaming AppData) is acceptable for a CLI tool and is the reason
+/// the `dirs`/`directories` crates were rejected (SHGetKnownFolderPath cannot be
+/// redirected per-process; their path shapes also differ from ours on Windows AND macOS).
+/// Empty values count as unset throughout: an empty override would silently root the
+/// history under the current directory.
+pub fn default_data_dir() -> Result<PathBuf, StoreError> {
+    #[cfg(target_os = "windows")]
+    {
+        // %LOCALAPPDATA% is set for every interactive logon (and on GitHub runners) but
+        // can be absent under service accounts — hence the %USERPROFILE% fallback.
+        if let Some(v) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(v).join("gpuviewer"));
+        }
+        if let Some(v) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(v)
+                .join("AppData")
+                .join("Local")
+                .join("gpuviewer"));
+        }
+        Err(StoreError::NoDataDir)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // XDG is deliberately NOT consulted on macOS: native tools put per-user data in
+        // Application Support, and a half-XDG layout would scatter the history.
+        if let Some(v) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(v).join("Library/Application Support/gpuviewer"));
+        }
+        Err(StoreError::NoDataDir)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // BYTE-IDENTICAL to the shipped v1 chain — existing users' history.db must not move.
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
             return Ok(PathBuf::from(xdg).join("gpuviewer"));
         }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
             return Ok(PathBuf::from(home).join(".local/share/gpuviewer"));
         }
+        Err(StoreError::NoDataDir)
     }
-    Err(StoreError::NoDataDir)
 }
 
 const SCHEMA_SQL: &str = "

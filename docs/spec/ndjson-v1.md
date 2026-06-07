@@ -29,10 +29,19 @@ asserts the output against this contract.
 - **`util_pct` is duty-cycle, not saturation.** It is the fraction of time at least one
   kernel was resident on the device — a GPU at "100%" may be far from compute- or
   bandwidth-bound. Do not present it as capacity used.
+- **Engine-derived percent fields can exceed 100.** On Windows the WDDM source reads PDH
+  GPU-engine counters with `PDH_FMT_NOCAP100` (silent capping would make summed numbers
+  quietly wrong) and sums per-engine busy% across pids; sampling skew adds a little more.
+  So `util_pct`, `encoder_pct`, `decoder_pct`, and per-process `util_pct` can honestly land
+  above 100 from such sources. A value over 100 is real data, never corruption — consumers
+  must not reject or "fix" it.
 - **The process list may be incomplete.** Listing other users' processes requires
   privileges on most platforms; on WSL2 per-process GPU attribution is unavailable at the
   driver level. The device's `process_hint` (TUI-side) explains such gaps; absence of a
   process from the array is not proof it isn't using the GPU.
+- **`throttle: null` is a blind spot, not quiet.** Sources that cannot observe throttle
+  state emit `null`; an all-false `throttle` object is an observed "no throttle reason
+  active". Alerting logic must not collapse the two.
 - **Events are two-tier.** `"confidence": "fact"` events assert observed state transitions
   plainly. `"confidence": "likely"` events are inferences, always hedged with "likely" in
   the title, and always carry the raw numbers behind the claim in `evidence`.
@@ -44,7 +53,8 @@ One per collection tick. Example (wrapped for readability — the stream never w
 ```json
 {"v":1,"type":"frame","ts_ms":1780000000000,"devices":[
   {"id":"0000:01:00.0","name":"GeForce RTX 4090","mem_total_bytes":25769803776,
-   "sample":{"ts_ms":1780000000000,"util_pct":97.2,"mem_used_bytes":21354232313,
+   "sample":{"ts_ms":1780000000000,"util_pct":97.2,"util_engine":null,
+             "mem_used_bytes":21354232313,
              "power_mw":400176,"temp_c":74.1,"fan_pct":62.0,"sm_clock_mhz":2447,
              "mem_clock_mhz":10500,"encoder_pct":0.0,"decoder_pct":null,
              "throttle":{"thermal":false,"power_cap":false,"hw_slowdown":false,
@@ -69,7 +79,7 @@ One per collection tick. Example (wrapped for readability — the stream never w
 |-------------------|-----------|----------|-----------|
 | `id`              | string    | no       | Stable device identity: PCI address (`0000:01:00.0`) for PCI devices; other devices use a prefixed key (e.g. `mock:0000:01:00.0`). Stable across ticks within a run. |
 | `name`            | string    | no       | Marketing/product name as reported by the driver. |
-| `mem_total_bytes` | integer   | yes      | Total VRAM in bytes, so consumers can compute used/total without a second query. `null` when the source does not expose it. |
+| `mem_total_bytes` | integer   | yes      | Total device memory in bytes, so consumers can compute used/total without a second query. VRAM on discrete boards; on unified-memory devices (Apple Silicon) this is a **working-set budget**, not a VRAM capacity — the TUI labels it per device. `null` when the source does not expose it. |
 | `sample`          | object    | yes      | This tick's metrics (below). `null` when the device failed to answer this tick — the device is still listed so consumers see the gap. |
 | `processes`       | array of process objects | no | Processes attached to this device this tick. May be empty; may be incomplete (see honesty notes). |
 
@@ -78,16 +88,17 @@ One per collection tick. Example (wrapped for readability — the stream never w
 | field            | JSON type | nullable | semantics |
 |------------------|-----------|----------|-----------|
 | `ts_ms`          | integer   | no       | When this device was sampled (epoch ms). May trail the frame's `ts_ms` by collection latency. |
-| `util_pct`       | number    | yes      | Device utilization, 0–100. **Duty-cycle, not saturation** (see honesty notes). |
+| `util_pct`       | number    | yes      | Device utilization, percent. Nominally 0–100, but engine-derived sources can exceed 100 (see honesty notes) — do not treat >100 as broken data. **Duty-cycle, not saturation** (see honesty notes). |
+| `util_engine`    | string    | yes      | Name of the engine whose busy% `util_pct` reports, when utilization is an engine headline rather than a whole-device number (Windows WDDM: the busiest single engine, Task-Manager-comparable — e.g. `"3D"`, `"Copy"`; the engtype set is open). `null` where utilization is device-wide. |
 | `mem_used_bytes` | integer   | yes      | VRAM in use, bytes. |
 | `power_mw`       | integer   | yes      | Board power draw, milliwatts. |
 | `temp_c`         | number    | yes      | Primary (edge/hotspot per source) temperature, °C. |
 | `fan_pct`        | number    | yes      | Fan speed, 0–100. `null` on fanless parts (iGPUs) and where unexposed. |
 | `sm_clock_mhz`   | integer   | yes      | Shader/SM clock, MHz. |
 | `mem_clock_mhz`  | integer   | yes      | Memory clock, MHz. |
-| `encoder_pct`    | number    | yes      | Video encoder utilization, 0–100. |
-| `decoder_pct`    | number    | yes      | Video decoder utilization, 0–100. |
-| `throttle`       | object    | no       | Decoded throttle reasons; five booleans, all always present: `thermal`, `power_cap`, `hw_slowdown`, `sync_boost`, `other`. Unknown future driver bits land in `other`, never dropped. |
+| `encoder_pct`    | number    | yes      | Video encoder utilization, percent. Nominally 0–100; engine-derived sources can exceed 100 (see honesty notes). |
+| `decoder_pct`    | number    | yes      | Video decoder utilization, percent. Nominally 0–100; engine-derived sources can exceed 100 (see honesty notes). |
+| `throttle`       | object    | yes      | Decoded throttle reasons. When present, an object of five booleans, all always present: `thermal`, `power_cap`, `hw_slowdown`, `sync_boost`, `other` (unknown future driver bits land in `other`, never dropped). **`null` means the source cannot observe throttling at all** (Windows cross-vendor WDDM counters, macOS, a failed NVML query) — treat it as "unknown", never as "not throttling": an all-false object is an *observation* of quiet, `null` is a blind spot. |
 
 ### Process object
 
@@ -97,7 +108,7 @@ One per collection tick. Example (wrapped for readability — the stream never w
 | `name`      | string    | no       | Process name (comm); best-effort, may be a fallback like the pid when unreadable. |
 | `kind`      | string    | no       | One of `"compute"`, `"graphics"`, `"both"`, `"unknown"`. |
 | `mem_bytes` | integer   | yes      | Device memory attributed to this process, bytes. `null` where the driver cannot attribute it (e.g. WDDM, WSL2). |
-| `util_pct`  | number    | yes      | Per-process GPU utilization, 0–100. Weak semantics under concurrency on some drivers — treat as indicative. |
+| `util_pct`  | number    | yes      | Per-process GPU utilization, percent. Nominally 0–100; engine-derived sources can exceed 100 (see honesty notes). Weak semantics under concurrency on some drivers — treat as indicative. |
 | `cpu_pct`   | number    | yes      | Process CPU usage as % of one core (`100.0` = one full core; can exceed 100 on multithreaded processes). `null` when unknown. |
 | `container` | string    | yes      | Container identity when the process runs in one, e.g. `"docker:1a2b3c4d5e6f"`. `null` for host processes or when unknown. |
 

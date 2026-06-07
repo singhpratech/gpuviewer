@@ -42,7 +42,7 @@ struct Args {
     backoff: bool,
     /// Persistence on (default); `--no-persist` turns it off (and with it, replay/report).
     persist: bool,
-    /// Override history database path (else the XDG default).
+    /// Override history database path (else the per-OS default).
     db: Option<PathBuf>,
     /// `--on-event 'CMD'`: shell command fired for every emitted event.
     on_event: Option<String>,
@@ -71,7 +71,32 @@ struct ReportArgs {
     mock: bool,
 }
 
-const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
+/// Per-OS default location of the history database — the HELP-text mirror of
+/// `gpuviewer_history::store::default_data_dir` (the single resolver). The help must tell
+/// each OS's users the truth about where history actually lands, not the Linux story.
+#[cfg(target_os = "windows")]
+const DB_DEFAULT_HELP: &str = "%LOCALAPPDATA%\\gpuviewer\\history.db";
+#[cfg(target_os = "macos")]
+const DB_DEFAULT_HELP: &str = "~/Library/Application Support/gpuviewer/history.db";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const DB_DEFAULT_HELP: &str = "$XDG_DATA_HOME/gpuviewer/history.db";
+
+/// How `--on-event` dispatches on this OS, with an example in this OS's variable syntax.
+/// The hook runs through the native shell (`collector::EventSink`), so on Windows the
+/// help shows `cmd /C` + `%VAR%` — a `sh` incantation may not exist there at all.
+#[cfg(windows)]
+const ON_EVENT_SHELL_HELP: &str = "cmd /C";
+#[cfg(windows)]
+const ON_EVENT_EXAMPLE_HELP: &str = "--on-event \"curl -s -d %GPV_EVENT_TITLE% ntfy.sh/mytopic\"";
+#[cfg(not(windows))]
+const ON_EVENT_SHELL_HELP: &str = "sh -c";
+#[cfg(not(windows))]
+const ON_EVENT_EXAMPLE_HELP: &str = "--on-event 'curl -s -d \"$GPV_EVENT_TITLE\" ntfy.sh/mytopic'";
+
+/// The `--help` text. A function (not a const) only because the per-OS fragments above
+/// are interpolated; the wording is otherwise fixed.
+fn help_text() -> String {
+    format!("gpuviewer — the GPU flight recorder\n\n\
     USAGE:\n  \
       gpuviewer [--json [--once]] [--mock] [--interval <ms>] [--no-backoff]\n            \
                 [--db <path>] [--on-event <cmd>]\n  \
@@ -88,16 +113,16 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
       --no-backoff    disable the adaptive low-power cadence (idle GPUs are normally polled\n                  \
                       slower so polling does not keep them awake)\n  \
       --no-persist    do not record history (the replay view and `report` need the recording)\n  \
-      --db <path>     history database path (default: $XDG_DATA_HOME/gpuviewer/history.db).\n                  \
+      --db <path>     history database path (default: {DB_DEFAULT_HELP}).\n                  \
                       A database is stamped real or mock on first recording; recording the\n                  \
                       other kind into it is refused so simulations never pollute real history.\n                  \
                       Only ONE instance records to a database at a time — a second instance\n                  \
                       runs live-only (read-only modes like report/view are unrestricted)\n  \
-      --on-event <c>  run `sh -c <c>` for every emitted event, with GPV_EVENT_KIND,\n                  \
+      --on-event <c>  run `{ON_EVENT_SHELL_HELP} <c>` for every emitted event, with GPV_EVENT_KIND,\n                  \
                       GPV_EVENT_SEVERITY, GPV_EVENT_CONFIDENCE, GPV_EVENT_TITLE,\n                  \
                       GPV_EVENT_EVIDENCE, GPV_EVENT_DEVICE, GPV_EVENT_TS_MS, GPV_EVENT_JSON\n                  \
                       in the environment (capped at 60 spawns/min). Example:\n                  \
-                      --on-event 'curl -s -d \"$GPV_EVENT_TITLE\" ntfy.sh/mytopic'\n\n\
+                      {ON_EVENT_EXAMPLE_HELP}\n\n\
     report — print a plain-text digest of recorded history (no ANSI):\n  \
       --since <spec>  window start; default 24h\n  \
       --until <spec>  window end; default now\n  \
@@ -118,7 +143,8 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
     q quits; arrows/pgup/pgdn scrub; enter jumps to the selected event\n\n\
     GENERAL:\n  \
       --version, -V   print version and exit\n  \
-      --help, -h      show this help";
+      --help, -h      show this help")
+}
 
 /// Write `text` to stdout, treating a broken pipe as the consumer hanging up — these
 /// streams are built to be piped (`gpuviewer report | head`, `--json | jq`), and a Unix
@@ -179,7 +205,7 @@ fn parse_args() -> Result<Args> {
                 std::process::exit(0);
             }
             "--help" | "-h" => {
-                emit_line(HELP);
+                emit_line(&help_text());
                 std::process::exit(0);
             }
             other => bail!("unknown flag: {other} (see --help)"),
@@ -218,7 +244,7 @@ fn parse_report_args(mut it: impl Iterator<Item = String>) -> Result<ReportArgs>
             }
             "--mock" => r.mock = true,
             "--help" | "-h" => {
-                emit_line(HELP);
+                emit_line(&help_text());
                 std::process::exit(0);
             }
             other => bail!("unknown report flag: {other} (see --help)"),
@@ -240,7 +266,7 @@ fn parse_demo_args(it: impl Iterator<Item = String>) -> Result<DemoArgs> {
         match a.as_str() {
             "--seed-only" => d.seed_only = true,
             "--help" | "-h" => {
-                emit_line(HELP);
+                emit_line(&help_text());
                 std::process::exit(0);
             }
             other => bail!("unknown demo flag: {other} (see --help)"),
@@ -279,7 +305,7 @@ fn parse_export_args(mut it: impl Iterator<Item = String>) -> Result<ExportArgs>
             }
             "--mock" => mock = true,
             "--help" | "-h" => {
-                emit_line(HELP);
+                emit_line(&help_text());
                 std::process::exit(0);
             }
             other if other.starts_with('-') => bail!("unknown export flag: {other} (see --help)"),
@@ -306,7 +332,7 @@ fn parse_view_args(it: impl Iterator<Item = String>) -> Result<PathBuf> {
     for a in it {
         match a.as_str() {
             "--help" | "-h" => {
-                emit_line(HELP);
+                emit_line(&help_text());
                 std::process::exit(0);
             }
             other if other.starts_with('-') => bail!("unknown view flag: {other} (see --help)"),
@@ -614,7 +640,7 @@ fn run_report(args: ReportArgs) -> Result<()> {
         None => now,
     };
 
-    // Resolve the database path. --db wins; else the XDG default, with --mock selecting the
+    // Resolve the database path. --db wins; else the per-OS default, with --mock selecting the
     // separate mock file (same rule the writer uses, so report reads what the run recorded).
     let path = match &args.db {
         Some(p) => p.clone(),
@@ -840,26 +866,17 @@ fn fmt_clock_full(ms: u64) -> String {
 }
 
 /// The default history path for `report`/`export`, mirroring `SqliteStore::open_default`'s
-/// naming so they read the same file the collector wrote. Resolved without opening anything.
+/// naming so they read the same file the collector wrote. Resolved without opening
+/// anything, through the store's own per-OS `default_data_dir` — ONE resolver, so the
+/// subcommands can never drift from where the collector records (the cross-platform
+/// design's reason for deleting the resolver this binary used to duplicate).
 fn default_history_path(mock: bool) -> Result<PathBuf> {
     let file = if mock {
         "history-mock.db"
     } else {
         "history.db"
     };
-    Ok(default_data_dir()?.join(file))
-}
-
-/// `$XDG_DATA_HOME/gpuviewer` or `~/.local/share/gpuviewer`, mirroring the store's own
-/// resolution so every subcommand reads/writes where the collector records.
-fn default_data_dir() -> Result<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("gpuviewer"));
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(home).join(".local/share/gpuviewer"));
-    }
-    bail!("no data directory (set $XDG_DATA_HOME or $HOME)")
+    Ok(gpuviewer_history::store::default_data_dir()?.join(file))
 }
 
 // ===========================================================================================
@@ -874,7 +891,7 @@ fn run_demo(args: DemoArgs) -> Result<()> {
     // The demo gets its OWN file next to the default path, deleted and recreated on every
     // run: the demo must be reproducible, and it must never touch history.db (nor even the
     // mock file a real `--mock` session may be recording to).
-    let path = default_data_dir()?.join("history-demo.db");
+    let path = gpuviewer_history::store::default_data_dir()?.join("history-demo.db");
     // Probe the instance lock BEFORE deleting: another live session may be recording to
     // this very file (a second `demo`, or `--mock --db .../history-demo.db`), and deleting
     // a recording out from under its writer is the destructive cousin of the audit's
@@ -1076,6 +1093,9 @@ fn static_info_from_row(d: DeviceRow) -> StaticInfo {
         temp_slowdown_c: None,
         driver_version: None,
         process_hint: None,
+        // Recordings do not (yet) persist the per-device source caveat; absence here is
+        // honest "unknown", not an assertion that the recorded source needed no label.
+        source_caveat: None,
     }
 }
 
@@ -1158,11 +1178,12 @@ mod tests {
     fn full_sample(
         ts_ms: u64,
         util: f32,
-        throttle: ThrottleReasons,
+        throttle: Option<ThrottleReasons>,
     ) -> gpuviewer_core::DynamicSample {
         gpuviewer_core::DynamicSample {
             ts_ms,
             util_pct: Some(util),
+            util_engine: None,
             mem_used_bytes: Some(8 * 1024 * 1024 * 1024),
             power_mw: Some(200_000),
             temp_c: Some(70.0),
@@ -1194,8 +1215,8 @@ mod tests {
         // summary that sums per-bucket sample counts instead of counting buckets reads 2,
         // not 1. Then a frame in the next bucket to force the completed bucket to flush.
         rec.observe(&dev, &full_sample(1_000, 40.0, Default::default()), &[]);
-        rec.observe(&dev, &full_sample(2_000, 80.0, thermal), &[]);
-        rec.observe(&dev, &full_sample(3_000, 45.0, thermal), &[]);
+        rec.observe(&dev, &full_sample(2_000, 80.0, Some(thermal)), &[]);
+        rec.observe(&dev, &full_sample(3_000, 45.0, Some(thermal)), &[]);
         rec.observe(&dev, &full_sample(9_000, 60.0, Default::default()), &[]);
         rec.observe(&dev, &full_sample(11_000, 5.0, Default::default()), &[]);
         rec.flush();

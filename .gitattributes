@@ -1,0 +1,13 @@
+# One byte-identical checkout on every OS (overrides the Windows runner image's
+# core.autocrlf=true). rustfmt's default newline_style=Auto then keeps LF everywhere.
+* text=auto eol=lf
+
+# Fixture trees replicate kernel sysfs/ioctl output byte-for-byte — never normalize.
+crates/core/tests/fixtures/** -text
+
+# Binary artifacts.
+*.gpvr binary
+*.db binary
+*.png binary
+*.ico binary
+*.icns binary

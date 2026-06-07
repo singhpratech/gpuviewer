@@ -4,14 +4,28 @@
 //! test points the process at a scratch data dir, so the user's real history is never read
 //! or written.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gpuviewer_core::{now_ms, Confidence, DeviceId, Event, EventKind, Severity, Vendor};
-use gpuviewer_history::{DataSource, SqliteStore, Tier};
+use gpuviewer_history::{DataSource, SqliteStore, StoreError, Tier};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_gpuviewer"))
+}
+
+/// The binary with EVERY per-OS data-dir root redirected to `dir` on the child process
+/// only: XDG_DATA_HOME (Linux), HOME (macOS — and the Linux fallback), LOCALAPPDATA +
+/// USERPROFILE (Windows). Setting all four on every OS is deliberate: resolution is
+/// env-based per OS, so the variables the local OS ignores are inert, and one helper
+/// keeps every spawn hermetic across the whole CI matrix.
+fn bin_hermetic(dir: &Path) -> Command {
+    let mut cmd = bin();
+    cmd.env("XDG_DATA_HOME", dir)
+        .env("HOME", dir)
+        .env("LOCALAPPDATA", dir)
+        .env("USERPROFILE", dir);
+    cmd
 }
 
 /// A unique scratch directory per test; removed at the end (a failed test leaves it for
@@ -27,15 +41,13 @@ fn scratch_dir(tag: &str) -> PathBuf {
 
 /// `demo --seed-only` builds the demo database under the (overridden) data dir, prints the
 /// one-line summary with the db path, and exits 0 without a tty. The store must hold >0
-/// events and rollups spanning ~8h. XDG_DATA_HOME/HOME are overridden on the child process
+/// events and rollups spanning ~8h. The data-dir env is overridden on the child process
 /// only, so the test is hermetic.
 #[test]
 fn demo_seed_only_builds_an_eight_hour_story() {
     let dir = scratch_dir("demo");
-    let out = bin()
+    let out = bin_hermetic(&dir)
         .args(["demo", "--seed-only"])
-        .env("XDG_DATA_HOME", &dir)
-        .env("HOME", &dir)
         .output()
         .expect("failed to spawn gpuviewer");
     assert!(
@@ -57,8 +69,21 @@ fn demo_seed_only_builds_an_eight_hour_story() {
         "summary must include the db path: {stdout}"
     );
 
-    let db = dir.join("gpuviewer").join("history-demo.db");
+    // The db path is parsed from the summary line rather than assuming the XDG layout:
+    // the per-OS default dir shapes differ (macOS appends Library/Application Support),
+    // and the summary line is already part of the asserted contract above.
+    let db_line = stdout
+        .lines()
+        .find(|l| l.contains("(db: "))
+        .expect("summary line must name the db path");
+    let after = &db_line[db_line.find("(db: ").unwrap() + "(db: ".len()..];
+    let db = PathBuf::from(after.trim_end().trim_end_matches(')'));
     assert!(db.exists(), "demo db must exist at {}", db.display());
+    assert!(
+        db.starts_with(&dir),
+        "the demo db must land under the redirected scratch dir, got {}",
+        db.display()
+    );
     let store = SqliteStore::open_readonly(&db).unwrap();
 
     // Rollups span ~8h (bucket flooring trims up to 60s off either edge, never more).
@@ -235,10 +260,8 @@ fn json_stream_ends_cleanly_when_the_consumer_hangs_up() {
     use std::process::Stdio;
 
     let dir = scratch_dir("epipe");
-    let mut child = bin()
+    let mut child = bin_hermetic(&dir)
         .args(["--json", "--mock", "--interval", "100"])
-        .env("XDG_DATA_HOME", &dir)
-        .env("HOME", &dir)
         .stdout(Stdio::piped())
         .spawn()
         .expect("failed to spawn gpuviewer");
@@ -280,7 +303,7 @@ fn recording_refuses_cross_mode_db() {
     // Mock data into a real-stamped db: refused.
     let real_db = dir.join("real-history.db");
     drop(SqliteStore::open_recording(&real_db, DataSource::Real).unwrap());
-    let out = bin()
+    let out = bin_hermetic(&dir)
         .args([
             "--json",
             "--once",
@@ -288,8 +311,6 @@ fn recording_refuses_cross_mode_db() {
             "--db",
             real_db.to_str().unwrap(),
         ])
-        .env("XDG_DATA_HOME", &dir)
-        .env("HOME", &dir)
         .output()
         .expect("failed to spawn gpuviewer");
     assert!(
@@ -319,10 +340,8 @@ fn recording_refuses_cross_mode_db() {
     // The reverse: a real session pointed at a mock-stamped db is refused the same way.
     let mock_db = dir.join("mock-history.db");
     drop(SqliteStore::open_recording(&mock_db, DataSource::Mock).unwrap());
-    let out = bin()
+    let out = bin_hermetic(&dir)
         .args(["--json", "--once", "--db", mock_db.to_str().unwrap()])
-        .env("XDG_DATA_HOME", &dir)
-        .env("HOME", &dir)
         .output()
         .expect("failed to spawn gpuviewer");
     assert!(
@@ -365,7 +384,7 @@ fn second_instance_loses_the_lock_and_runs_live_only() {
     let db = dir.join("shared-history.db");
 
     // Instance 1: a long-running --json stream — the systemd-unit shape from the audit.
-    let mut holder = bin()
+    let mut holder = bin_hermetic(&dir)
         .args([
             "--json",
             "--mock",
@@ -374,8 +393,6 @@ fn second_instance_loses_the_lock_and_runs_live_only() {
             "--db",
             db.to_str().unwrap(),
         ])
-        .env("XDG_DATA_HOME", &dir)
-        .env("HOME", &dir)
         .stdout(Stdio::piped())
         .spawn()
         .expect("failed to spawn the holding instance");
@@ -390,10 +407,8 @@ fn second_instance_loses_the_lock_and_runs_live_only() {
 
     // Instance 2, same --db: must still do its job (a frame on stdout, exit 0) while
     // recording nothing, and must say WHY on stderr.
-    let out = bin()
+    let out = bin_hermetic(&dir)
         .args(["--json", "--once", "--mock", "--db", db.to_str().unwrap()])
-        .env("XDG_DATA_HOME", &dir)
-        .env("HOME", &dir)
         .output()
         .expect("failed to spawn the losing instance");
     assert!(
@@ -428,12 +443,25 @@ fn second_instance_loses_the_lock_and_runs_live_only() {
     );
 
     // Holder exits -> kernel releases the lock -> the next recording open succeeds.
+    // Bounded retry instead of a one-shot open: on Linux flock release is immediate at
+    // process death, but Microsoft documents that LockFileEx locks may take OS-dependent
+    // time to be released after TerminateProcess — an immediate single attempt is a real
+    // windows-latest flake, not a hardening nicety.
     holder.kill().expect("kill holder");
     holder.wait().expect("wait holder");
-    drop(
-        SqliteStore::open_recording(&db, DataSource::Mock)
-            .expect("the lock must be free once the holder is gone"),
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match SqliteStore::open_recording(&db, DataSource::Mock) {
+            Ok(store) => {
+                drop(store);
+                break;
+            }
+            Err(StoreError::Locked { .. }) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("the lock must be free once the holder is gone: {e}"),
+        }
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }
