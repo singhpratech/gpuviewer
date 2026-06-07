@@ -45,6 +45,17 @@ pub enum EventKind {
     /// Device stopped answering queries while a workload was attached — possibly a hung
     /// kernel or driver. An inference by nature: always `Confidence::Likely`.
     HangSuspected,
+    /// A registered device stopped answering its dynamic probe entirely (consecutive
+    /// whole-probe failures, not per-metric absence — `NOT_SUPPORTED` stays `None` in the
+    /// sample and is never this). Driver reset, NVML dying, eGPU unplug, and an xe rebind
+    /// all look identical from this side of the probe, so the kind asserts only the
+    /// observed silence — the CAUSE is never claimed. Emitted by the tui collector (it
+    /// owns the probe loop and its tick counting). Always `Confidence::Fact`.
+    DeviceLost,
+    /// A device previously declared lost answered again. The samples between loss and
+    /// return were never collected; that gap stays blank in history — a hole, never
+    /// zeros. Always `Confidence::Fact`.
+    DeviceReturned,
     /// A GPU-attached process is burning CPU while the GPU sits idle — the classic
     /// CPU-bound dataloader. An inference: always `Confidence::Likely`.
     CpuSpillover,

@@ -21,6 +21,8 @@ const DOCUMENTED_KINDS: &[&str] = &[
     "history_reset",
     "hang_suspected",
     "cpu_spillover",
+    "device_lost",
+    "device_returned",
 ];
 
 const DOCUMENTED_SEVERITIES: &[&str] = &["info", "warning", "critical"];

@@ -141,6 +141,8 @@ Emitted today:
 | `history_reset`    | fact       | Recorded history was truncated or restarted; the discontinuity is the recorder's, not the device's. |
 | `hang_suspected`   | likely     | A device stopped answering queries while a workload was attached — possibly a hung kernel or driver. |
 | `cpu_spillover`    | likely     | A GPU-attached process is burning CPU while the GPU sits idle — the classic CPU-bound dataloader. |
+| `device_lost`      | fact       | A registered device stopped answering its dynamic probe for 5 consecutive ticks; the device stays in `devices` with `sample: null`. Only the silence is asserted — the cause (driver reset, unplug, library death) is not. Added additively under rules (b)/(c). |
+| `device_returned`  | fact       | A device previously declared lost answered again. The samples between loss and return were never collected; that gap stays blank in history, never zero-filled. Added additively under rules (b)/(c). |
 
 ## Compatibility promise
 

@@ -79,6 +79,45 @@ pub fn is_stall(gap: Duration, interval: Duration) -> bool {
 /// while burning a core on a known-broken probe.
 pub const MAX_CONSECUTIVE_PANICS: u32 = 3;
 
+/// Consecutive failed dynamic probes (`refresh_dynamic` → `Err`) before a device is
+/// declared LOST. Per-metric absence never reaches this counter — `NOT_SUPPORTED` and a
+/// missing sysfs file are `None` INSIDE an `Ok` sample (normal weather, rendered
+/// "unavailable"); an `Err` is the whole probe producing nothing, the trait's documented
+/// "device fell off the bus" shape. One or two of those are still transient (a driver
+/// mid-reset drops a few queries and recovers); this many in a row is the device being
+/// gone, and the audit's silently-vanishing-device hole (nvtop #459 is the genre's
+/// cautionary tale: a device disappearing mid-run must be narrated, not crashed on or
+/// ignored) demands the recorder say so as a fact.
+///
+/// The threshold counts TICKS, not wall-time — deterministic and testable. At the default
+/// 1s interval five misses ≈ 5s of silence, matching the 5s floor of [`stall_threshold`]:
+/// the recorder's established line for "this gap is worth narrating". A failing probe
+/// pins full cadence ([`device_is_idle`] treats `sample: None` as not-idle), so after the
+/// first failure the remaining misses are spaced at the configured interval; only the gap
+/// *into* the first failure can be backoff-stretched. The event's evidence therefore
+/// reports the measured wall-time alongside the tick count rather than assuming one from
+/// the other.
+pub const DEVICE_LOST_AFTER_FAILED_PROBES: u32 = 5;
+
+/// Per-device dynamic-probe health, parallel to `Engine::devices` (collection order) —
+/// the state behind the `device_lost`/`device_returned` facts.
+#[derive(Clone, Default)]
+struct ProbeHealth {
+    /// Consecutive `refresh_dynamic` failures; any success resets it.
+    consecutive_failures: u32,
+    /// Unix-millis of the current failing streak's first failure (valid while
+    /// `consecutive_failures > 0`) — the basis of the measured-wall-time evidence.
+    first_fail_ms: u64,
+    /// First and last error strings of the current streak (often identical — the
+    /// evidence dedupes them, but a cause that *changes* mid-streak is worth keeping).
+    first_error: String,
+    last_error: String,
+    /// `ts_ms` of the last successful sample; `None` until the device first answers.
+    last_good_ms: Option<u64>,
+    /// `Some(unix ms when declared)` while the device is lost; cleared on return.
+    lost_at_ms: Option<u64>,
+}
+
 /// What one guarded tick ([`Engine::tick_guarded`]) produced. `Frame` is the normal path;
 /// `Panicked` means the tick body panicked and its frame is lost — the carried event
 /// narrates that hole (already persisted and `--on-event`-fired where those channels
@@ -107,6 +146,92 @@ fn panic_summary(payload: &(dyn std::any::Any + Send)) -> String {
         s.clone()
     } else {
         "non-string panic payload".into()
+    }
+}
+
+/// The `device_lost` fact. Severity is CRITICAL — the per-device analog of the
+/// collector's own Critical stop fact: this device's recording ends here (until a
+/// return), and a device vanishing under load almost always took its workload with it,
+/// which is exactly the incident a flight recorder exists to capture. Confidence is
+/// FACT: the claim is precisely "N consecutive probes produced nothing", which was
+/// observed; the CAUSE is deliberately not asserted — driver reset, device removal, and
+/// library death are indistinguishable from this side of the probe, and a guessed cause
+/// would break the two-tier honesty contract.
+fn device_lost_event(di: usize, id: &DeviceId, h: &ProbeHealth, at_ms: u64) -> Event {
+    let wall = Duration::from_millis(at_ms.saturating_sub(h.first_fail_ms));
+    let last_good = match h.last_good_ms {
+        Some(ts) => format!("last good data {}", fmt_clock(ts)),
+        None => "it never answered this session".to_string(),
+    };
+    let last_good_ev = match h.last_good_ms {
+        Some(ts) => format!("last good sample at {ts} ms ({})", fmt_clock(ts)),
+        None => "no good sample this session".to_string(),
+    };
+    let errors = if h.first_error == h.last_error {
+        format!("error: {}", h.last_error)
+    } else {
+        format!(
+            "first error: {}; last error: {}",
+            h.first_error, h.last_error
+        )
+    };
+    Event {
+        ts_ms: at_ms,
+        device: id.clone(),
+        kind: EventKind::DeviceLost,
+        severity: Severity::Critical,
+        confidence: Confidence::Fact,
+        title: format!(
+            "GPU{di} stopped answering — device lost after {} consecutive failed probes; \
+             {last_good}",
+            h.consecutive_failures
+        ),
+        evidence: format!(
+            "refresh_dynamic for {id} failed {} consecutive ticks over {} of wall time \
+             (the threshold counts ticks; a failing probe pins full cadence, so only the \
+             gap into the first failure can be backoff-stretched); {last_good_ev}; \
+             {errors}; cause not asserted — driver reset, device removal, and library \
+             death look identical from here",
+            h.consecutive_failures,
+            fmt_dur(wall),
+        ),
+    }
+}
+
+/// The `device_returned` fact — the recovery edge, so the story has both ends. Severity
+/// is INFO: good news plainly stated (the Critical loss already alerted; alarming again
+/// on recovery would teach users to tune the feed out). Still a FACT: "the probe
+/// succeeded again" is observed.
+fn device_returned_event(
+    di: usize,
+    id: &DeviceId,
+    h: &ProbeHealth,
+    lost_at_ms: u64,
+    ts_ms: u64,
+) -> Event {
+    // The hole as the user experienced it runs from the last GOOD data, not from the
+    // (later) loss declaration — the data went quiet before the verdict did.
+    let gap_start = h.last_good_ms.unwrap_or(h.first_fail_ms);
+    let gap = Duration::from_millis(ts_ms.saturating_sub(gap_start));
+    Event {
+        ts_ms,
+        device: id.clone(),
+        kind: EventKind::DeviceReturned,
+        severity: Severity::Info,
+        confidence: Confidence::Fact,
+        title: format!(
+            "GPU{di} answering again — device returned; {} of data are missing",
+            fmt_dur(gap)
+        ),
+        evidence: format!(
+            "refresh_dynamic for {id} succeeded after {} consecutive failures; declared \
+             lost at {}; nothing was collected between {} and {} — the gap stays blank \
+             in history, never zero-filled",
+            h.consecutive_failures,
+            fmt_clock(lost_at_ms),
+            fmt_clock(gap_start),
+            fmt_clock(ts_ms),
+        ),
     }
 }
 
@@ -169,6 +294,8 @@ pub struct Engine {
     sink: Option<EventSink>,
     /// Consecutive panicked ticks ([`Engine::tick_guarded`]); any clean tick resets it.
     consecutive_panics: u32,
+    /// Per-device probe health (parallel to `devices`) — drives device-lost/returned.
+    health: Vec<ProbeHealth>,
 }
 
 impl Engine {
@@ -280,6 +407,7 @@ impl Engine {
         }
 
         let sink = config.on_event.map(EventSink::new);
+        let health = vec![ProbeHealth::default(); devices.len()];
 
         Self {
             backends,
@@ -293,6 +421,7 @@ impl Engine {
             pending_reset,
             sink,
             consecutive_panics: 0,
+            health,
         }
     }
 
@@ -356,12 +485,49 @@ impl Engine {
             events.push(reset);
         }
 
-        for (bi, id, info) in &self.devices {
+        for (di, (bi, id, info)) in self.devices.iter().enumerate() {
             let backend = &mut self.backends[*bi];
             let probe_start = Instant::now();
-            let sample = backend.refresh_dynamic(id).ok();
+            // Keep the error, not just its absence: when failures accumulate into a
+            // `device_lost` fact, the evidence must carry what the driver actually said.
+            let (sample, probe_err) = match backend.refresh_dynamic(id) {
+                Ok(s) => (Some(s), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
             let probe_dur = probe_start.elapsed();
             let processes = backend.refresh_processes(id).unwrap_or_default();
+
+            // Device-lost / returned edges — the audit's silently-vanishing-device hole:
+            // a device that stops answering (driver reset, NVML dying, eGPU unplug, xe
+            // rebind) must enter the recording as a fact with both edges, never vanish
+            // or freeze silently. One failed probe is weather; the streak threshold and
+            // its rationale live on [`DEVICE_LOST_AFTER_FAILED_PROBES`].
+            let h = &mut self.health[di];
+            match &sample {
+                Some(s) => {
+                    if let Some(lost_at) = h.lost_at_ms.take() {
+                        events.push(device_returned_event(di, id, h, lost_at, s.ts_ms));
+                    }
+                    h.consecutive_failures = 0;
+                    h.last_good_ms = Some(s.ts_ms);
+                }
+                None => {
+                    let err = probe_err.unwrap_or_else(|| "unknown error".into());
+                    h.consecutive_failures += 1;
+                    if h.consecutive_failures == 1 {
+                        h.first_fail_ms = now_ms();
+                        h.first_error = err.clone();
+                    }
+                    h.last_error = err;
+                    if h.lost_at_ms.is_none()
+                        && h.consecutive_failures >= DEVICE_LOST_AFTER_FAILED_PROBES
+                    {
+                        let at = now_ms();
+                        h.lost_at_ms = Some(at);
+                        events.push(device_lost_event(di, id, h, at));
+                    }
+                }
+            }
 
             // A slow probe foreshadows a stall — note it (Info, rate-capped per device).
             if probe_dur > SLOW_PROBE {
@@ -877,6 +1043,13 @@ pub struct Shared {
     /// tick panics): the UI must state collection STOPPED — with time and cause — and
     /// mark every live pane stale, never current.
     pub stopped: Option<CollectorStop>,
+    /// Per-device loss marker, parallel to `infos`: `Some(unix ms the device was declared
+    /// lost)` while its probe is dead ([`DEVICE_LOST_AFTER_FAILED_PROBES`] consecutive
+    /// failures), cleared when it answers again. Drives the per-device STALE affordances:
+    /// a lost device's panes are frozen at its last good data and must say so. This is
+    /// deliberately NOT [`Shared::stopped`] — the other devices are still collecting, so
+    /// the footer must not claim collection stopped.
+    pub lost: Vec<Option<u64>>,
 }
 
 pub struct Collector {
@@ -905,6 +1078,7 @@ impl Collector {
             effective_interval_ms: Arc::clone(&effective_interval_ms),
             tick_seq: 0,
             stopped: None,
+            lost: vec![None; n],
         }));
         let paused = Arc::new(AtomicBool::new(false));
 
@@ -928,8 +1102,32 @@ impl Collector {
                                 if let Some(sample) = &fd.sample {
                                     sh.history.push_sample(&fd.id, sample.clone());
                                     sh.latest[i] = Some(sample.clone());
+                                    // The process list only updates alongside a good
+                                    // probe: a failed refresh_dynamic almost certainly
+                                    // took the process probe down with it (same dead
+                                    // device), and replacing the table with that empty
+                                    // result would render "no processes" as if current —
+                                    // the same lie as a frozen chart. The kept list is
+                                    // the device's last good data, which the per-device
+                                    // stale affordances label once the device is lost.
+                                    sh.processes[i] = fd.processes.clone();
                                 }
-                                sh.processes[i] = fd.processes.clone();
+                            }
+                            // Device-lost edges ride in the frame's own events; fold
+                            // them into the per-device markers the UI renders from.
+                            for e in &frame.events {
+                                let mark = match e.kind {
+                                    EventKind::DeviceLost => Some(Some(e.ts_ms)),
+                                    EventKind::DeviceReturned => Some(None),
+                                    _ => None,
+                                };
+                                if let Some(mark) = mark {
+                                    if let Some(i) =
+                                        sh.infos.iter().position(|inf| inf.id == e.device)
+                                    {
+                                        sh.lost[i] = mark;
+                                    }
+                                }
                             }
                             sh.history.push_events(frame.events);
                             // Publish the tick AFTER its data is folded in, so a reader
@@ -994,6 +1192,7 @@ impl Collector {
                 effective_interval_ms: Arc::new(AtomicU64::new(1000)),
                 tick_seq: 0,
                 stopped: None,
+                lost: vec![None; n],
             })),
             paused: Arc::new(AtomicBool::new(false)),
         }
@@ -1019,6 +1218,7 @@ pub(crate) fn test_collector(db_path: Option<PathBuf>) -> Collector {
 mod tests {
     use super::*;
     use gpuviewer_core::{BackendError, ProcessKind, ThrottleReasons, Vendor};
+    use gpuviewer_history::Tier;
 
     fn sample(util: Option<f32>) -> DynamicSample {
         DynamicSample {
@@ -1687,6 +1887,333 @@ mod tests {
         );
         // tick_seq advanced per narration, so an open timeline re-queries and sees them.
         assert!(sh.tick_seq >= MAX_CONSECUTIVE_PANICS as u64);
+    }
+
+    // ---- device lost / returned (scripted flaky backend) ----
+
+    /// A backend whose `refresh_dynamic` errors on scripted tick indices — the audit's
+    /// silently-disappearing device (driver reset, eGPU unplug, xe rebind) made flesh.
+    /// Sample timestamps advance 10s per tick so the persistence test lands each good
+    /// tick in its own 10s rollup bucket. The process probe mirrors the dynamic one (a
+    /// dead device cannot list processes either), with one process on good ticks so the
+    /// frozen-process-list assertion has something to freeze.
+    struct FlakyBackend<F: Fn(u32) -> bool + Send> {
+        tick: u32,
+        fails: F,
+    }
+
+    impl<F: Fn(u32) -> bool + Send> GpuBackend for FlakyBackend<F> {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        fn devices(&mut self) -> Vec<DeviceId> {
+            vec![DeviceId("flaky:0".into())]
+        }
+        fn static_info(&mut self, dev: &DeviceId) -> Result<StaticInfo, BackendError> {
+            Ok(StaticInfo {
+                id: dev.clone(),
+                vendor: Vendor::Unknown,
+                name: "Flaky GPU".into(),
+                backend: "flaky".into(),
+                mem_total_bytes: Some(8 << 30),
+                power_limit_mw: None,
+                max_sm_clock_mhz: None,
+                temp_slowdown_c: None,
+                driver_version: None,
+                process_hint: None,
+            })
+        }
+        fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {
+            let t = self.tick;
+            self.tick += 1;
+            if (self.fails)(t) {
+                Err(BackendError::Unavailable("probe timed out".into()))
+            } else {
+                let mut s = sample(Some(50.0));
+                s.ts_ms = 10_000 * (t as u64 + 1);
+                Ok(s)
+            }
+        }
+        fn refresh_processes(
+            &mut self,
+            _dev: &DeviceId,
+        ) -> Result<Vec<ProcessSample>, BackendError> {
+            // `tick` was already advanced by this tick's refresh_dynamic.
+            if self.tick > 0 && (self.fails)(self.tick - 1) {
+                Err(BackendError::Unavailable("probe timed out".into()))
+            } else {
+                Ok(vec![proc(Some(10.0))])
+            }
+        }
+    }
+
+    /// An engine over a [`FlakyBackend`] with the given failure script, persisting to
+    /// `db` when given (otherwise live-only).
+    fn flaky_engine(db: Option<PathBuf>, fails: impl Fn(u32) -> bool + Send + 'static) -> Engine {
+        Engine::with_backends(
+            vec![Box::new(FlakyBackend { tick: 0, fails })],
+            EngineConfig {
+                persist: db.is_some(),
+                db_path: db,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The new kinds' wire tokens must match the spec/schema/suite spelling exactly.
+    /// The conformance suite cannot see them on a mock run (the mock never loses a
+    /// device), so the token spelling is pinned here instead.
+    #[test]
+    fn device_lifecycle_kinds_use_documented_wire_tokens() {
+        assert_eq!(env_token(EventKind::DeviceLost), "device_lost");
+        assert_eq!(env_token(EventKind::DeviceReturned), "device_returned");
+    }
+
+    /// The detection policy end to end: failures below the threshold are silent weather
+    /// (the frame's `sample: null` already shows the gap on the wire), the Nth
+    /// consecutive failure declares the loss as a Critical FACT with auditable evidence,
+    /// and a dead device stays listed — and stays lost without re-narrating.
+    #[test]
+    fn device_lost_fires_exactly_at_the_threshold_with_evidence() {
+        const N: u32 = DEVICE_LOST_AFTER_FAILED_PROBES;
+        // Two good ticks, then the device falls off the bus for good.
+        let mut engine = flaky_engine(None, |t| t >= 2);
+        let lost_tick = 2 + N - 1;
+        for t in 0..(lost_tick + 4) {
+            let TickOutcome::Frame(frame) = engine.tick_guarded() else {
+                panic!("flaky ticks never panic");
+            };
+            assert_eq!(frame.devices.len(), 1, "a lost device must stay listed");
+            assert_eq!(frame.devices[0].sample.is_some(), t < 2);
+            let lost: Vec<&Event> = frame
+                .events
+                .iter()
+                .filter(|e| e.kind == EventKind::DeviceLost)
+                .collect();
+            if t == lost_tick {
+                assert_eq!(lost.len(), 1, "the {N}th consecutive failure declares it");
+                let e = lost[0];
+                assert_eq!(e.severity, Severity::Critical);
+                assert_eq!(e.confidence, Confidence::Fact, "the silence is observed");
+                assert_eq!(e.device.0, "flaky:0");
+                assert!(
+                    e.title.contains("GPU0") && e.title.contains("device lost"),
+                    "title must name the device and the loss: {}",
+                    e.title
+                );
+                assert!(
+                    !e.title.contains("likely"),
+                    "a fact must not read hedged: {}",
+                    e.title
+                );
+                assert!(
+                    e.evidence.contains(&format!("{N} consecutive")),
+                    "evidence must carry the tick count: {}",
+                    e.evidence
+                );
+                // The last good sample was tick 1 → ts 20000 ms.
+                assert!(
+                    e.evidence.contains("20000 ms"),
+                    "evidence must carry the last-good timestamp: {}",
+                    e.evidence
+                );
+                assert!(
+                    e.evidence.contains("probe timed out"),
+                    "evidence must carry the driver's error string: {}",
+                    e.evidence
+                );
+                assert!(
+                    e.evidence.contains("cause not asserted"),
+                    "the cause must be explicitly unclaimed: {}",
+                    e.evidence
+                );
+            } else {
+                assert!(
+                    lost.is_empty(),
+                    "tick {t}: device_lost only at the threshold tick"
+                );
+            }
+            assert!(
+                frame
+                    .events
+                    .iter()
+                    .all(|e| e.kind != EventKind::DeviceReturned),
+                "the device never recovers in this script"
+            );
+        }
+    }
+
+    /// Below the threshold a failing streak is per-tick weather: the frame's
+    /// `sample: null` shows the gap, but neither lifecycle event may narrate (recovering
+    /// from an undeclared loss is no story either).
+    #[test]
+    fn transient_probe_failures_below_threshold_stay_silent() {
+        const N: u32 = DEVICE_LOST_AFTER_FAILED_PROBES;
+        // N-1 consecutive failures, then the device answers again.
+        let mut engine = flaky_engine(None, move |t| (2..2 + N - 1).contains(&t));
+        for _ in 0..12 {
+            let TickOutcome::Frame(frame) = engine.tick_guarded() else {
+                panic!("flaky ticks never panic");
+            };
+            assert!(
+                frame.events.iter().all(|e| {
+                    e.kind != EventKind::DeviceLost && e.kind != EventKind::DeviceReturned
+                }),
+                "a sub-threshold blip must not narrate device loss"
+            );
+        }
+    }
+
+    /// The recovery edge: a lost device answering again narrates `device_returned`
+    /// (Info, FACT) — and a second outage re-narrates `device_lost`, so a flapping
+    /// device tells each chapter exactly once.
+    #[test]
+    fn device_returned_closes_the_story_and_a_second_outage_reopens_it() {
+        const N: u32 = DEVICE_LOST_AFTER_FAILED_PROBES;
+        assert_eq!(
+            N, 5,
+            "the scripted outage windows below assume the threshold"
+        );
+        // Outage 1: ticks 2..=6 (lost at 6); good 7..=8 (returned at 7);
+        // outage 2: ticks 9..=13 (lost at 13); good from 14 (returned at 14).
+        let mut engine = flaky_engine(None, |t| matches!(t, 2..=6 | 9..=13));
+        let mut lost = Vec::new();
+        let mut returned = Vec::new();
+        for _ in 0..16 {
+            let TickOutcome::Frame(frame) = engine.tick_guarded() else {
+                panic!("flaky ticks never panic");
+            };
+            for e in frame.events {
+                match e.kind {
+                    EventKind::DeviceLost => lost.push(e),
+                    EventKind::DeviceReturned => returned.push(e),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(lost.len(), 2, "each outage narrates its own loss");
+        assert_eq!(returned.len(), 2, "each recovery narrates its own return");
+        let r = &returned[0];
+        assert_eq!(
+            r.severity,
+            Severity::Info,
+            "recovery is good news, not an alarm"
+        );
+        assert_eq!(r.confidence, Confidence::Fact);
+        assert!(
+            r.title.contains("GPU0") && r.title.contains("returned"),
+            "return title must name the device: {}",
+            r.title
+        );
+        assert!(
+            r.title.contains("data are missing"),
+            "the return must size the hole it closes: {}",
+            r.title
+        );
+        assert!(
+            r.evidence.contains("never zero-filled"),
+            "the return must state the gap stays blank: {}",
+            r.evidence
+        );
+    }
+
+    /// The full pipeline through [`Collector::start`]'s real thread: a device that stops
+    /// answering surfaces as a per-device `Shared::lost` marker (the UI's stale
+    /// affordances) WITHOUT tripping `Shared::stopped` (collection itself is fine, other
+    /// devices would still be live), keeps its last process list frozen rather than
+    /// flashing empty, and the marker clears when the device answers again — with both
+    /// edges in the story feed.
+    #[test]
+    fn lost_device_marks_shared_and_recovery_clears_it() {
+        // Good ticks 0..=2 (so a last process list exists), a long outage (declared lost
+        // at tick 3 + threshold - 1), recovery from tick 100.
+        let engine = flaky_engine(None, |t| (3..100).contains(&t));
+        let collector = Collector::start(engine, Duration::from_millis(5), false);
+
+        // Bounded wait for the loss to be declared.
+        let mut lost_seen = false;
+        for _ in 0..1000 {
+            let sh = collector.shared.lock().unwrap();
+            if sh.lost[0].is_some() {
+                lost_seen = true;
+                assert!(sh.stopped.is_none(), "device loss is not a collector stop");
+                assert!(
+                    !sh.processes[0].is_empty(),
+                    "the last good process list stays frozen, never flashes empty"
+                );
+                assert!(sh.latest[0].is_some(), "the last good sample is kept");
+                break;
+            }
+            drop(sh);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(lost_seen, "the device loss must reach Shared");
+
+        // Bounded wait for the recovery to clear the marker.
+        let mut cleared = false;
+        for _ in 0..2000 {
+            let sh = collector.shared.lock().unwrap();
+            if sh.lost[0].is_none() {
+                cleared = true;
+                break;
+            }
+            drop(sh);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(cleared, "recovery must clear the per-device marker");
+
+        let sh = collector.shared.lock().unwrap();
+        let kinds: Vec<EventKind> = sh.history.events().iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&EventKind::DeviceLost));
+        assert!(kinds.contains(&EventKind::DeviceReturned));
+    }
+
+    /// The recording half: both lifecycle facts reach the persistent event log, and the
+    /// lost stretch leaves NO sample rollups — the gap stays blank (a hole), never
+    /// zero-filled (CLAUDE.md's "never write raw zeros for absence" rule applied to an
+    /// absent device).
+    #[test]
+    fn device_lifecycle_events_persist_and_the_gap_has_no_rollups() {
+        const N: u32 = DEVICE_LOST_AFTER_FAILED_PROBES;
+        let path = scratch_db();
+        // Good tick 0 (bucket 10000), outage ticks 1..=N (lost at tick N), good from
+        // tick N+1 (bucket 10000·(N+2)).
+        let mut engine = flaky_engine(Some(path.clone()), move |t| (1..=N).contains(&t));
+        for _ in 0..(N + 2) {
+            assert!(matches!(engine.tick_guarded(), TickOutcome::Frame(_)));
+        }
+        drop(engine); // Drop flushes the recording tail.
+
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let events = store.events_between(0, now_ms() + 60_000).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::DeviceLost)
+                .count(),
+            1,
+            "the loss is recorded exactly once"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::DeviceReturned)
+                .count(),
+            1,
+            "the return is recorded exactly once"
+        );
+        let buckets: Vec<u64> = store
+            .samples_between(&DeviceId("flaky:0".into()), 0, 1_000_000, Tier::TenSec)
+            .unwrap()
+            .iter()
+            .map(|r| r.bucket_ms)
+            .collect();
+        assert_eq!(
+            buckets,
+            vec![10_000, 10_000 * (N as u64 + 2)],
+            "only the good ticks produced rollups — the lost stretch is a blank gap"
+        );
+        cleanup_db(&path);
     }
 
     #[test]
