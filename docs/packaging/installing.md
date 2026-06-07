@@ -7,6 +7,32 @@ files plus GitHub build-provenance attestations on every artifact
 ([verify](#verify-what-you-downloaded)). Platforms ship per the roadmap: Linux from v1,
 Windows from v1.5, macOS Apple Silicon from v2.
 
+## One-line install
+
+```sh
+# Linux (x86_64) / macOS (Apple Silicon)
+curl -fsSL https://raw.githubusercontent.com/singhpratech/gpuviewer/main/install.sh | sh
+```
+
+```powershell
+# Windows (x86_64)
+irm https://raw.githubusercontent.com/singhpratech/gpuviewer/main/install.ps1 | iex
+```
+
+Both scripts resolve the latest release tag, download the matching archive **and** its
+`SHA256SUMS-<target>`, verify the checksum, and only then install a single binary. They
+fail closed on any mismatch and never edit your shell profile or PATH.
+
+- **install.sh** installs to `~/.local/bin` (override with `GPUVIEWER_BIN_DIR`); pin a
+  version with `GPUVIEWER_VERSION`. Prints a PATH hint if the bin dir isn't on `PATH`,
+  but won't modify it for you.
+- **install.ps1** installs to `%LOCALAPPDATA%\Programs\gpuviewer` (override with `-BinDir`);
+  pin with `-Version`. Idempotently appends the dir to the user-scope `Path`.
+
+macOS bonus: `curl` does **not** set the `com.apple.quarantine` attribute, so the
+script path sidesteps the Gatekeeper friction described under
+[macOS](#macos-apple-silicon--from-v2) — no "Open Anyway" prompt, no `xattr` dance.
+
 ## Linux (x86_64, glibc 2.35 or newer)
 
 Built on Ubuntu 22.04, so the binary needs glibc ≥ 2.35 (Ubuntu 22.04+, Debian 12+,
@@ -16,8 +42,16 @@ there.
 - **tar.gz**: extract and run — `tar xzf gpuviewer-<ver>-x86_64-unknown-linux-gnu.tar.gz && ./gpuviewer-<ver>-x86_64-unknown-linux-gnu/gpuviewer`
 - **deb**: `sudo apt install ./gpuviewer_<ver>-1_amd64.deb`
 - **rpm**: `sudo dnf install ./gpuviewer-<ver>-1.x86_64.rpm`
+- **AppImage**: one self-contained file that runs on any distro meeting the same glibc
+  ≥ 2.35 floor (it does **not** bundle glibc). `chmod +x gpuviewer-<ver>-x86_64.AppImage`
+  first, then either run it directly (needs `libfuse2` installed), or run it without FUSE:
 
-The deb/rpm deliberately declare **no** NVIDIA driver dependency: gpuviewer dlopens
+  ```sh
+  chmod +x gpuviewer-<ver>-x86_64.AppImage
+  ./gpuviewer-<ver>-x86_64.AppImage --appimage-extract-and-run --version
+  ```
+
+The deb/rpm/AppImage deliberately bundle **no** NVIDIA driver pieces: gpuviewer dlopens
 `libnvidia-ml.so.1` at runtime and degrades gracefully when it is absent (AMD and Intel
 need no driver package at all — they are read via sysfs/fdinfo).
 

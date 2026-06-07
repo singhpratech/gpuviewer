@@ -6,3 +6,7 @@
 *.db-wal
 *.db-shm
 *.gpvr
+
+# locally built release artifacts (tarballs, AppImage, deb/rpm) — produced by CI/packaging,
+# never checked in
+/dist
