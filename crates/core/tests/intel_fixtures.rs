@@ -318,6 +318,86 @@ fn xe_util_is_cycles_delta_over_total_cycles_not_wall_time() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+// ---- hwmon temp dialect (i915 temp1_input vs xe temp2_input — research 07 §3.2) ----
+//
+// The package sensor lives on a DIFFERENT hwmon channel per driver: i915 publishes it
+// as temp1_input (gate 6.12+); xe has NO temp1 — its pkg temp is temp2_input and temp3
+// is the VRAM sensor (gate 6.15+). Each tree below plants DECOYS on the channels the
+// dialect must not read, so a wrong-channel read produces a recognizably wrong number
+// instead of silently passing.
+
+#[test]
+fn i915_temp_is_temp1_never_the_temp2_decoy() {
+    let mut b = IntelBackend::with_root(fixture("intel-i915-kernel6.12-arc")).unwrap();
+    let dev = b.devices().remove(0);
+
+    let s = b.refresh_dynamic(&dev).unwrap();
+    // temp1_input (61000 milli-°C) is the i915 package sensor; 53.0 would mean the
+    // temp2_input decoy was read on the wrong dialect's channel.
+    assert_eq!(s.temp_c, Some(61.0));
+    // fan1_input (RPM) is present, but there is no fan1_max reference and the model
+    // carries percent-of-max: no honest value exists.
+    assert_eq!(s.fan_pct, None);
+    // Card-level gt_act_freq_mhz (1850), never the per-GT rps_act_freq_mhz decoy (1500).
+    assert_eq!(s.sm_clock_mhz, Some(1850));
+}
+
+#[test]
+fn xe_temp_is_temp2_never_the_temp1_or_temp3_decoys() {
+    let mut b = IntelBackend::with_root(fixture("intel-xe-kernel6.15-bmg")).unwrap();
+    let dev = b.devices().remove(0);
+
+    let s = b.refresh_dynamic(&dev).unwrap();
+    // temp2_input (58000 milli-°C) is the xe package sensor. 47.0 would mean the
+    // temp1_input decoy was read (THE historical bug: i915's channel applied to xe —
+    // real xe hwmon exposes no temp1 at all); 64.0 would mean temp3_input, the VRAM
+    // sensor — a different physical claim that must never appear as device temp.
+    assert_eq!(s.temp_c, Some(58.0));
+    assert_eq!(s.fan_pct, None); // fan1_input RPM-only, no max → no honest percent
+                                 // freq0/act_freq (2400), never the rpa_freq decoy (2200).
+    assert_eq!(s.sm_clock_mhz, Some(2400));
+    // Channel-choice decoys: the card channel power1_max (190 W) stays preferred over
+    // the power2_max pkg decoy (220 W).
+    let info = b.static_info(&dev).unwrap();
+    assert_eq!(info.power_limit_mw, Some(190_000));
+}
+
+#[test]
+fn xe_missing_temp2_is_none_never_a_fallback_channel() {
+    // Remove the designated xe channel: temp1 (decoy) and temp3 (VRAM) remain, and
+    // neither may be surfaced as device temp — the documented channel being absent
+    // means the package temp is unobservable, not an invitation to read some other
+    // sensor and present it as GPU temp.
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-xe-temp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-xe-kernel6.15-bmg"), &scratch);
+    std::fs::remove_file(scratch.join("sys/class/drm/card0/device/hwmon/hwmon6/temp2_input"))
+        .unwrap();
+
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    assert_eq!(b.refresh_dynamic(&dev).unwrap().temp_c, None);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn i915_missing_temp1_is_none_never_a_fallback_channel() {
+    // The mirror case: an i915 tree whose temp1_input vanished must not fall back to
+    // the temp2_input decoy.
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-i915-temp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.12-arc"), &scratch);
+    std::fs::remove_file(scratch.join("sys/class/drm/card1/device/hwmon/hwmon5/temp1_input"))
+        .unwrap();
+
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    assert_eq!(b.refresh_dynamic(&dev).unwrap().temp_c, None);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 // ---- throttle_reason decoding (i915 gt/gt0/throttle_reason_*, xe freq0/throttle/*) ----
 //
 // The fixtures ship quiescent (status=0); these scratch copies drive the bit→model

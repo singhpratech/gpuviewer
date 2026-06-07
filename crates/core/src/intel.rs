@@ -7,10 +7,12 @@
 //! every read below is dispatched on a per-device [`Dialect`] detected from the uevent:
 //! - i915 (Gen9 → Meteor Lake, DG2 default): fdinfo `drm-engine-*` cumulative busy-ns
 //!   (kernel 5.19+), per-process memory regions named `local0`/`system0` (6.8+),
-//!   card-level `gt_*_freq_mhz` files, dGPU-only `lmem_total_bytes`.
+//!   card-level `gt_*_freq_mhz` files, dGPU-only `lmem_total_bytes`, hwmon package
+//!   temp on `temp1_input` (6.12+).
 //! - xe (Lunar Lake, Battlemage+): fdinfo `drm-cycles-*` / `drm-total-cycles-*` GT-clock
 //!   counters (6.11+), memory regions named `vram0`/`system`/`gtt` (6.8+),
-//!   `device/tile0/gt0/freq0/*` freq files, NO VRAM-total sysfs at all.
+//!   `device/tile0/gt0/freq0/*` freq files, NO VRAM-total sysfs at all, hwmon package
+//!   temp on `temp2_input` — there is NO temp1, and temp3 is the VRAM sensor (6.15+).
 //!
 //! Per the domain rules in CLAUDE.md:
 //! - Every path derives from a root-dir parameter (`with_root`), so the whole backend
@@ -95,11 +97,20 @@ fn gpu_name(dev_path: &Path) -> String {
     }
 }
 
-/// hwmon temps are MILLI-degrees C; `temp1_input` is the package sensor. Kernel gates:
-/// i915 6.12+, xe 6.15+ — absence on older kernels (and the no-hwmon iGPU case) is the
-/// normal outcome.
-fn temp_c(hwmon: &Path) -> Option<f32> {
-    let millic: i64 = read_parse(&hwmon.join("temp1_input"))?;
+/// hwmon temps are MILLI-degrees C — but the package/GT sensor lives on a DIFFERENT
+/// channel per dialect (research 07 §3.2): i915 exposes it as `temp1_input` (gate
+/// 6.12+); xe hwmon has NO temp1 — its package temp is `temp2_input` and `temp3_input`
+/// is the VRAM sensor (gate 6.15+, ABI-documented). Each dialect reads exactly its
+/// documented channel and never falls back to another one: temp3 (VRAM) surfaced as
+/// device temp would be a different physical claim, and a wrong-channel read on either
+/// dialect presents some other sensor as GPU temp. The designated file being absent
+/// (older kernels, the no-hwmon iGPU case) is the normal outcome → `None`.
+fn temp_c(hwmon: &Path, dialect: Dialect) -> Option<f32> {
+    let file = match dialect {
+        Dialect::I915 => "temp1_input",
+        Dialect::Xe => "temp2_input",
+    };
+    let millic: i64 = read_parse(&hwmon.join(file))?;
     Some(millic as f32 / 1000.0)
 }
 
@@ -634,7 +645,7 @@ impl GpuBackend for IntelBackend {
     fn refresh_dynamic(&mut self, dev: &DeviceId) -> Result<DynamicSample, BackendError> {
         let d = self.device(dev)?;
         let sm_clock_mhz = d.act_freq_mhz();
-        let temp_c = d.hwmon.as_deref().and_then(temp_c);
+        let temp_c = d.hwmon.as_deref().and_then(|h| temp_c(h, d.dialect));
         let energy_uj: Option<u64> = d
             .hwmon
             .as_deref()
