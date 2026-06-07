@@ -122,7 +122,7 @@
             "hang_suspected",
             "cpu_spillover"
           ],
-          "description": "collector_stall/history_reset/hang_suspected/cpu_spillover are reserved (documented, not yet emitted). Consumers must ignore kinds not in this list."
+          "description": "All listed kinds are emitted today. Consumers must ignore kinds not in this list (new ones arrive additively per the compatibility promise)."
         },
         "severity": { "enum": ["info", "warning", "critical"] },
         "confidence": {

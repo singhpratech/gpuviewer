@@ -224,6 +224,73 @@ mod tests {
         );
     }
 
+    /// With every process size unknown (WSL2, unprivileged fdinfo) the pressure narration
+    /// must not crown an arbitrary process "largest holder" on zero evidence — and must
+    /// still name one as soon as a real size is known.
+    #[test]
+    fn vram_pressure_holder_requires_known_size() {
+        let total: u64 = 16 << 30;
+        let mk = |ts_ms: u64, used: u64| DynamicSample {
+            ts_ms,
+            util_pct: Some(90.0),
+            mem_used_bytes: Some(used),
+            power_mw: None,
+            temp_c: None,
+            fan_pct: None,
+            sm_clock_mhz: None,
+            mem_clock_mhz: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            throttle: ThrottleReasons::default(),
+        };
+        let proc_named = |pid: u32, name: &str, mem: Option<u64>| ProcessSample {
+            pid,
+            name: name.into(),
+            kind: ProcessKind::Compute,
+            mem_bytes: mem,
+            util_pct: None,
+            cpu_pct: None,
+            container: None,
+        };
+
+        // Climb from 86% toward 95% at ~600 MiB/min; the pressure event fires once the
+        // 60 s minimum trend span is met. Returns the first pressure narration.
+        let run = |mem_a: Option<u64>, mem_b: Option<u64>| -> Event {
+            let mut engine = EventEngine::new();
+            let dev = DeviceId("test".into());
+            let procs = vec![proc_named(1, "alpha", mem_a), proc_named(2, "beta", mem_b)];
+            let mut ts = 0u64;
+            let mut used = (total as f64 * 0.86) as u64;
+            let mut hits = Vec::new();
+            for _ in 0..=13 {
+                let events = engine.observe(&dev, &mk(ts, used), &procs, Some(total), None);
+                hits.extend(
+                    events
+                        .into_iter()
+                        .filter(|e| e.kind == EventKind::VramPressure),
+                );
+                ts += 10_000;
+                used += 100 << 20;
+            }
+            assert!(!hits.is_empty(), "pressure event never fired");
+            hits.remove(0)
+        };
+
+        let unknown = run(None, None);
+        assert!(
+            !unknown.title.contains("largest holder"),
+            "must not name a holder when every process size is unknown: {}",
+            unknown.title
+        );
+
+        let known = run(None, Some(2 << 30));
+        assert!(
+            known.title.contains("largest holder: beta pid 2"),
+            "must name the process whose size is known: {}",
+            known.title
+        );
+    }
+
     // ---- idle-gap (training stall) tests: synthetic 1 Hz traces, controlled ts_ms ----
 
     fn idle_sample(ts_ms: u64, util_pct: f32) -> DynamicSample {

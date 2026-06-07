@@ -137,15 +137,10 @@ Emitted today:
 | `process_exited`   | fact       | A process left a device's process list. |
 | `vram_pressure`    | likely     | VRAM usage is high and climbing; the title extrapolates a time-to-full. A linear extrapolation, hence an inference. |
 | `idle_gap`         | likely     | The device sat idle after sustained activity while a large allocation stayed attached — likely a dataloader or checkpoint stall. |
-
-Reserved — documented now so consumers can prepare, but **not yet emitted** by any release:
-
-| kind              | confidence | meaning |
-|-------------------|------------|---------|
-| `collector_stall` | fact       | gpuviewer's own collection loop fell behind its tick cadence; the recording has a hole that must not masquerade as device idleness. |
-| `history_reset`   | fact       | Recorded history was truncated or restarted; the discontinuity is the recorder's, not the device's. |
-| `hang_suspected`  | likely     | A device stopped answering queries while a workload was attached — possibly a hung kernel or driver. |
-| `cpu_spillover`   | likely     | A GPU-attached process is burning CPU while the GPU sits idle — the classic CPU-bound dataloader. |
+| `collector_stall`  | fact       | gpuviewer's own collection loop fell behind its tick cadence; the recording has a hole that must not masquerade as device idleness. |
+| `history_reset`    | fact       | Recorded history was truncated or restarted; the discontinuity is the recorder's, not the device's. |
+| `hang_suspected`   | likely     | A device stopped answering queries while a workload was attached — possibly a hung kernel or driver. |
+| `cpu_spillover`    | likely     | A GPU-attached process is burning CPU while the GPU sits idle — the classic CPU-bound dataloader. |
 
 ## Compatibility promise
 
