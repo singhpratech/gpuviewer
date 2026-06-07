@@ -15,8 +15,8 @@ use gpuviewer_core::{DeviceId, DynamicSample, Event, ProcessKind, ProcessSample}
 pub mod store;
 
 pub use store::{
-    DeviceRow, ProcessRollup, SampleRollup, SqliteStore, StoreError, Tier, RETAIN_10S_MS,
-    RETAIN_1M_MS, RETAIN_EVENTS_MS, SCHEMA_VERSION,
+    DeviceRow, ExportCounts, ProcessRollup, SampleRollup, SqliteStore, StoreError, Tier,
+    RETAIN_10S_MS, RETAIN_1M_MS, RETAIN_EVENTS_MS, SCHEMA_VERSION,
 };
 
 /// Fixed-capacity ring of samples for one device's live window.
@@ -1172,5 +1172,197 @@ mod tests {
             .unwrap();
         assert_eq!(store.earliest_bucket_ms().unwrap(), Some(50_000));
         assert_eq!(store.latest_bucket_ms().unwrap(), Some(600_000));
+    }
+
+    // ===================================================================================
+    // Export (.gpvr) + latest-event seek anchors.
+    // ===================================================================================
+
+    /// A minimal all-present 10s/1m rollup at `bucket` — the export tests only care about
+    /// which buckets cross the window, not the metric values.
+    fn rollup_at(d: &DeviceId, bucket: u64) -> SampleRollup {
+        SampleRollup {
+            device_id: d.clone(),
+            bucket_ms: bucket,
+            n: 1,
+            util_min: Some(1.0),
+            util_avg: Some(1.0),
+            util_max: Some(1.0),
+            mem_avg: None,
+            mem_max: None,
+            power_avg_mw: None,
+            power_max_mw: None,
+            temp_avg_c: None,
+            temp_max_c: None,
+            fan_max_pct: None,
+            sm_clock_min: None,
+            sm_clock_avg: None,
+            sm_clock_max: None,
+            throttle_n: 0,
+            throttle_thermal_n: 0,
+            throttle_power_n: 0,
+            throttle_hw_n: 0,
+        }
+    }
+
+    fn event_at(d: &DeviceId, ts_ms: u64, kind: EventKind, title: &str) -> Event {
+        Event {
+            ts_ms,
+            device: d.clone(),
+            kind,
+            severity: Severity::Warning,
+            confidence: Confidence::Likely,
+            title: title.into(),
+            evidence: "likely evidence".into(),
+        }
+    }
+
+    /// export_to copies meta/devices whole and ONLY the window's sample/process/event rows
+    /// into a fresh file. Decoy rows sit on both sides of the window so an unfiltered copy
+    /// (or an off-by-one window) fails; the export then opens standalone — with the source
+    /// file DELETED — and round-trips its events, confidence included.
+    #[test]
+    fn export_copies_only_the_window_into_a_standalone_file() {
+        let scratch = Scratch::new();
+        let out = Scratch::new(); // never created until export_to runs
+        let (mut store, _) = SqliteStore::open(&scratch.path).unwrap();
+        let d = dev("0000:01:00.0");
+        store
+            .register_device(&d, "Exported GPU", Vendor::Amd, Some(16 << 30))
+            .unwrap();
+
+        // Window [60_000, 179_999]: two in-window rows per tier, decoys outside both edges.
+        store
+            .insert_sample_rollups(
+                Tier::TenSec,
+                &[
+                    rollup_at(&d, 50_000),  // decoy: before the window
+                    rollup_at(&d, 60_000),  // in (left edge)
+                    rollup_at(&d, 170_000), // in
+                    rollup_at(&d, 180_000), // decoy: past the window
+                ],
+            )
+            .unwrap();
+        store
+            .insert_sample_rollups(
+                Tier::OneMin,
+                &[
+                    rollup_at(&d, 0),       // decoy
+                    rollup_at(&d, 60_000),  // in
+                    rollup_at(&d, 120_000), // in
+                    rollup_at(&d, 180_000), // decoy
+                ],
+            )
+            .unwrap();
+        let proc_at = |bucket: u64, name: &str| ProcessRollup {
+            device_id: d.clone(),
+            bucket_ms: bucket,
+            pid: 9,
+            name: name.into(),
+            kind: ProcessKind::Compute,
+            mem_max: Some(1 << 30),
+            util_avg: Some(50.0),
+            cpu_avg: Some(120.0),
+            container: Some("docker:abc123".into()),
+        };
+        store
+            .insert_process_rollups(&[proc_at(50_000, "decoy-proc"), proc_at(70_000, "kept-proc")])
+            .unwrap();
+        store
+            .insert_events(&[
+                event_at(&d, 59_999, EventKind::ThrottleStart, "decoy just before"),
+                event_at(&d, 60_000, EventKind::ThrottleStart, "likely edge start"),
+                event_at(&d, 179_999, EventKind::VramPressure, "likely edge end"),
+                event_at(&d, 180_000, EventKind::ThrottleEnd, "decoy just after"),
+            ])
+            .unwrap();
+
+        let counts = store.export_to(&out.path, 60_000, 179_999).unwrap();
+        assert_eq!(counts.devices, 1);
+        assert_eq!(counts.samples_10s, 2, "only the in-window 10s buckets copy");
+        assert_eq!(counts.samples_1m, 2, "only the in-window 1m buckets copy");
+        assert_eq!(counts.processes_10s, 1, "the decoy process bucket stays");
+        assert_eq!(counts.events, 2, "edge rows in, decoys out");
+
+        // Standalone proof: delete the source, then read the export on its own.
+        drop(store);
+        std::fs::remove_file(&scratch.path).unwrap();
+        let exported = SqliteStore::open_readonly(&out.path).unwrap();
+        let devs = exported.devices().unwrap();
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].name, "Exported GPU");
+        assert_eq!(devs[0].mem_total_bytes, Some(16 << 30));
+        let tens = exported
+            .samples_between(&d, 0, 1_000_000, Tier::TenSec)
+            .unwrap();
+        assert_eq!(
+            tens.iter().map(|r| r.bucket_ms).collect::<Vec<_>>(),
+            vec![60_000, 170_000]
+        );
+        let procs = exported.processes_at(&d, 75_000).unwrap();
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].name, "kept-proc");
+        assert_eq!(procs[0].container.as_deref(), Some("docker:abc123"));
+        let evs = exported.events_between(0, 1_000_000).unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(
+            evs.iter().all(|e| !e.title.contains("decoy")),
+            "no decoy may cross the window: {evs:?}"
+        );
+        // The honesty contract survives the copy: inferences stay Likely in the export.
+        assert!(evs.iter().all(|e| e.confidence == Confidence::Likely));
+    }
+
+    /// An existing output file is never clobbered — and stays byte-identical after the
+    /// refused attempt.
+    #[test]
+    fn export_refuses_to_overwrite_an_existing_file() {
+        let scratch = Scratch::new();
+        let out = Scratch::new();
+        let (store, _) = SqliteStore::open(&scratch.path).unwrap();
+        std::fs::write(&out.path, b"someone's shared incident file").unwrap();
+
+        let err = store.export_to(&out.path, 0, 1_000).unwrap_err();
+        assert!(
+            matches!(err, StoreError::OutputExists(_)),
+            "must refuse with OutputExists, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&out.path).unwrap(),
+            b"someone's shared incident file",
+            "the existing file must be untouched"
+        );
+    }
+
+    /// latest_event_ms: overall max, per-kind max, and None for an absent kind — the demo
+    /// must find the last ThrottleStart, not just the last anything.
+    #[test]
+    fn latest_event_ms_overall_and_by_kind() {
+        let scratch = Scratch::new();
+        let (mut store, _) = SqliteStore::open(&scratch.path).unwrap();
+        let d = dev("anchors");
+        assert_eq!(store.latest_event_ms(None).unwrap(), None);
+
+        store
+            .insert_events(&[
+                event_at(&d, 5_000, EventKind::ThrottleStart, "likely a"),
+                event_at(&d, 9_000, EventKind::ProcessExited, "likely b"),
+                event_at(&d, 7_000, EventKind::ThrottleStart, "likely c"),
+            ])
+            .unwrap();
+        assert_eq!(store.latest_event_ms(None).unwrap(), Some(9_000));
+        assert_eq!(
+            store
+                .latest_event_ms(Some(EventKind::ThrottleStart))
+                .unwrap(),
+            Some(7_000),
+            "per-kind max must ignore newer events of other kinds"
+        );
+        assert_eq!(
+            store
+                .latest_event_ms(Some(EventKind::VramPressure))
+                .unwrap(),
+            None
+        );
     }
 }

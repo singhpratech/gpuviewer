@@ -653,11 +653,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
     // the mock database, so its replay is also mock data.
     let mock_tag = if shared.mock { " (mock data)" } else { "" };
     let text = match app.mode {
-        Mode::Replay => format!(
-            " REPLAY {}  esc live · enter jump to event · arrows scrub 10s · pgup/pgdn 5m  \
-             (10s rollups, 48h retention){mock_tag}",
-            fmt_clock(app.cursor_ms)
-        ),
+        // The file viewer has no live mode behind the recording, so the "esc live" hint
+        // would be a dead key dressed as a feature — the file's name and the read-only
+        // promise take its place. Provenance is unstated, so no mock/live claim either.
+        Mode::Replay => match app.view_file() {
+            Some(file) => format!(
+                " REPLAY {}  viewing {file} (read-only) · q quit · enter jump to event · \
+                 arrows scrub 10s · pgup/pgdn 5m",
+                fmt_clock(app.cursor_ms)
+            ),
+            None => format!(
+                " REPLAY {}  esc live · enter jump to event · arrows scrub 10s · pgup/pgdn 5m  \
+                 (10s rollups, 48h retention){mock_tag}",
+                fmt_clock(app.cursor_ms)
+            ),
+        },
         Mode::Live => {
             let paused = if app.paused() { " · PAUSED" } else { "" };
             // Surface the stretched cadence whenever low-power backoff is active, so a

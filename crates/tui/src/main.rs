@@ -5,6 +5,9 @@
 //!   gpuviewer --json          stream NDJSON v1 lines per tick to stdout
 //!   gpuviewer --json --once   print one frame line plus its event lines, then exit
 //!   gpuviewer report          print a plain-text digest of the recorded history
+//!   gpuviewer demo            seed 8h of simulated history, open scrolled back to the story
+//!   gpuviewer export OUT      copy a window of history into a standalone .gpvr file
+//!   gpuviewer view FILE       replay a .gpvr file read-only (no GPU, no recording)
 //!
 //! Persistence is on by default in the live modes: 10s/1m rollups + an event log go to the
 //! history database (separate `-mock` file under `--mock`). `report` reads it back.
@@ -13,13 +16,18 @@ mod app;
 mod collector;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use collector::{Collector, Engine, EngineConfig, FrameDevice};
-use gpuviewer_core::{now_ms, Confidence, DeviceId, Event, Severity};
-use gpuviewer_history::{SqliteStore, Tier, RETAIN_10S_MS, RETAIN_1M_MS, RETAIN_EVENTS_MS};
+use gpuviewer_core::mock::MockBackend;
+use gpuviewer_core::{
+    now_ms, Confidence, DeviceId, Event, EventEngine, EventKind, GpuBackend, Severity, StaticInfo,
+};
+use gpuviewer_history::{
+    DeviceRow, Recorder, SqliteStore, Tier, RETAIN_10S_MS, RETAIN_1M_MS, RETAIN_EVENTS_MS,
+};
 use serde::Serialize;
 
 struct Args {
@@ -64,7 +72,10 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
     USAGE:\n  \
       gpuviewer [--json [--once]] [--mock] [--interval <ms>] [--no-backoff]\n            \
                 [--db <path>] [--on-event <cmd>]\n  \
-      gpuviewer report [--since <spec>] [--until <spec>] [--db <path>] [--mock]\n\n\
+      gpuviewer report [--since <spec>] [--until <spec>] [--db <path>] [--mock]\n  \
+      gpuviewer demo [--seed-only]\n  \
+      gpuviewer export [--since <spec>] [--db <path>] [--mock] <out.gpvr>\n  \
+      gpuviewer view <file.gpvr>\n\n\
     LIVE OPTIONS:\n  \
       --json          stream one NDJSON frame per tick to stdout\n  \
       --once          with --json: print a single frame and exit\n  \
@@ -87,6 +98,17 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
       --mock          read the history-mock.db instead of real history\n\n  \
       <spec> is a relative duration (12h, 45m, 7d) or a clock time (HH:MM, today; yesterday\n      \
       if that time is still in the future)\n\n\
+    demo — seed 8h of simulated history into its own history-demo.db (history.db is never\n    \
+    touched), then open the TUI already scrolled back to the last throttle onset:\n  \
+      --seed-only     build the database and print the summary, then exit (no tty needed)\n\n\
+    export — copy a window of recorded history into a standalone, shareable .gpvr file\n    \
+    (opens anywhere with `gpuviewer view` — no GPU required). Prints per-table row counts;\n    \
+    refuses to overwrite an existing output file:\n  \
+      --since <spec>  window start; default 24h (the window always ends now)\n  \
+      --db <path>     source history database (default: the recorded default)\n  \
+      --mock          read history-mock.db as the source\n\n\
+    view — replay a .gpvr file read-only: no backends, no recording, no live mode.\n    \
+    q quits; arrows/pgup/pgdn scrub; enter jumps to the selected event\n\n\
     GENERAL:\n  \
       --version, -V   print version and exit\n  \
       --help, -h      show this help";
@@ -178,14 +200,122 @@ fn parse_report_args(mut it: impl Iterator<Item = String>) -> Result<ReportArgs>
     Ok(r)
 }
 
+/// Parsed `demo` subcommand options.
+struct DemoArgs {
+    /// Build the database and print the summary, then exit — CI and smoke scripts need the
+    /// seeding without the TUI (which wants a tty).
+    seed_only: bool,
+}
+
+fn parse_demo_args(it: impl Iterator<Item = String>) -> Result<DemoArgs> {
+    let mut d = DemoArgs { seed_only: false };
+    for a in it {
+        match a.as_str() {
+            "--seed-only" => d.seed_only = true,
+            "--help" | "-h" => {
+                println!("{HELP}");
+                std::process::exit(0);
+            }
+            other => bail!("unknown demo flag: {other} (see --help)"),
+        }
+    }
+    Ok(d)
+}
+
+/// Parsed `export` subcommand options.
+struct ExportArgs {
+    since: Option<String>,
+    db: Option<PathBuf>,
+    mock: bool,
+    /// The output `.gpvr` path (positional).
+    out: PathBuf,
+}
+
+fn parse_export_args(mut it: impl Iterator<Item = String>) -> Result<ExportArgs> {
+    let mut since = None;
+    let mut db = None;
+    let mut mock = false;
+    let mut out: Option<PathBuf> = None;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--since" => {
+                since = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--since needs a spec"))?,
+                )
+            }
+            "--db" => {
+                db = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--db needs a path"))?,
+                ))
+            }
+            "--mock" => mock = true,
+            "--help" | "-h" => {
+                println!("{HELP}");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => bail!("unknown export flag: {other} (see --help)"),
+            _ => {
+                if out.is_some() {
+                    bail!("export takes exactly one output path (got {a:?} too)");
+                }
+                out = Some(PathBuf::from(a));
+            }
+        }
+    }
+    Ok(ExportArgs {
+        since,
+        db,
+        mock,
+        out: out
+            .ok_or_else(|| anyhow::anyhow!("export needs an output path, e.g. incident.gpvr"))?,
+    })
+}
+
+/// Parse the `view` subcommand's single positional file argument.
+fn parse_view_args(it: impl Iterator<Item = String>) -> Result<PathBuf> {
+    let mut file: Option<PathBuf> = None;
+    for a in it {
+        match a.as_str() {
+            "--help" | "-h" => {
+                println!("{HELP}");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => bail!("unknown view flag: {other} (see --help)"),
+            _ => {
+                if file.is_some() {
+                    bail!("view takes exactly one file (got {a:?} too)");
+                }
+                file = Some(PathBuf::from(a));
+            }
+        }
+    }
+    file.ok_or_else(|| anyhow::anyhow!("view needs a file, e.g. gpuviewer view incident.gpvr"))
+}
+
 fn main() -> Result<()> {
-    // `report` is a subcommand, not a flag: dispatch before the flag parser so its own options
-    // (which overlap names like --db/--mock) are parsed in the right context.
+    // Subcommands dispatch before the flag parser so their own options (which overlap names
+    // like --db/--mock) are parsed in the right context.
     let mut raw = std::env::args().skip(1).peekable();
-    if raw.peek().map(|s| s == "report").unwrap_or(false) {
-        let _ = raw.next(); // consume "report"
-        let rargs = parse_report_args(raw)?;
-        return run_report(rargs);
+    match raw.peek().map(String::as_str) {
+        Some("report") => {
+            let _ = raw.next();
+            return run_report(parse_report_args(raw)?);
+        }
+        Some("demo") => {
+            let _ = raw.next();
+            return run_demo(parse_demo_args(raw)?);
+        }
+        Some("export") => {
+            let _ = raw.next();
+            return run_export(parse_export_args(raw)?);
+        }
+        Some("view") => {
+            let _ = raw.next();
+            return run_view(parse_view_args(raw)?);
+        }
+        _ => {}
     }
 
     let args = parse_args()?;
@@ -556,22 +686,230 @@ fn fmt_clock_full(ms: u64) -> String {
         .unwrap_or_else(|| "--:--:--".into())
 }
 
-/// The default history path for `report`, mirroring `SqliteStore::open_default`'s naming so
-/// report reads the same file the collector wrote. Resolved without opening anything.
+/// The default history path for `report`/`export`, mirroring `SqliteStore::open_default`'s
+/// naming so they read the same file the collector wrote. Resolved without opening anything.
 fn default_history_path(mock: bool) -> Result<PathBuf> {
-    let dir = if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(xdg).join("gpuviewer")
-    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        PathBuf::from(home).join(".local/share/gpuviewer")
-    } else {
-        bail!("no data directory (set $XDG_DATA_HOME or $HOME)");
-    };
     let file = if mock {
         "history-mock.db"
     } else {
         "history.db"
     };
-    Ok(dir.join(file))
+    Ok(default_data_dir()?.join(file))
+}
+
+/// `$XDG_DATA_HOME/gpuviewer` or `~/.local/share/gpuviewer`, mirroring the store's own
+/// resolution so every subcommand reads/writes where the collector records.
+fn default_data_dir() -> Result<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(xdg).join("gpuviewer"));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(home).join(".local/share/gpuviewer"));
+    }
+    bail!("no data directory (set $XDG_DATA_HOME or $HOME)")
+}
+
+// ===========================================================================================
+// demo subcommand — seed 8h of simulated history, then open the TUI already scrolled back.
+// ===========================================================================================
+
+/// How much simulated history `demo` seeds, at [`DEMO_STEP_MS`] per simulated tick.
+const DEMO_SPAN_MS: u64 = 8 * 3600 * 1000;
+const DEMO_STEP_MS: u64 = 1000;
+
+fn run_demo(args: DemoArgs) -> Result<()> {
+    // The demo gets its OWN file next to the default path, deleted and recreated on every
+    // run: the demo must be reproducible, and it must never touch history.db (nor even the
+    // mock file a real `--mock` session may be recording to).
+    let path = default_data_dir()?.join("history-demo.db");
+    let _ = std::fs::remove_file(&path);
+    for ext in ["-wal", "-shm"] {
+        let mut side = path.as_os_str().to_os_string();
+        side.push(ext);
+        let _ = std::fs::remove_file(side);
+    }
+
+    let now = now_ms();
+    let (events, throttles) = seed_demo(&path, now.saturating_sub(DEMO_SPAN_MS), now)?;
+    println!(
+        "seeded {}h of simulated history: {events} events, {throttles} throttle episodes \
+         (db: {})",
+        DEMO_SPAN_MS / 3_600_000,
+        path.display()
+    );
+    if args.seed_only {
+        return Ok(());
+    }
+
+    // The TUI's first sight is the scroll-back answering "why did it slow down": open in
+    // replay at the most recent throttle onset (or, should the seed somehow hold none, at
+    // the newest recorded moment — `enter_replay(None)`'s fallback). The live session keeps
+    // running underneath with `--mock` semantics, recording onto the same demo file.
+    let anchor = SqliteStore::open_readonly(&path)
+        .ok()
+        .and_then(|s| s.latest_event_ms(Some(EventKind::ThrottleStart)).ok())
+        .flatten();
+    let interval = Duration::from_millis(1000);
+    let engine = Engine::new(EngineConfig {
+        force_mock: true,
+        persist: true,
+        db_path: Some(path),
+        interval,
+        on_event: None,
+    });
+    let collector = Collector::start(engine, interval, true);
+    let mut app = app::App::new(collector);
+    app.enter_replay(anchor);
+    app.run()
+}
+
+/// Drive the mock simulation from `from_ms` to `to_ms` at 1s steps through the real event
+/// engine and recorder — the exact pipeline a live session runs, so the seeded history is
+/// indistinguishable from a recording that ran all morning. Returns `(events recorded,
+/// throttle episodes among them)`.
+fn seed_demo(path: &Path, from_ms: u64, to_ms: u64) -> Result<(usize, usize)> {
+    let (store, _) = SqliteStore::open(path)
+        .map_err(|e| anyhow::anyhow!("cannot create demo database at {}: {e}", path.display()))?;
+    let mut rec = Recorder::new(store);
+    let mut mock = MockBackend::new();
+    let mut engine = EventEngine::new();
+
+    // Register devices first (store rows + GPU0/GPU1 short names), mirroring Engine::new.
+    let mut infos = Vec::new();
+    for (i, id) in mock.devices().into_iter().enumerate() {
+        let info = mock
+            .static_info(&id)
+            .map_err(|e| anyhow::anyhow!("mock static_info for {id}: {e}"))?;
+        rec.store_mut()
+            .register_device(&id, &info.name, info.vendor, info.mem_total_bytes)
+            .map_err(|e| anyhow::anyhow!("registering {id}: {e}"))?;
+        engine.register_device(id, format!("GPU{i}"));
+        infos.push(info);
+    }
+
+    let mut events = 0usize;
+    let mut throttles = 0usize;
+    for ts in (from_ms..=to_ms).step_by(DEMO_STEP_MS as usize) {
+        let mut tick_events = Vec::new();
+        for (id, sample, procs) in &mock.tick_at(ts) {
+            // Match by id, not position — a reordered `tick_at` must not cross-wire the
+            // per-device thresholds (mem totals, slowdown temps) into the wrong sim.
+            let info = infos.iter().find(|i| i.id == *id);
+            tick_events.extend(engine.observe(
+                id,
+                sample,
+                procs,
+                info.and_then(|i| i.mem_total_bytes),
+                info.and_then(|i| i.temp_slowdown_c),
+            ));
+            rec.observe(id, sample, procs);
+        }
+        events += tick_events.len();
+        throttles += tick_events
+            .iter()
+            .filter(|e| e.kind == EventKind::ThrottleStart)
+            .count();
+        rec.record_events(&tick_events);
+    }
+    // Persist the partial tail buckets so the recording reaches all the way to `to_ms`.
+    rec.flush();
+    Ok((events, throttles))
+}
+
+// ===========================================================================================
+// export subcommand — copy a window of history into a standalone, shareable .gpvr file.
+// ===========================================================================================
+
+fn run_export(args: ExportArgs) -> Result<()> {
+    let now = now_ms();
+    let from = match &args.since {
+        Some(s) => parse_spec(s, now).ok_or_else(|| {
+            anyhow::anyhow!("--since: cannot parse {s:?} (try 12h, 45m, 7d, HH:MM)")
+        })?,
+        None => now.saturating_sub(24 * 3600 * 1000),
+    };
+
+    let src = match &args.db {
+        Some(p) => p.clone(),
+        None => default_history_path(args.mock)?,
+    };
+    if !src.exists() {
+        bail!(
+            "no history database at {} — run gpuviewer first to record, or pass --db <path>",
+            src.display()
+        );
+    }
+    if args.out.exists() {
+        // The store enforces this too; checking here keeps the message at CLI altitude.
+        bail!(
+            "refusing to overwrite {} — pick a new output path",
+            args.out.display()
+        );
+    }
+
+    let store = SqliteStore::open_readonly(&src)
+        .map_err(|e| anyhow::anyhow!("cannot open {} read-only: {e}", src.display()))?;
+    let counts = store
+        .export_to(&args.out, from, now)
+        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
+
+    println!(
+        "exported {} .. {} into {}",
+        fmt_clock(from),
+        fmt_clock(now),
+        args.out.display()
+    );
+    println!("  devices        {}", counts.devices);
+    println!("  samples_10s    {}", counts.samples_10s);
+    println!("  samples_1m     {}", counts.samples_1m);
+    println!("  processes_10s  {}", counts.processes_10s);
+    println!("  events         {}", counts.events);
+    Ok(())
+}
+
+// ===========================================================================================
+// view subcommand — replay a .gpvr file read-only: no backends, no collector, no recorder.
+// ===========================================================================================
+
+fn run_view(path: PathBuf) -> Result<()> {
+    if !path.exists() {
+        bail!(
+            "no such file: {} — export one with `gpuviewer export incident.gpvr`",
+            path.display()
+        );
+    }
+    let store = SqliteStore::open_readonly(&path)
+        .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
+    // Probe the schema up front: junk bytes or someone else's SQLite file should fail with
+    // one friendly line here, not deep inside the first replay query.
+    let devices = store
+        .devices()
+        .map_err(|_| anyhow::anyhow!("{} is not a gpuviewer recording (.gpvr)", path.display()))?;
+    let infos: Vec<StaticInfo> = devices.into_iter().map(static_info_from_row).collect();
+    let label = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let collector = Collector::stationary(infos, Some(path.clone()));
+    app::App::viewer(collector, store, label).run()
+}
+
+/// Rebuild a `StaticInfo` from a recording's device row. Only what the file holds: limits,
+/// max clocks, and driver are unknown, so they stay `None` — the gauges render absolute
+/// values rather than inventing bounds the recording never carried.
+fn static_info_from_row(d: DeviceRow) -> StaticInfo {
+    StaticInfo {
+        id: d.device_id,
+        vendor: d.vendor,
+        name: d.name,
+        backend: "file".into(),
+        mem_total_bytes: d.mem_total_bytes,
+        power_limit_mw: None,
+        max_sm_clock_mhz: None,
+        temp_slowdown_c: None,
+        driver_version: None,
+        process_hint: None,
+    }
 }
 
 #[cfg(test)]

@@ -111,6 +111,27 @@ pub struct DeviceRow {
     pub mem_total_bytes: Option<u64>,
 }
 
+/// Row counts copied by [`SqliteStore::export_to`], one per table — printed by the CLI so
+/// the user can see at a glance whether the incident window actually held data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExportCounts {
+    pub devices: u64,
+    pub samples_10s: u64,
+    pub samples_1m: u64,
+    pub processes_10s: u64,
+    pub events: u64,
+}
+
+/// Column lists shared by the read, write, and export-copy statements for each table, so
+/// the three can never drift apart.
+const SAMPLE_COLS: &str = "device_id, bucket_ms, n, util_min, util_avg, util_max, mem_avg, \
+     mem_max, power_avg_mw, power_max_mw, temp_avg_c, temp_max_c, fan_max_pct, sm_clock_min, \
+     sm_clock_avg, sm_clock_max, throttle_n, throttle_thermal_n, throttle_power_n, \
+     throttle_hw_n";
+const PROC_COLS: &str =
+    "device_id, bucket_ms, pid, name, kind, mem_max, util_avg, cpu_avg, container";
+const EVENT_COLS: &str = "ts_ms, device_id, kind, severity, confidence, title, evidence";
+
 /// Persistence failures. Per-metric absence is never one of these (it is `NULL` in the row);
 /// an error here means the database itself is unusable.
 #[derive(Debug)]
@@ -119,6 +140,9 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     /// Could not resolve a data directory for `open_default`.
     NoDataDir,
+    /// `export_to` refused to clobber an existing output file — a .gpvr someone may
+    /// already have shared must never be silently replaced.
+    OutputExists(PathBuf),
 }
 
 impl std::fmt::Display for StoreError {
@@ -127,6 +151,9 @@ impl std::fmt::Display for StoreError {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::NoDataDir => {
                 write!(f, "no data directory (set $XDG_DATA_HOME or $HOME)")
+            }
+            StoreError::OutputExists(p) => {
+                write!(f, "refusing to overwrite existing file {}", p.display())
             }
         }
     }
@@ -312,10 +339,7 @@ impl SqliteStore {
             return Ok(());
         }
         let sql = format!(
-            "INSERT OR REPLACE INTO {} (device_id, bucket_ms, n, util_min, util_avg, util_max, \
-             mem_avg, mem_max, power_avg_mw, power_max_mw, temp_avg_c, temp_max_c, fan_max_pct, \
-             sm_clock_min, sm_clock_avg, sm_clock_max, throttle_n, throttle_thermal_n, \
-             throttle_power_n, throttle_hw_n) \
+            "INSERT OR REPLACE INTO {} ({SAMPLE_COLS}) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             tier.samples_table()
         );
@@ -359,10 +383,10 @@ impl SqliteStore {
         }
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO processes_10s (device_id, bucket_ms, pid, name, kind, \
-                 mem_max, util_avg, cpu_avg, container) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            )?;
+            let mut stmt = tx.prepare_cached(&format!(
+                "INSERT OR REPLACE INTO processes_10s ({PROC_COLS}) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+            ))?;
             for r in rows {
                 stmt.execute(params![
                     r.device_id.0,
@@ -389,10 +413,9 @@ impl SqliteStore {
         }
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO events (ts_ms, device_id, kind, severity, confidence, title, \
-                 evidence) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            )?;
+            let mut stmt = tx.prepare_cached(&format!(
+                "INSERT INTO events ({EVENT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+            ))?;
             for e in events {
                 stmt.execute(params![
                     e.ts_ms as i64,
@@ -420,11 +443,8 @@ impl SqliteStore {
         tier: Tier,
     ) -> Result<Vec<SampleRollup>, StoreError> {
         let sql = format!(
-            "SELECT device_id, bucket_ms, n, util_min, util_avg, util_max, mem_avg, mem_max, \
-             power_avg_mw, power_max_mw, temp_avg_c, temp_max_c, fan_max_pct, sm_clock_min, \
-             sm_clock_avg, sm_clock_max, throttle_n, throttle_thermal_n, throttle_power_n, \
-             throttle_hw_n FROM {} WHERE device_id = ?1 AND bucket_ms >= ?2 AND bucket_ms <= ?3 \
-             ORDER BY bucket_ms ASC",
+            "SELECT {SAMPLE_COLS} FROM {} WHERE device_id = ?1 AND bucket_ms >= ?2 \
+             AND bucket_ms <= ?3 ORDER BY bucket_ms ASC",
             tier.samples_table()
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -442,10 +462,10 @@ impl SqliteStore {
     /// one inserted (a corrupt/unknown enum string drops that one row rather than failing the
     /// whole query — old recordings must still replay).
     pub fn events_between(&self, from_ms: u64, to_ms: u64) -> Result<Vec<Event>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT ts_ms, device_id, kind, severity, confidence, title, evidence FROM events \
-             WHERE ts_ms >= ?1 AND ts_ms <= ?2 ORDER BY ts_ms ASC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {EVENT_COLS} FROM events \
+             WHERE ts_ms >= ?1 AND ts_ms <= ?2 ORDER BY ts_ms ASC, id ASC"
+        ))?;
         let rows = stmt.query_map(params![from_ms as i64, to_ms as i64], |row| {
             Ok((
                 row.get::<_, i64>(0)? as u64,
@@ -505,10 +525,10 @@ impl SqliteStore {
         let Some(chosen) = chosen else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT device_id, bucket_ms, pid, name, kind, mem_max, util_avg, cpu_avg, container \
-             FROM processes_10s WHERE device_id = ?1 AND bucket_ms = ?2 ORDER BY pid ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PROC_COLS} FROM processes_10s \
+             WHERE device_id = ?1 AND bucket_ms = ?2 ORDER BY pid ASC"
+        ))?;
         let rows = stmt
             .query_map(params![device.0, chosen], process_rollup_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -531,6 +551,23 @@ impl SqliteStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Newest event timestamp in the log, optionally restricted to one kind — the seek
+    /// anchor for `gpuviewer demo` (the most recent throttle onset) and for the file
+    /// viewer (a recording opens at its last event). `None` when no such event exists.
+    pub fn latest_event_ms(&self, kind: Option<EventKind>) -> Result<Option<u64>, StoreError> {
+        let v: Option<i64> = match kind {
+            Some(k) => self.conn.query_row(
+                "SELECT MAX(ts_ms) FROM events WHERE kind = ?1",
+                params![kind_to_str(k)],
+                |r| r.get(0),
+            )?,
+            None => self
+                .conn
+                .query_row("SELECT MAX(ts_ms) FROM events", [], |r| r.get(0))?,
+        };
+        Ok(v.map(|v| v as u64))
     }
 
     /// Oldest bucket across both sample tiers, or `None` if no samples are stored. Defines the
@@ -578,6 +615,111 @@ impl SqliteStore {
         tx.execute("DELETE FROM events WHERE ts_ms < ?1", params![cut_events])?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ---- export (.gpvr incident files) ----
+
+    /// Copy the `[from_ms, to_ms]` window into a fresh standalone database at `out_path` —
+    /// the shareable incident file (`.gpvr`). `meta` and `devices` travel whole (identity
+    /// and provenance ride with the data); the sample/process/event tables are restricted
+    /// to the window. Implemented as ATTACH + `INSERT..SELECT` in one transaction on a NEW
+    /// writer connection, with THIS store's file attached `mode=ro` — the export can never
+    /// modify the recording it reads, and no row round-trips through Rust.
+    ///
+    /// Refuses to overwrite an existing `out_path` ([`StoreError::OutputExists`]); a failed
+    /// export removes its half-written file so a retry is not blocked by that refusal.
+    pub fn export_to(
+        &self,
+        out_path: impl AsRef<Path>,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<ExportCounts, StoreError> {
+        let out_path = out_path.as_ref();
+        if out_path.exists() {
+            return Err(StoreError::OutputExists(out_path.to_path_buf()));
+        }
+        let result = self.copy_window(out_path, from_ms, to_ms);
+        if result.is_err() {
+            let _ = std::fs::remove_file(out_path);
+            for ext in ["-wal", "-shm"] {
+                let mut side = out_path.as_os_str().to_os_string();
+                side.push(ext);
+                let _ = std::fs::remove_file(side);
+            }
+        }
+        result
+    }
+
+    fn copy_window(
+        &self,
+        out_path: &Path,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<ExportCounts, StoreError> {
+        let mut dest = Self::try_open_init(out_path)?;
+        // ATTACH cannot run inside a transaction, so bind the source first. `mode=ro` is
+        // load-bearing: the recording stays untouchable even though this connection writes.
+        dest.conn.execute(
+            "ATTACH DATABASE ?1 AS src",
+            params![format!("file:{}?mode=ro", uri_path(&self.path))],
+        )?;
+        let (from, to) = (from_ms as i64, to_ms as i64);
+        let tx = dest.conn.transaction()?;
+        // Source meta wins over the fresh file's own stamps: created_ms etc. describe the
+        // recording, not the export. The window is stamped alongside so the file says what
+        // slice it claims to hold.
+        tx.execute(
+            "INSERT OR REPLACE INTO meta SELECT key, value FROM src.meta",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) \
+             VALUES ('export_from_ms', ?1), ('export_to_ms', ?2)",
+            params![from.to_string(), to.to_string()],
+        )?;
+        let devices = tx.execute(
+            "INSERT INTO devices SELECT device_id, name, vendor, mem_total_bytes \
+             FROM src.devices",
+            [],
+        )?;
+        let samples_10s = tx.execute(
+            &format!(
+                "INSERT INTO samples_10s SELECT {SAMPLE_COLS} FROM src.samples_10s \
+                 WHERE bucket_ms >= ?1 AND bucket_ms <= ?2"
+            ),
+            params![from, to],
+        )?;
+        let samples_1m = tx.execute(
+            &format!(
+                "INSERT INTO samples_1m SELECT {SAMPLE_COLS} FROM src.samples_1m \
+                 WHERE bucket_ms >= ?1 AND bucket_ms <= ?2"
+            ),
+            params![from, to],
+        )?;
+        let processes_10s = tx.execute(
+            &format!(
+                "INSERT INTO processes_10s SELECT {PROC_COLS} FROM src.processes_10s \
+                 WHERE bucket_ms >= ?1 AND bucket_ms <= ?2"
+            ),
+            params![from, to],
+        )?;
+        // Fresh autoincrement ids in the copy; ORDER BY preserves the source's intra-tick
+        // event order so `events_between` reads the export in the original sequence.
+        let events = tx.execute(
+            &format!(
+                "INSERT INTO events ({EVENT_COLS}) SELECT {EVENT_COLS} FROM src.events \
+                 WHERE ts_ms >= ?1 AND ts_ms <= ?2 ORDER BY ts_ms ASC, id ASC"
+            ),
+            params![from, to],
+        )?;
+        tx.commit()?;
+        Ok(ExportCounts {
+            devices: devices as u64,
+            samples_10s: samples_10s as u64,
+            samples_1m: samples_1m as u64,
+            processes_10s: processes_10s as u64,
+            events: events as u64,
+        })
     }
 }
 
@@ -676,6 +818,15 @@ fn kind_from_proc_str(s: &str) -> ProcessKind {
 /// per-reason bucket counters live in one place.
 pub fn throttle_flags(t: &ThrottleReasons) -> (bool, bool, bool, bool) {
     (t.any(), t.thermal, t.power_cap, t.hw_slowdown)
+}
+
+/// Percent-encode a filesystem path for a `file:` SQLite URI: `%`, `?`, and `#` would
+/// otherwise read as URI syntax. SQLite percent-decodes the path, so this is lossless.
+fn uri_path(p: &Path) -> String {
+    p.to_string_lossy()
+        .replace('%', "%25")
+        .replace('?', "%3F")
+        .replace('#', "%23")
 }
 
 fn now_ms_wall() -> u64 {

@@ -65,6 +65,9 @@ pub struct App {
     /// True after a replay key was pressed with no history store available — the footer
     /// explains why nothing happened instead of silently swallowing the key.
     pub replay_hint: bool,
+    /// The recording file this session is pinned to (`gpuviewer view`); `Some` means there
+    /// is no live source behind the UI, so the app never leaves replay.
+    view_file: Option<String>,
     /// Cached replay window, re-queried on every seek.
     replay: Option<ReplayWindow>,
     /// Second, read-only store connection (WAL lets it read while the collector's writer
@@ -82,10 +85,29 @@ impl App {
             cursor_ms: 0,
             story_selected: None,
             replay_hint: false,
+            view_file: None,
             replay: None,
             store: None,
             collector,
         }
+    }
+
+    /// An app pinned to a recording file (`gpuviewer view FILE.gpvr`): starts in replay at
+    /// the file's newest event (or its newest bucket when it holds none) and never drops to
+    /// Live — there is no collector ticking and no live source, only the file. Esc/'r' are
+    /// inert; 'q' quits. Pair with [`Collector::stationary`].
+    pub fn viewer(collector: Collector, store: SqliteStore, file: String) -> Self {
+        let mut app = Self::new(collector);
+        let anchor = store.latest_event_ms(None).ok().flatten();
+        app.store = Some(store);
+        app.view_file = Some(file);
+        app.enter_replay(anchor);
+        app
+    }
+
+    /// The pinned recording's display name (`gpuviewer view`), `None` in a live session.
+    pub fn view_file(&self) -> Option<&str> {
+        self.view_file.as_deref()
     }
 
     pub fn paused(&self) -> bool {
@@ -191,8 +213,12 @@ impl App {
             // q always quits; Esc must NOT — in replay it returns to the live view.
             KeyCode::Char('q') => return KeyOutcome::Quit,
             KeyCode::Esc | KeyCode::Char('r') => {
-                self.mode = Mode::Live;
-                self.story_selected = None;
+                // Inert in the file viewer: there is no live view behind a recording to
+                // return to, and swapping in an empty "live" pane would be a lie.
+                if self.view_file.is_none() {
+                    self.mode = Mode::Live;
+                    self.story_selected = None;
+                }
             }
             KeyCode::Left => self.scrub(-(SCRUB_STEP_MS as i64)),
             KeyCode::Right => self.scrub(SCRUB_STEP_MS as i64),
@@ -228,10 +254,12 @@ impl App {
     }
 
     /// Enter replay at `cursor` (an event's ts), or at the newest recorded bucket when
-    /// `None` ('r'). With no store available (persistence disabled, or the database
-    /// unreadable) this sets the footer hint and stays live — a replay view with no
-    /// recording behind it would be an empty lie.
-    fn enter_replay(&mut self, cursor: Option<u64>) {
+    /// `None` ('r'). Public because `gpuviewer demo` opens the session already scrolled
+    /// back to the last throttle onset — the user's first sight is the answer to "why did
+    /// it slow down", not a live gauge. With no store available (persistence disabled, or
+    /// the database unreadable) this sets the footer hint and stays live — a replay view
+    /// with no recording behind it would be an empty lie.
+    pub fn enter_replay(&mut self, cursor: Option<u64>) {
         if self.store.is_none() {
             let db_path = self.collector.shared.lock().unwrap().db_path.clone();
             match db_path.and_then(|p| SqliteStore::open_readonly(p).ok()) {
@@ -630,6 +658,69 @@ mod tests {
         assert!(
             !screen.contains("REPLAY"),
             "live view must not be labeled REPLAY:\n{screen}"
+        );
+        cleanup(&path);
+    }
+
+    /// `gpuviewer view`: the app opens pinned to the file — replay from the first frame,
+    /// anchored at the newest event — and Esc/'r' must NOT drop to Live (there is no live
+    /// behind a recording); 'q' still quits; the footer names the file as read-only.
+    #[test]
+    fn viewer_pins_replay_and_never_drops_to_live() {
+        let path = scratch_path();
+        let dev = DeviceId("0000:09:00.0".into());
+        seed_store(&path, &dev);
+
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let infos = vec![gpuviewer_core::StaticInfo {
+            id: dev.clone(),
+            vendor: Vendor::Unknown,
+            name: "Seeded GPU".into(),
+            backend: "file".into(),
+            mem_total_bytes: Some(24 << 30),
+            power_limit_mw: None,
+            max_sm_clock_mhz: None,
+            temp_slowdown_c: None,
+            driver_version: None,
+            process_hint: None,
+        }];
+        let collector = crate::collector::Collector::stationary(infos, Some(path.clone()));
+        let mut app = App::viewer(collector, store, "incident.gpvr".into());
+
+        assert_eq!(app.mode, Mode::Replay, "the viewer starts in replay");
+        assert_eq!(
+            app.cursor_ms,
+            BASE + 15_000,
+            "cursor anchors at the file's newest event"
+        );
+
+        assert_eq!(app.handle_key(KeyCode::Esc), KeyOutcome::Continue);
+        assert_eq!(
+            app.mode,
+            Mode::Replay,
+            "Esc must not drop to Live — there is no live behind the file"
+        );
+        assert_eq!(app.handle_key(KeyCode::Char('r')), KeyOutcome::Continue);
+        assert_eq!(app.mode, Mode::Replay, "'r' is inert in the viewer too");
+
+        let screen = draw(&app);
+        assert!(
+            screen.contains("viewing incident.gpvr (read-only)"),
+            "footer must name the file and promise read-only:\n{screen}"
+        );
+        assert!(
+            screen.contains("REPLAY"),
+            "viewer is labeled REPLAY:\n{screen}"
+        );
+        assert!(
+            screen.contains("ghost-train"),
+            "the file's recorded processes must render:\n{screen}"
+        );
+
+        assert_eq!(
+            app.handle_key(KeyCode::Char('q')),
+            KeyOutcome::Quit,
+            "q quits the viewer"
         );
         cleanup(&path);
     }
