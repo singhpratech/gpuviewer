@@ -140,7 +140,7 @@ fn help_text() -> String {
       --db <path>     source history database (default: the recorded default)\n  \
       --mock          read history-mock.db as the source\n\n\
     view — replay a .gpvr file read-only: no backends, no recording, no live mode.\n    \
-    q quits; arrows/pgup/pgdn scrub; enter jumps to the selected event\n\n\
+    q quits; arrows or a/d scrub (A/D pages, g/G ends); enter jumps to the selected event\n\n\
     GENERAL:\n  \
       --version, -V   print version and exit\n  \
       --help, -h      show this help")

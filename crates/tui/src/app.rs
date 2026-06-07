@@ -317,6 +317,13 @@ impl App {
     }
 
     /// Dispatch one key press according to the current mode.
+    ///
+    /// Every navigation key has a letter alias, because Mac laptops have no
+    /// PgUp/PgDn/Home/End keys and terminal emulators routinely swallow the Fn+arrow
+    /// substitutes (scrolling their own buffer instead of sending the key). The rule is
+    /// uniform across modes so it can be learned once: `w`/`a`/`s`/`d` mirror the
+    /// arrows, shifted `A`/`D` mirror PgUp/PgDn (a bigger step of the same motion), and
+    /// `g`/`G` mirror Home/End. Chart style lives on `c` — `s` is wasd-down.
     pub fn handle_key(&mut self, code: KeyCode) -> KeyOutcome {
         match self.mode {
             Mode::Live => self.handle_key_live(code),
@@ -329,14 +336,18 @@ impl App {
         let n = self.collector.shared.lock().unwrap().infos.len().max(1);
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
-            KeyCode::Tab | KeyCode::Right => self.selected = (self.selected + 1) % n,
-            KeyCode::Left | KeyCode::BackTab => self.selected = (self.selected + n - 1) % n,
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('d') => {
+                self.selected = (self.selected + 1) % n
+            }
+            KeyCode::Left | KeyCode::BackTab | KeyCode::Char('a') => {
+                self.selected = (self.selected + n - 1) % n
+            }
             KeyCode::Char('p') => {
                 let p = &self.collector.paused;
                 p.store(!p.load(Ordering::Relaxed), Ordering::Relaxed);
             }
-            KeyCode::Up => self.move_story_selection(-1),
-            KeyCode::Down => self.move_story_selection(1),
+            KeyCode::Up | KeyCode::Char('w') => self.move_story_selection(-1),
+            KeyCode::Down | KeyCode::Char('s') => self.move_story_selection(1),
             KeyCode::Enter => {
                 // Enter on a selected event scrolls back to it. The feed displays
                 // newest-first, so the visual index maps back from the end of the log.
@@ -351,7 +362,7 @@ impl App {
             }
             KeyCode::Char('r') => self.enter_replay(None),
             KeyCode::Char('t') => self.enter_timeline(),
-            KeyCode::Char('s') => self.chart_style = self.chart_style.toggled(),
+            KeyCode::Char('c') => self.chart_style = self.chart_style.toggled(),
             _ => {}
         }
         KeyOutcome::Continue
@@ -370,19 +381,24 @@ impl App {
                     self.story_selected = None;
                 }
             }
-            KeyCode::Left => self.scrub(-(SCRUB_STEP_MS as i64)),
-            KeyCode::Right => self.scrub(SCRUB_STEP_MS as i64),
-            KeyCode::PageUp => self.scrub(-(SCRUB_PAGE_MS as i64)),
-            KeyCode::PageDown => self.scrub(SCRUB_PAGE_MS as i64),
-            KeyCode::Home => {
+            KeyCode::Left | KeyCode::Char('a') => self.scrub(-(SCRUB_STEP_MS as i64)),
+            KeyCode::Right | KeyCode::Char('d') => self.scrub(SCRUB_STEP_MS as i64),
+            KeyCode::PageUp | KeyCode::Char('A') => self.scrub(-(SCRUB_PAGE_MS as i64)),
+            KeyCode::PageDown | KeyCode::Char('D') => self.scrub(SCRUB_PAGE_MS as i64),
+            KeyCode::Home | KeyCode::Char('g') => {
                 if let Some((earliest, _)) = self.recorded_range() {
                     self.seek(earliest);
                 }
             }
+            KeyCode::End | KeyCode::Char('G') => {
+                if let Some((_, latest)) = self.recorded_range() {
+                    self.seek(latest);
+                }
+            }
             KeyCode::Tab => self.selected = (self.selected + 1) % n,
             KeyCode::BackTab => self.selected = (self.selected + n - 1) % n,
-            KeyCode::Up => self.move_story_selection(-1),
-            KeyCode::Down => self.move_story_selection(1),
+            KeyCode::Up | KeyCode::Char('w') => self.move_story_selection(-1),
+            KeyCode::Down | KeyCode::Char('s') => self.move_story_selection(1),
             KeyCode::Enter => {
                 // Re-anchor the cursor to the selected event, then keep the selection
                 // pointing at that same event inside the re-centered window.
@@ -399,7 +415,7 @@ impl App {
                 }
             }
             KeyCode::Char('t') => self.enter_timeline(),
-            KeyCode::Char('s') => self.chart_style = self.chart_style.toggled(),
+            KeyCode::Char('c') => self.chart_style = self.chart_style.toggled(),
             _ => {}
         }
         KeyOutcome::Continue
@@ -424,16 +440,18 @@ impl App {
             // '=' is unshifted '+' on common layouts; accept both.
             KeyCode::Char('+') | KeyCode::Char('=') => self.timeline_rezoom(-1),
             KeyCode::Char('-') => self.timeline_rezoom(1),
-            KeyCode::Left => self.timeline_step(-1),
-            KeyCode::Right => self.timeline_step(1),
-            KeyCode::PageUp => self.timeline_step(-(TIMELINE_PAGE_COLS as i64)),
-            KeyCode::PageDown => self.timeline_step(TIMELINE_PAGE_COLS as i64),
-            KeyCode::Home => {
+            KeyCode::Left | KeyCode::Char('a') => self.timeline_step(-1),
+            KeyCode::Right | KeyCode::Char('d') => self.timeline_step(1),
+            KeyCode::PageUp | KeyCode::Char('A') => {
+                self.timeline_step(-(TIMELINE_PAGE_COLS as i64))
+            }
+            KeyCode::PageDown | KeyCode::Char('D') => self.timeline_step(TIMELINE_PAGE_COLS as i64),
+            KeyCode::Home | KeyCode::Char('g') => {
                 if let Some(w) = &self.timeline {
                     self.timeline_cursor_ms = w.from_ms;
                 }
             }
-            KeyCode::End => {
+            KeyCode::End | KeyCode::Char('G') => {
                 if let Some(w) = &self.timeline {
                     self.timeline_cursor_ms = w.to_ms;
                 }
@@ -1452,8 +1470,9 @@ mod tests {
         cleanup(&path);
     }
 
-    /// 's' cycles braille↔solid in live and replay — same data, same gaps, different
-    /// paint — and the timeline ignores it (its strips are always solid).
+    /// 'c' cycles braille↔solid in live and replay — same data, same gaps, different
+    /// paint — and the timeline ignores it (its strips are always solid). 's' must NOT
+    /// touch the style: it is wasd-down (story selection) since the Mac-alias change.
     #[test]
     fn chart_style_toggles_in_live_and_replay_but_not_timeline() {
         let (mut app, path) = seeded_app();
@@ -1468,7 +1487,13 @@ mod tests {
         }
 
         app.handle_key(KeyCode::Char('s'));
-        assert_eq!(app.chart_style, ChartStyle::Solid, "'s' toggles in live");
+        assert_eq!(
+            app.chart_style,
+            ChartStyle::Braille,
+            "'s' is story-down now, never the style toggle"
+        );
+        app.handle_key(KeyCode::Char('c'));
+        assert_eq!(app.chart_style, ChartStyle::Solid, "'c' toggles in live");
         app.handle_key(KeyCode::Char('r'));
         let screen = draw(&app);
         assert!(
@@ -1480,11 +1505,11 @@ mod tests {
             "solid mode must not draw braille outlines:\n{screen}"
         );
 
-        app.handle_key(KeyCode::Char('s'));
+        app.handle_key(KeyCode::Char('c'));
         assert_eq!(
             app.chart_style,
             ChartStyle::Braille,
-            "'s' toggles in replay"
+            "'c' toggles in replay"
         );
         let screen = draw(&app);
         assert!(
@@ -1492,16 +1517,98 @@ mod tests {
             "braille mode draws the step outline:\n{screen}"
         );
         assert!(
-            screen.contains("s style"),
+            screen.contains("c style"),
             "the footer advertises the toggle:\n{screen}"
         );
 
         app.handle_key(KeyCode::Char('t'));
-        app.handle_key(KeyCode::Char('s'));
+        app.handle_key(KeyCode::Char('c'));
         assert_eq!(
             app.chart_style,
             ChartStyle::Braille,
-            "the timeline ignores 's' — its strips are always solid"
+            "the timeline ignores 'c' — its strips are always solid"
+        );
+        cleanup(&path);
+    }
+
+    /// Mac laptops have no PgUp/PgDn/Home/End and terminals eat Fn+arrows, so every
+    /// navigation key has a letter alias: wasd = arrows, A/D = PgUp/PgDn, g/G =
+    /// Home/End. The aliases must land in the SAME match arms as the keys they mirror —
+    /// this walks each mode through the letters and asserts identical movement.
+    #[test]
+    fn mac_letter_aliases_mirror_navigation_keys() {
+        let (mut app, path) = seeded_app();
+
+        // Live: a/d switch device exactly like ←/→. (The live story ring is empty in
+        // this harness — w/s are exercised against the replay window below.)
+        app.handle_key(KeyCode::Char('d'));
+        assert_eq!(app.selected, 1, "'d' switches device forward in live");
+        app.handle_key(KeyCode::Char('a'));
+        assert_eq!(app.selected, 0, "'a' switches device back in live");
+
+        // Replay: a/d scrub 10s, A/D scrub a 5m page, g/G jump to the recorded ends —
+        // all clamped to the recorded range exactly like the keys they alias — and
+        // w/s walk the story feed like ↑/↓.
+        app.handle_key(KeyCode::Char('r'));
+        assert_eq!(app.cursor_ms, BASE + 20_000);
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.story_selected,
+            Some(0),
+            "'s' selects down the story feed"
+        );
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(app.story_selected, Some(1), "'s' again steps deeper");
+        app.handle_key(KeyCode::Char('w'));
+        assert_eq!(app.story_selected, Some(0), "'w' selects back up");
+        app.handle_key(KeyCode::Char('a'));
+        assert_eq!(app.cursor_ms, BASE + 10_000, "'a' scrubs back 10s");
+        app.handle_key(KeyCode::Char('d'));
+        assert_eq!(app.cursor_ms, BASE + 20_000, "'d' scrubs forward 10s");
+        app.handle_key(KeyCode::Char('A'));
+        assert_eq!(
+            app.cursor_ms, BASE,
+            "'A' pages back, clamped at the earliest"
+        );
+        app.handle_key(KeyCode::Char('D'));
+        assert_eq!(app.cursor_ms, BASE + 20_000, "'D' pages forward, clamped");
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(app.cursor_ms, BASE, "'g' jumps to the earliest bucket");
+        app.handle_key(KeyCode::Char('G'));
+        assert_eq!(
+            app.cursor_ms,
+            BASE + 20_000,
+            "'G' jumps to the newest bucket"
+        );
+        app.handle_key(KeyCode::End);
+        assert_eq!(
+            app.cursor_ms,
+            BASE + 20_000,
+            "End matches 'G' (new alias pair)"
+        );
+
+        // Timeline: a/d move the cursor one column, A/D a page of columns, g/G the
+        // window edges.
+        app.handle_key(KeyCode::Char('t'));
+        app.timeline_cols = 100;
+        app.handle_key(KeyCode::Char('g'));
+        let from = app.timeline_cursor_ms;
+        app.handle_key(KeyCode::Char('d'));
+        assert!(app.timeline_cursor_ms > from, "'d' steps the cursor right");
+        app.handle_key(KeyCode::Char('a'));
+        assert_eq!(app.timeline_cursor_ms, from, "'a' steps it back");
+        app.handle_key(KeyCode::Char('D'));
+        let paged = app.timeline_cursor_ms;
+        assert!(paged > from, "'D' pages the cursor right");
+        app.handle_key(KeyCode::Char('A'));
+        assert_eq!(app.timeline_cursor_ms, from, "'A' pages it back");
+        app.handle_key(KeyCode::Char('G'));
+        let to = app.timeline_cursor_ms;
+        assert!(to > from, "'G' jumps to the window's newest edge");
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(
+            app.timeline_cursor_ms, from,
+            "'g' jumps back to the oldest edge"
         );
         cleanup(&path);
     }

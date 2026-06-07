@@ -1186,15 +1186,18 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
         // The file viewer has no live mode behind the recording, so the "esc live" hint
         // would be a dead key dressed as a feature — the file's name and the read-only
         // promise take its place. Provenance is unstated, so no mock/live claim either.
+        // Key hints name the letter aliases, not pgup/pgdn/home/end: the letters exist
+        // on every keyboard (Mac laptops have none of those four keys), the legacy keys
+        // still work, and the README documents the full matrix.
         Mode::Replay => match app.view_file() {
             Some(file) => format!(
                 " REPLAY {}  viewing {file} (read-only) · q quit · enter jump to event · \
-                 arrows scrub 10s · pgup/pgdn 5m · t timeline · s style",
+                 ←→/ad scrub 10s · A/D 5m · g/G ends · t timeline · c style",
                 fmt_clock(app.cursor_ms)
             ),
             None => format!(
-                " REPLAY {}  esc live · enter jump to event · arrows scrub 10s · pgup/pgdn 5m · \
-                 t timeline · s style  (10s rollups, 48h retention){mock_tag}",
+                " REPLAY {}  esc live · enter jump to event · ←→/ad scrub 10s · A/D 5m · \
+                 g/G ends · t timeline · c style  (10s rollups, 48h retention){mock_tag}",
                 fmt_clock(app.cursor_ms)
             ),
         },
@@ -1223,8 +1226,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
                 })
                 .unwrap_or_default();
             format!(
-                " TIMELINE {zoom}{span_note}{viewing}  t/esc {back} · +/- zoom · ←/→ cursor · \
-                 pgup/pgdn jump · home/end · enter drill to replay · q quit{mock_tag}"
+                " TIMELINE {zoom}{span_note}{viewing}  t/esc {back} · +/- zoom · ←→/ad cursor · \
+                 A/D jump · g/G ends · enter drill to replay · q quit{mock_tag}"
             )
         }
         Mode::Live => {
@@ -1247,8 +1250,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
                 ""
             };
             format!(
-                " q quit · ←/→/tab device · p pause{paused} · ↑/↓ story · enter/r replay · \
-                 t timeline · s style{cadence}{hint}  —  gpuviewer{mock_tag}"
+                " q quit · ←→/ad/tab device · p pause{paused} · ↑↓/ws story · enter/r replay · \
+                 t timeline · c style{cadence}{hint}  —  gpuviewer{mock_tag}"
             )
         }
     };
