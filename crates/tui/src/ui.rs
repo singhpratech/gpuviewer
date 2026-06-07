@@ -124,11 +124,17 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         .and_then(|s| s.util_pct)
         .map(|u| format!("{u:.0}%"))
         .unwrap_or_else(|| "—".into());
-    let ds = vec![Dataset::default()
-        .marker(symbols::Marker::HalfBlock)
-        .graph_type(GraphType::Bar)
-        .style(Style::default().fg(Color::Cyan))
-        .data(&util_pts)];
+    let util_segs = step_segments(&util_pts, 1.0);
+    let ds: Vec<Dataset> = util_segs
+        .iter()
+        .map(|seg| {
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Cyan))
+                .data(seg)
+        })
+        .collect();
     let chart = Chart::new(ds)
         .block(
             Block::default()
@@ -165,9 +171,12 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         vram_a,
         info,
         &vram_pts,
-        &latest_mem,
-        [-CHART_WINDOW_S, 0.0],
-        "",
+        &VramChartCtx {
+            headline: &latest_mem,
+            x_bounds: [-CHART_WINDOW_S, 0.0],
+            title_tag: "",
+            sample_w_s: 1.0,
+        },
     );
 
     // Gauge row reads the latest tick's sample.
@@ -207,22 +216,29 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
     let at = bucket_at(samples, app.cursor_ms);
 
     // Utilization (bucket averages) across the window.
-    let util_pts: Vec<(f64, f64)> = hold_bucket_width(
-        samples.iter().filter_map(|r| {
+    let util_pts: Vec<(f64, f64)> = samples
+        .iter()
+        .filter_map(|r| {
             r.util_avg
                 .map(|u| ((r.bucket_ms as f64 - cursor) / 1000.0, u as f64))
-        }),
-        Tier::TenSec.width_ms() as f64 / 1000.0,
-    );
+        })
+        .collect();
     let cursor_util = at
         .and_then(|r| r.util_avg)
         .map(|u| format!("{u:.0}%"))
         .unwrap_or_else(|| "—".into());
-    let ds = vec![Dataset::default()
-        .marker(symbols::Marker::HalfBlock)
-        .graph_type(GraphType::Bar)
-        .style(Style::default().fg(Color::Cyan))
-        .data(&util_pts)];
+    let bucket_w_s = Tier::TenSec.width_ms() as f64 / 1000.0;
+    let util_segs = step_segments(&util_pts, bucket_w_s);
+    let ds: Vec<Dataset> = util_segs
+        .iter()
+        .map(|seg| {
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Cyan))
+                .data(seg)
+        })
+        .collect();
     let chart = Chart::new(ds)
         .block(
             Block::default()
@@ -242,13 +258,13 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
     f.render_widget(chart, util_a);
 
     // VRAM (bucket averages).
-    let vram_pts: Vec<(f64, f64)> = hold_bucket_width(
-        samples.iter().filter_map(|r| {
+    let vram_pts: Vec<(f64, f64)> = samples
+        .iter()
+        .filter_map(|r| {
             r.mem_avg
                 .map(|m| ((r.bucket_ms as f64 - cursor) / 1000.0, m as f64 / GIB))
-        }),
-        Tier::TenSec.width_ms() as f64 / 1000.0,
-    );
+        })
+        .collect();
     let cursor_mem = at
         .and_then(|r| r.mem_avg)
         .map(fmt_bytes)
@@ -258,9 +274,12 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
         vram_a,
         info,
         &vram_pts,
-        &cursor_mem,
-        [-REPLAY_WINDOW_S, REPLAY_WINDOW_S],
-        " REPLAY",
+        &VramChartCtx {
+            headline: &cursor_mem,
+            x_bounds: [-REPLAY_WINDOW_S, REPLAY_WINDOW_S],
+            title_tag: " REPLAY",
+            sample_w_s: bucket_w_s,
+        },
     );
 
     // Gauge row reads the bucket at the cursor. `throttle_n` counts frames in the bucket
@@ -280,18 +299,38 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
     );
 }
 
-/// Bucket rollups plot one point per bucket — sparser than the chart's columns, which
-/// leaves x-quantization blanks that read as missing data. Hold each bucket's value across
-/// its real width (sub-points every 2s) so the wave is square and a blank column means
-/// exactly one thing: nothing was recorded there.
-fn hold_bucket_width(
-    pts: impl Iterator<Item = (f64, f64)>,
-    width_s: f64,
-) -> Vec<(f64, f64)> {
-    const STEP_S: f64 = 2.0;
-    let n = (width_s / STEP_S).max(1.0) as usize;
-    pts.flat_map(|(x, y)| (0..n).map(move |i| (x + i as f64 * STEP_S, y)))
-        .collect()
+/// Consecutive points farther apart than this are not bridged: the trace breaks and the
+/// blank stays, because a hole in the recording must look like a hole. Covers both the
+/// 10s rollup spacing and the live cadence at its maximum idle-backoff stretch (10s).
+const GAP_BRIDGE_S: f64 = 15.0;
+
+/// Square-wave outline from sampled points: each value holds flat until the next sample,
+/// then steps vertically — no diagonal interpolation smearing a 0→95 transition. Points
+/// farther apart than [`GAP_BRIDGE_S`] start a new segment (rendered as separate
+/// datasets), and each segment's last value is held for `trail_s`, the sample's real
+/// width, so the newest bucket is drawn as wide as it actually is.
+fn step_segments(pts: &[(f64, f64)], trail_s: f64) -> Vec<Vec<(f64, f64)>> {
+    let mut segs: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut cur: Vec<(f64, f64)> = Vec::new();
+    for &(x, y) in pts {
+        match cur.last().copied() {
+            Some((px, py)) if x - px <= GAP_BRIDGE_S => {
+                cur.push((x, py)); // hold the previous value to here…
+                cur.push((x, y)); // …then step vertically
+            }
+            Some((px, py)) => {
+                cur.push((px + trail_s, py));
+                segs.push(std::mem::take(&mut cur));
+                cur.push((x, y));
+            }
+            None => cur.push((x, y)),
+        }
+    }
+    if let Some(&(px, py)) = cur.last() {
+        cur.push((px + trail_s, py));
+        segs.push(cur);
+    }
+    segs
 }
 
 /// The 10s rollup covering `cursor_ms`, if recorded. Exact-bucket only: a cursor sitting
@@ -301,36 +340,47 @@ fn bucket_at(samples: &[SampleRollup], cursor_ms: u64) -> Option<&SampleRollup> 
     samples.iter().find(|r| r.bucket_ms == key)
 }
 
+/// Per-mode inputs to the shared VRAM chart: live and replay differ only in these.
+struct VramChartCtx<'a> {
+    headline: &'a str,
+    x_bounds: [f64; 2],
+    title_tag: &'a str,
+    sample_w_s: f64,
+}
+
 /// The VRAM chart, shared by live (raw ring samples) and replay (bucket averages): only
-/// the points, the headline value, the x-bounds, and the title tag differ.
+/// the points and the per-mode context differ.
 fn render_vram_chart(
     f: &mut Frame,
     area: Rect,
     info: &StaticInfo,
     pts: &[(f64, f64)],
-    headline: &str,
-    x_bounds: [f64; 2],
-    title_tag: &str,
+    ctx: &VramChartCtx,
 ) {
     let total_gib = info.mem_total_bytes.map(|b| b as f64 / GIB).unwrap_or(0.0);
     let total_label = info
         .mem_total_bytes
         .map(fmt_bytes)
         .unwrap_or_else(|| "?".into());
-    let ds = vec![Dataset::default()
-        .marker(symbols::Marker::HalfBlock)
-        .graph_type(GraphType::Bar)
-        .style(Style::default().fg(Color::Magenta))
-        .data(pts)];
+    let segs = step_segments(pts, ctx.sample_w_s);
+    let ds: Vec<Dataset> = segs
+        .iter()
+        .map(|seg| {
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Magenta))
+                .data(seg)
+        })
+        .collect();
     let y_max = if total_gib > 0.0 { total_gib } else { 1.0 };
     let y_max_label = format!("{y_max:.0}G");
     let chart = Chart::new(ds)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" vram {headline} / {total_label}{title_tag} ")),
-        )
-        .x_axis(Axis::default().bounds(x_bounds))
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " vram {} / {total_label}{} ",
+            ctx.headline, ctx.title_tag
+        )))
+        .x_axis(Axis::default().bounds(ctx.x_bounds))
         .y_axis(
             Axis::default()
                 .bounds([0.0, y_max])
