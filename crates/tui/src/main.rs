@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use collector::{Collector, Engine, EngineConfig, FrameDevice};
+use collector::{
+    Collector, Engine, EngineConfig, FrameDevice, TickOutcome, MAX_CONSECUTIVE_PANICS,
+};
 use gpuviewer_core::mock::MockBackend;
 use gpuviewer_core::{
     now_ms, Confidence, DeviceId, Event, EventEngine, EventKind, GpuBackend, Severity, StaticInfo,
@@ -455,7 +457,35 @@ struct EventLine<'a> {
 
 fn run_json(mut engine: Engine, interval: Duration, once: bool) -> Result<()> {
     loop {
-        let frame = engine.tick();
+        // The same panic firewall the TUI's collector thread runs behind: a panicked tick
+        // emits its CollectorStall event line (an existing kind — the NDJSON contract is
+        // untouched; the fact was already persisted/`--on-event`-fired inside the guard)
+        // and the stream retries; a fatal panic ends the stream loudly — final stderr
+        // line, nonzero exit — never by silently emitting nothing forever. A `--once` run
+        // retries within the budget or dies loudly.
+        let frame = match engine.tick_guarded() {
+            TickOutcome::Frame(frame) => frame,
+            TickOutcome::Panicked { event, fatal, .. } => {
+                let line = serde_json::to_string(&EventLine {
+                    v: 1,
+                    kind: "event",
+                    event: &event,
+                })?;
+                if !emit_line(&line) {
+                    engine.flush();
+                    return Ok(());
+                }
+                if fatal {
+                    engine.flush();
+                    bail!(
+                        "collector stopped: {MAX_CONSECUTIVE_PANICS} consecutive tick \
+                         panics — stream ended (panic details on stderr above)"
+                    );
+                }
+                std::thread::sleep(interval);
+                continue;
+            }
+        };
         let mut lines = vec![serde_json::to_string(&FrameLine {
             v: 1,
             kind: "frame",
