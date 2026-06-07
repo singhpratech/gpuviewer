@@ -113,6 +113,26 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
       --version, -V   print version and exit\n  \
       --help, -h      show this help";
 
+/// Write `text` to stdout, treating a broken pipe as the consumer hanging up — these
+/// streams are built to be piped (`gpuviewer report | head`, `--json | jq`), and a Unix
+/// tool ends quietly when its reader goes away, it does not panic (Rust ignores SIGPIPE,
+/// so without this every `println!` aborts mid-stream). Returns `false` once stdout is
+/// gone so streaming callers can stop ticking and flush their recording tail.
+fn emit(text: &str) -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .is_ok()
+}
+
+/// [`emit`] with a trailing newline — one NDJSON line, one summary line.
+fn emit_line(text: &str) -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{text}").and_then(|()| out.flush()).is_ok()
+}
+
 fn parse_args() -> Result<Args> {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
@@ -148,11 +168,11 @@ fn parse_args() -> Result<Args> {
                 args.on_event = Some(v);
             }
             "--version" | "-V" => {
-                println!("gpuviewer {}", env!("CARGO_PKG_VERSION"));
+                emit_line(concat!("gpuviewer ", env!("CARGO_PKG_VERSION")));
                 std::process::exit(0);
             }
             "--help" | "-h" => {
-                println!("{HELP}");
+                emit_line(HELP);
                 std::process::exit(0);
             }
             other => bail!("unknown flag: {other} (see --help)"),
@@ -191,7 +211,7 @@ fn parse_report_args(mut it: impl Iterator<Item = String>) -> Result<ReportArgs>
             }
             "--mock" => r.mock = true,
             "--help" | "-h" => {
-                println!("{HELP}");
+                emit_line(HELP);
                 std::process::exit(0);
             }
             other => bail!("unknown report flag: {other} (see --help)"),
@@ -213,7 +233,7 @@ fn parse_demo_args(it: impl Iterator<Item = String>) -> Result<DemoArgs> {
         match a.as_str() {
             "--seed-only" => d.seed_only = true,
             "--help" | "-h" => {
-                println!("{HELP}");
+                emit_line(HELP);
                 std::process::exit(0);
             }
             other => bail!("unknown demo flag: {other} (see --help)"),
@@ -252,7 +272,7 @@ fn parse_export_args(mut it: impl Iterator<Item = String>) -> Result<ExportArgs>
             }
             "--mock" => mock = true,
             "--help" | "-h" => {
-                println!("{HELP}");
+                emit_line(HELP);
                 std::process::exit(0);
             }
             other if other.starts_with('-') => bail!("unknown export flag: {other} (see --help)"),
@@ -279,7 +299,7 @@ fn parse_view_args(it: impl Iterator<Item = String>) -> Result<PathBuf> {
     for a in it {
         match a.as_str() {
             "--help" | "-h" => {
-                println!("{HELP}");
+                emit_line(HELP);
                 std::process::exit(0);
             }
             other if other.starts_with('-') => bail!("unknown view flag: {other} (see --help)"),
@@ -366,24 +386,26 @@ struct EventLine<'a> {
 fn run_json(mut engine: Engine, interval: Duration, once: bool) -> Result<()> {
     loop {
         let frame = engine.tick();
-        println!(
-            "{}",
-            serde_json::to_string(&FrameLine {
-                v: 1,
-                kind: "frame",
-                ts_ms: frame.ts_ms,
-                devices: &frame.devices,
-            })?
-        );
+        let mut lines = vec![serde_json::to_string(&FrameLine {
+            v: 1,
+            kind: "frame",
+            ts_ms: frame.ts_ms,
+            devices: &frame.devices,
+        })?];
         for event in &frame.events {
-            println!(
-                "{}",
-                serde_json::to_string(&EventLine {
-                    v: 1,
-                    kind: "event",
-                    event,
-                })?
-            );
+            lines.push(serde_json::to_string(&EventLine {
+                v: 1,
+                kind: "event",
+                event,
+            })?);
+        }
+        for line in &lines {
+            if !emit_line(line) {
+                // The consumer hung up (`--json | head` is a normal way to grab a frame).
+                // End the run cleanly, persisting the partial tail like any other exit.
+                engine.flush();
+                return Ok(());
+            }
         }
         if once {
             // Persist the partial tail before exiting so a one-shot run still records.
@@ -488,7 +510,7 @@ fn run_report(args: ReportArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot open {} read-only: {e}", path.display()))?;
 
     let report = build_report(&store, from, to)?;
-    print!("{report}");
+    emit(&report);
     Ok(())
 }
 
@@ -563,7 +585,10 @@ fn build_report(store: &SqliteStore, from: u64, to: u64) -> Result<String> {
         let util_max = rows.iter().filter_map(|r| r.util_max).fold(None, fmax);
         let temp_max = rows.iter().filter_map(|r| r.temp_max_c).fold(None, fmax);
         let mem_max = rows.iter().filter_map(|r| r.mem_avg).max();
-        let throttle_buckets: u32 = rows.iter().map(|r| r.throttle_n).sum();
+        // `throttle_n` counts throttled raw samples WITHIN one bucket; summing it across
+        // rows would report sample counts under a "buckets" label (5x off at 1Hz/10s).
+        // Count buckets that saw any throttling, which is what the label promises.
+        let throttle_buckets = rows.iter().filter(|r| r.throttle_n > 0).count();
 
         out.push_str(&format!(
             "{short} ({}): util avg {} / max {}, temp max {}, mem max {}, throttle buckets {}\n",
@@ -731,12 +756,12 @@ fn run_demo(args: DemoArgs) -> Result<()> {
 
     let now = now_ms();
     let (events, throttles) = seed_demo(&path, now.saturating_sub(DEMO_SPAN_MS), now)?;
-    println!(
+    emit_line(&format!(
         "seeded {}h of simulated history: {events} events, {throttles} throttle episodes \
          (db: {})",
         DEMO_SPAN_MS / 3_600_000,
         path.display()
-    );
+    ));
     if args.seed_only {
         return Ok(());
     }
@@ -853,17 +878,18 @@ fn run_export(args: ExportArgs) -> Result<()> {
         .export_to(&args.out, from, now)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
 
-    println!(
-        "exported {} .. {} into {}",
+    emit(&format!(
+        "exported {} .. {} into {}\n  devices        {}\n  samples_10s    {}\n  \
+         samples_1m     {}\n  processes_10s  {}\n  events         {}\n",
         fmt_clock(from),
         fmt_clock(now),
-        args.out.display()
-    );
-    println!("  devices        {}", counts.devices);
-    println!("  samples_10s    {}", counts.samples_10s);
-    println!("  samples_1m     {}", counts.samples_1m);
-    println!("  processes_10s  {}", counts.processes_10s);
-    println!("  events         {}", counts.events);
+        args.out.display(),
+        counts.devices,
+        counts.samples_10s,
+        counts.samples_1m,
+        counts.processes_10s,
+        counts.events,
+    ));
     Ok(())
 }
 
@@ -1023,10 +1049,12 @@ mod tests {
             thermal: true,
             ..Default::default()
         };
-        // Three frames in bucket [0,10s); one throttled. Then a frame in the next bucket to
-        // force the completed bucket to flush.
+        // Four frames in bucket [0,10s); TWO throttled — one bucket with throttling, so a
+        // summary that sums per-bucket sample counts instead of counting buckets reads 2,
+        // not 1. Then a frame in the next bucket to force the completed bucket to flush.
         rec.observe(&dev, &full_sample(1_000, 40.0, Default::default()), &[]);
         rec.observe(&dev, &full_sample(2_000, 80.0, thermal), &[]);
+        rec.observe(&dev, &full_sample(3_000, 45.0, thermal), &[]);
         rec.observe(&dev, &full_sample(9_000, 60.0, Default::default()), &[]);
         rec.observe(&dev, &full_sample(11_000, 5.0, Default::default()), &[]);
         rec.flush();
@@ -1063,18 +1091,19 @@ mod tests {
             text.starts_with("gpuviewer report —"),
             "missing header:\n{text}"
         );
-        // Per-device summary: util avg (40+80+60)/3 = 60, throttle buckets = 1 (one frame).
         assert!(
             text.contains("GPU0 (Test GPU 9000)"),
             "device summary missing:\n{text}"
         );
-        // 1m tier folds all four frames in the minute: (40+80+60+5)/4 = 46.25 → 46%. A broken
+        // 1m tier folds all five frames in the minute: (40+80+45+60+5)/5 = 46 → 46%. A broken
         // average (e.g. over bucket count vs present-count, or wrong tier) would not read 46.
         assert!(text.contains("util avg 46%"), "util average wrong:\n{text}");
         assert!(
             text.contains("util avg 46% / max 80%"),
             "util max wrong:\n{text}"
         );
+        // One bucket had throttling (two throttled frames within it). Summing the per-bucket
+        // sample counts would read 2 — the decoy that catches a count/sum mixup.
         assert!(
             text.contains("throttle buckets 1"),
             "throttle bucket count wrong:\n{text}"

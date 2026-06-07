@@ -27,11 +27,18 @@ const DOCUMENTED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
 const DOCUMENTED_PROCESS_KINDS: &[&str] = &["compute", "graphics", "both", "unknown"];
 
 /// Run `gpuviewer --json --once --mock` and return stdout split into lines.
+/// XDG_DATA_HOME/HOME point at a scratch dir on the child process only: persistence is on
+/// by default, and a conformance test must never write into the user's real data dir.
 fn run_once() -> Vec<String> {
+    let dir = std::env::temp_dir().join(format!("gpuviewer-ndjson-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch data dir");
     let out = Command::new(env!("CARGO_BIN_EXE_gpuviewer"))
         .args(["--json", "--once", "--mock"])
+        .env("XDG_DATA_HOME", &dir)
+        .env("HOME", &dir)
         .output()
         .expect("failed to spawn the gpuviewer binary");
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         out.status.success(),
         "--json --once --mock must exit 0, got {:?}; stderr: {}",

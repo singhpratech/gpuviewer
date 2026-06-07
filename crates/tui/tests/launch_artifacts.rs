@@ -225,6 +225,49 @@ fn view_rejects_missing_and_invalid_files() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The NDJSON stream is built to be piped, and `--json | head -1` is the documented way to
+/// grab a frame — so a consumer hanging up must end the run cleanly (exit 0), not abort
+/// with the default Rust broken-pipe panic. The stream would otherwise run forever, so a
+/// watchdog kills it (and fails) if neither happens.
+#[test]
+fn json_stream_ends_cleanly_when_the_consumer_hangs_up() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let dir = scratch_dir("epipe");
+    let mut child = bin()
+        .args(["--json", "--mock", "--interval", "100"])
+        .env("XDG_DATA_HOME", &dir)
+        .env("HOME", &dir)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn gpuviewer");
+
+    // Prove the stream started, then hang up: the next write hits EPIPE.
+    let mut stdout = child.stdout.take().expect("stdout must be piped");
+    let mut first = [0u8; 1];
+    stdout.read_exact(&mut first).expect("first stream byte");
+    drop(stdout);
+
+    let mut status = None;
+    for _ in 0..100 {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let Some(status) = status else {
+        let _ = child.kill();
+        panic!("the stream must end on its own once the consumer is gone");
+    };
+    assert!(
+        status.success(),
+        "hangup must end the stream cleanly (exit 0), got {status:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// --help documents the launch artifacts — demo/export/view must be discoverable.
 #[test]
 fn help_documents_the_launch_artifacts() {
