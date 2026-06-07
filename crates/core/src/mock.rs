@@ -89,6 +89,28 @@ impl MockBackend {
     }
 }
 
+impl MockBackend {
+    /// One simulation step for ALL devices at a synthetic timestamp, in `devices()` order —
+    /// the seeding entry point for `gpuviewer demo`, which replays hours of history through
+    /// the sims in seconds. The live path (`refresh_dynamic` at `now_ms()`) and this one
+    /// share the same `step()`, so seeded history and live mock data are the same
+    /// simulation, just on different clocks.
+    pub fn tick_at(&mut self, ts_ms: u64) -> Vec<(DeviceId, DynamicSample, Vec<ProcessSample>)> {
+        vec![
+            (
+                self.ids[0].clone(),
+                self.train.step(ts_ms),
+                self.train.processes(),
+            ),
+            (
+                self.ids[1].clone(),
+                self.desktop.step(ts_ms),
+                self.desktop.processes(),
+            ),
+        ]
+    }
+}
+
 impl Default for MockBackend {
     fn default() -> Self {
         Self::new()
@@ -324,5 +346,59 @@ impl DesktopSim {
             });
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two fresh backends stepped with the same timestamp sequence must produce identical
+    /// frames — `gpuviewer demo` relies on this: the seeded story is reproducible, and any
+    /// hidden wall-clock dependence in the sims (which would make the demo unrepeatable)
+    /// fails here.
+    #[test]
+    fn tick_at_is_deterministic_across_instances() {
+        let mut a = MockBackend::new();
+        let mut b = MockBackend::new();
+        for i in 0..500u64 {
+            let ts = 1_700_000_000_000 + i * 1_000;
+            let fa = a.tick_at(ts);
+            let fb = b.tick_at(ts);
+            assert_eq!(fa, fb, "frames diverged at tick {i}");
+            assert_eq!(fa.len(), 2, "tick_at must cover BOTH mock devices");
+            for (_, sample, procs) in &fa {
+                assert_eq!(sample.ts_ms, ts, "samples carry the synthetic timestamp");
+                assert!(!procs.is_empty(), "mock devices always have processes");
+            }
+        }
+    }
+
+    /// `tick_at` and the live `refresh_dynamic` route through the same simulation step, so
+    /// driving one backend via `tick_at` and another via the trait methods yields the same
+    /// per-tick *state evolution* (only the timestamps differ — the live path stamps
+    /// `now_ms()`). Throttling within 500 ticks proves the seeded story actually contains
+    /// the throttle onset the demo scrolls back to.
+    #[test]
+    fn tick_at_drives_the_same_simulation_as_refresh_dynamic() {
+        use crate::backend::GpuBackend;
+        let mut seeded = MockBackend::new();
+        let mut live = MockBackend::new();
+        let train = live.devices()[0].clone();
+        let mut seeded_throttled = false;
+        for i in 0..500u64 {
+            let frame = seeded.tick_at(i * 1_000);
+            let (_, s, _) = &frame[0];
+            let mut l = live.refresh_dynamic(&train).unwrap();
+            // Same evolution apart from the clock: align it and compare everything else.
+            l.ts_ms = s.ts_ms;
+            assert_eq!(*s, l, "sim state diverged at tick {i}");
+            let _ = live.refresh_processes(&train).unwrap();
+            seeded_throttled |= s.throttle.any();
+        }
+        assert!(
+            seeded_throttled,
+            "500 ticks of the training sim must include a throttle episode"
+        );
     }
 }

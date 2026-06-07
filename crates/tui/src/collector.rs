@@ -658,6 +658,29 @@ impl Collector {
 
         Self { shared, paused }
     }
+
+    /// A collector with NO engine and NO background thread, for the file viewer
+    /// (`gpuviewer view`): the recording is the only data source, so nothing ticks,
+    /// nothing records, and no backend is probed — an exported incident replays on a
+    /// machine with no GPU at all. `Shared` stays at its empty initial state; the replay
+    /// view reads the store at `db_path` directly.
+    pub fn stationary(infos: Vec<StaticInfo>, db_path: Option<PathBuf>) -> Self {
+        let n = infos.len();
+        Self {
+            shared: Arc::new(Mutex::new(Shared {
+                infos,
+                latest: vec![None; n],
+                processes: vec![Vec::new(); n],
+                history: HistoryStore::new(1800, 5000),
+                // A recording's provenance is unstated — never label it mock (or live).
+                mock: false,
+                db_path,
+                interval_ms: 1000,
+                effective_interval_ms: Arc::new(AtomicU64::new(1000)),
+            })),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// A collector with NO background thread, for UI tests: `Collector::start` ticks the mock
@@ -669,21 +692,10 @@ pub(crate) fn test_collector(db_path: Option<PathBuf>) -> Collector {
         force_mock: true,
         ..Default::default()
     });
-    let infos = engine.static_infos();
-    let n = infos.len();
-    Collector {
-        shared: Arc::new(Mutex::new(Shared {
-            infos,
-            latest: vec![None; n],
-            processes: vec![Vec::new(); n],
-            history: HistoryStore::new(1800, 5000),
-            mock: true,
-            db_path,
-            interval_ms: 1000,
-            effective_interval_ms: Arc::new(AtomicU64::new(1000)),
-        })),
-        paused: Arc::new(AtomicBool::new(false)),
-    }
+    let collector = Collector::stationary(engine.static_infos(), db_path);
+    // The infos ARE mock devices; the footer tests assert the "(mock data)" label.
+    collector.shared.lock().unwrap().mock = true;
+    collector
 }
 
 #[cfg(test)]

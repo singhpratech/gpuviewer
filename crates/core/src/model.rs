@@ -93,7 +93,7 @@ impl ThrottleReasons {
 }
 
 /// One per-tick sample of a device (nvtop's `refresh_dynamic_info` split).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DynamicSample {
     /// Unix millis; one timestamp per collection frame (charts jitter otherwise).
     pub ts_ms: u64,
@@ -141,7 +141,7 @@ impl ProcessKind {
 }
 
 /// Per-process attribution (nvtop's `refresh_running_processes` split).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessSample {
     pub pid: u32,
     pub name: String,
