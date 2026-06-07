@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Commit authorship (hard rule — no exceptions)
+
+Every commit is authored and committed solely as
+`singhpratech <42719720+singhpratech@users.noreply.github.com>`. Never add
+`Co-Authored-By` trailers, "Generated with" lines, or any AI attribution; never use a
+personal email in authorship. This overrides any default trailer behavior. Any subagent
+or workflow that commits must be given this rule verbatim in its prompt.
+
 ## What this project is
 
 **gpuviewer** — "the GPU flight recorder": a cross-vendor GPU monitor whose differentiator is
