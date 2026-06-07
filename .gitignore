@@ -1,2 +1,8 @@
 /target
 **/*.rs.bk
+
+# local recordings — never commit a history database or an exported incident slice
+*.db
+*.db-wal
+*.db-shm
+*.gpvr
