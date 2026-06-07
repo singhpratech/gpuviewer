@@ -1,0 +1,19 @@
+# gpuviewer launcher entry (docs/design/cross-platform.md §6).
+#
+# Install paths (wired into the deb/rpm asset lists in crates/tui/Cargo.toml — §7):
+#   this file                                  -> usr/share/applications/gpuviewer.desktop
+#   docs/assets/icon/png/<N>x<N>/gpuviewer.png -> usr/share/icons/hicolor/<N>x<N>/apps/gpuviewer.png
+#                                                 (N = 16/32/48/64/128/256/512)
+#   docs/assets/icon/gpuviewer.svg             -> usr/share/icons/hicolor/scalable/apps/gpuviewer.svg
+#
+# Icon= is a THEME NAME (no extension/path) resolved against hicolor — hence the
+# install layout above. Terminal=true: gpuviewer is a TUI, so launchers spawn it
+# inside the user's terminal emulator.
+[Desktop Entry]
+Type=Application
+Name=gpuviewer
+Comment=GPU flight recorder
+Exec=gpuviewer
+Icon=gpuviewer
+Terminal=true
+Categories=System;Monitor;

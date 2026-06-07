@@ -19,3 +19,56 @@ serde_json.workspace = true
 anyhow.workspace = true
 ratatui.workspace = true
 chrono.workspace = true
+
+# build.rs gates on env CARGO_CFG_TARGET_OS == "windows" (build scripts run on the HOST —
+# design §8) and embeds docs/assets/icon/gpuviewer.ico via rc.exe on windows-latest.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1.31"
+
+# --- Linux packaging metadata (cross-platform design §6/§7) -----------------------
+# Both cargo-deb's and cargo-generate-rpm's dependency scanners read DT_NEEDED only:
+# the dlopen'd libnvidia-ml.so.1 is invisible to them, so neither package declares an
+# NVIDIA driver dependency. That is CORRECT — do not add one manually (degrading to
+# other backends/mock is the designed behavior).
+#
+# cargo-deb resolves relative asset sources against THIS manifest's directory
+# (crates/tui/), with target/release/* special-cased to the workspace target dir —
+# verified empirically with cargo-deb 3.7.0 from a mirrored workspace.
+[package.metadata.deb]
+name = "gpuviewer"
+maintainer = "singhpratech <42719720+singhpratech@users.noreply.github.com>"
+copyright = "2026 singhpratech"
+section = "utils"
+priority = "optional"
+extended-description = "Cross-vendor GPU monitor with persistent history and narrated events."
+assets = [
+    { source = "target/release/gpuviewer", dest = "usr/bin/", mode = "755" },
+    { source = "../../docs/packaging/gpuviewer.desktop", dest = "usr/share/applications/", mode = "644" },
+    { source = "../../docs/assets/icon/gpuviewer.svg", dest = "usr/share/icons/hicolor/scalable/apps/", mode = "644" },
+    { source = "../../docs/assets/icon/png/16x16/gpuviewer.png", dest = "usr/share/icons/hicolor/16x16/apps/", mode = "644" },
+    { source = "../../docs/assets/icon/png/32x32/gpuviewer.png", dest = "usr/share/icons/hicolor/32x32/apps/", mode = "644" },
+    { source = "../../docs/assets/icon/png/48x48/gpuviewer.png", dest = "usr/share/icons/hicolor/48x48/apps/", mode = "644" },
+    { source = "../../docs/assets/icon/png/64x64/gpuviewer.png", dest = "usr/share/icons/hicolor/64x64/apps/", mode = "644" },
+    { source = "../../docs/assets/icon/png/128x128/gpuviewer.png", dest = "usr/share/icons/hicolor/128x128/apps/", mode = "644" },
+    { source = "../../docs/assets/icon/png/256x256/gpuviewer.png", dest = "usr/share/icons/hicolor/256x256/apps/", mode = "644" },
+    { source = "../../docs/assets/icon/png/512x512/gpuviewer.png", dest = "usr/share/icons/hicolor/512x512/apps/", mode = "644" },
+]
+
+# cargo-generate-rpm must run FROM THE WORKSPACE ROOT (`cargo generate-rpm -p
+# crates/tui`, exactly as release.yml does): it reads ./Cargo.toml and resolves
+# relative asset sources against the CWD — verified empirically with 0.21.0.
+# `name` override makes the package gpuviewer-<ver>-1.x86_64.rpm, not gpuviewer-tui-*.
+[package.metadata.generate-rpm]
+name = "gpuviewer"
+assets = [
+    { source = "target/release/gpuviewer", dest = "/usr/bin/gpuviewer", mode = "755" },
+    { source = "docs/packaging/gpuviewer.desktop", dest = "/usr/share/applications/gpuviewer.desktop", mode = "644" },
+    { source = "docs/assets/icon/gpuviewer.svg", dest = "/usr/share/icons/hicolor/scalable/apps/gpuviewer.svg", mode = "644" },
+    { source = "docs/assets/icon/png/16x16/gpuviewer.png", dest = "/usr/share/icons/hicolor/16x16/apps/gpuviewer.png", mode = "644" },
+    { source = "docs/assets/icon/png/32x32/gpuviewer.png", dest = "/usr/share/icons/hicolor/32x32/apps/gpuviewer.png", mode = "644" },
+    { source = "docs/assets/icon/png/48x48/gpuviewer.png", dest = "/usr/share/icons/hicolor/48x48/apps/gpuviewer.png", mode = "644" },
+    { source = "docs/assets/icon/png/64x64/gpuviewer.png", dest = "/usr/share/icons/hicolor/64x64/apps/gpuviewer.png", mode = "644" },
+    { source = "docs/assets/icon/png/128x128/gpuviewer.png", dest = "/usr/share/icons/hicolor/128x128/apps/gpuviewer.png", mode = "644" },
+    { source = "docs/assets/icon/png/256x256/gpuviewer.png", dest = "/usr/share/icons/hicolor/256x256/apps/gpuviewer.png", mode = "644" },
+    { source = "docs/assets/icon/png/512x512/gpuviewer.png", dest = "/usr/share/icons/hicolor/512x512/apps/gpuviewer.png", mode = "644" },
+]
