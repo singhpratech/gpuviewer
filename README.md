@@ -8,8 +8,8 @@
 
 [![CI](https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Platform](https://img.shields.io/badge/platform-Linux-success)](#status)
-[![Vendors](https://img.shields.io/badge/GPUs-NVIDIA%20·%20AMD%20·%20Intel-76b900)](#status)
+[![Platform](https://img.shields.io/badge/platform-Linux%20·%20Windows%20·%20macOS-success)](#status)
+[![Vendors](https://img.shields.io/badge/GPUs-NVIDIA%20·%20AMD%20·%20Intel%20·%20Apple-76b900)](#status)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-f74c00?logo=rust&logoColor=white)](#architecture)
 
 </div>
@@ -19,7 +19,9 @@
 Your training run stalled at 02:14. You were asleep. Every other monitor would have shown
 you a beautiful live gauge — of a moment that no longer exists.
 
-**gpuviewer** is a Linux GPU monitor (NVIDIA · AMD · Intel) that records persistent,
+**gpuviewer** is a GPU monitor — Linux (NVIDIA · AMD · Intel) validated on real hardware;
+Windows and macOS Apple Silicon support newly in-tree, compiles + CI-tested with hardware
+validation pending ([status](#status)) — that records persistent,
 per-process history and a narrated event log **just by being open** — no daemon to install,
 no recording you had to remember to start. The next morning you scroll back to the moment
 it happened and read the story: the throttle onset with clock deltas, the VRAM climb with
@@ -88,6 +90,14 @@ GPU1 (Radeon RX 7900 XTX): util avg 12% / max 87%, temp max 71°C, mem max 12.4 
 03:02:11  WARN  [likely]  GPU0 VRAM 92% and climbing ~270 MiB/min — likely full in ~8 min (largest holder: python pid 4521)
 06:58:40  INFO  [fact]    python (pid 4521) left GPU0, freeing 21.3 GiB
 ```
+
+## Install
+
+Packaged builds (Linux `tar.gz`/`.deb`/`.rpm`, Windows `zip`, macOS `tar.gz` — with
+checksums and build-provenance attestations) are produced per release tag. Every install
+path, platform note (Windows SmartScreen, macOS quarantine), and verification step lives
+in [`docs/packaging/installing.md`](docs/packaging/installing.md). Building from source
+always works: `cargo build --release`.
 
 ## Quick start
 
@@ -230,8 +240,14 @@ This project was built research-first, and the research is in the repo:
 
 ## Status
 
-**Working pre-release (v0.1.0) — Linux.** Build from source: `cargo build --release`;
-no packaged binaries yet.
+**Working pre-release (v0.1.0).** Install paths:
+[`docs/packaging/installing.md`](docs/packaging/installing.md).
+
+| Platform | Backends | Tier |
+|---|---|---|
+| Linux | NVIDIA (NVML, runtime-loaded) · AMD (sysfs/`gpu_metrics`/fdinfo) · Intel (i915 + xe) | Developed and validated on real hardware |
+| Windows | NVIDIA (NVML device truth + PDH per-process fill, joined by LUID↔PCI match) · cross-vendor WDDM (PDH: NVIDIA/AMD/Intel device + per-process) | Compiles + CI-tested; hardware validation pending |
+| macOS Apple Silicon | Device-level only — per-process GPU is OS-prohibited and the UI says so, never fakes it | Compiles + CI-tested; hardware validation pending |
 
 Shipped — in the binary today:
 
@@ -263,18 +279,22 @@ Shipped — in the binary today:
 
 In progress / not yet:
 
-- Packaged releases (cargo-only for now).
+- First published binaries — the release pipeline (tar.gz/zip/deb/rpm, drafted per tag,
+  provenance-attested) is in-tree; artifacts appear with the next tagged release.
 - Real-hardware soak across the driver matrix — a manual pre-release checklist by design;
-  CI stays GPU-free.
-- Windows NVIDIA (v1.5) and macOS Apple Silicon + iced GUI (v2) — see roadmap.
+  CI stays GPU-free. Windows and macOS are at the compiles + CI-tested tier until then.
+- iced GUI (v2) — see roadmap.
 
 ## Architecture
 
 ```
 gpuviewer-core      trait GpuBackend (nvtop's vtable, translated to Rust)
                     ├─ nvidia: nvml-wrapper (runtime dlopen, never hard-linked)
+                    │          + on Windows: per-process fill from the shared PDH snapshot
                     ├─ amd:    sysfs/hwmon/gpu_metrics(v1.1–v3.0)/fdinfo (zero library deps)
                     ├─ intel:  fdinfo (i915 + xe dialects) + sysfs
+                    ├─ wddm:   Windows cross-vendor (DXGI + PDH + D3DKMT — OS surfaces only)
+                    ├─ apple:  macOS device-level (Metal; private tiers gated post-WWDC26)
                     └─ mock:   deterministic simulation (CI + demo; no GPU required)
 gpuviewer-history   RAM rings (live window) → 10s/1m SQLite rollups + event log
 gpuviewer-tui       ratatui — live · timeline · replay, story feed
@@ -331,12 +351,18 @@ and `demo` to `history-demo.db` — your real history is never polluted by simul
 
 ### Roadmap
 
-- **v1.5 — Windows NVIDIA:** NVML + PDH dual-source — an honest per-process number where
-  Task Manager misleads.
+- **v1.5 — Windows NVIDIA:** NVML + PDH dual-source — NVML for device truth, Windows GPU
+  performance counters for the per-process VRAM/util that NVML architecturally cannot see
+  under WDDM (an honest per-process number where Task Manager misleads). *Dual-source
+  fusion in-tree: compiles + CI-tested, hardware validation pending.* The cross-vendor
+  WDDM backend (device + per-process AMD/Intel/NVIDIA via PDH) landed alongside it, same
+  tier.
 - **v2 — macOS Apple Silicon:** device-level telemetry only (per-process GPU is
-  OS-prohibited, and we will say so in-UI rather than fake it) + an iced GUI from the same
-  core.
-- **v2+:** Windows AMD/Intel, Prometheus exporter, multi-host views.
+  OS-prohibited, and we say so in-UI rather than fake it) + an iced GUI from the same
+  core. *Device-level backend in-tree: compiles + CI-tested, hardware validation pending;
+  GUI not started.*
+- **v2+:** Prometheus exporter, multi-host views, vendor-depth Windows AMD/Intel beyond
+  the WDDM device tier.
 
 Deliberately not chasing: fan/OC control (LACT owns it), a daemon/client split ("always-on"
 means by virtue of normal use — for boot-time recording, run `gpuviewer --json` under your
