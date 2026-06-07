@@ -539,6 +539,11 @@ pub struct IntelBackend {
     last_energy: HashMap<DeviceId, (u64, u64)>,
     /// Set once at init: explanation for a known-incomplete process list, if any.
     process_hint: Option<String>,
+    /// Turns the kernel's cumulative per-PID CPU counter into a per-tick rate. The CPU%/
+    /// container columns come from `/proc` (never the device root: a fixture tree's pids are
+    /// not real processes), shared with the other Linux backends via `crate::proc_meta`.
+    #[cfg(target_os = "linux")]
+    cpu: crate::proc_meta::CpuTracker,
 }
 
 impl IntelBackend {
@@ -565,6 +570,8 @@ impl IntelBackend {
             last_cycles: HashMap::new(),
             last_energy: HashMap::new(),
             process_hint,
+            #[cfg(target_os = "linux")]
+            cpu: crate::proc_meta::CpuTracker::new(),
         })
     }
 
@@ -732,6 +739,19 @@ impl GpuBackend for IntelBackend {
             .retain(|(d, pid), _| d != dev || by_pid.contains_key(pid));
         self.last_cycles
             .retain(|(d, pid), _| d != dev || by_pid.contains_key(pid));
+
+        // CPU% and container identity come from /proc, mirroring the NVIDIA backend. The
+        // CpuTracker holds per-PID state, so prune it to the PIDs we still see to keep it
+        // from growing across a long session; container_of is stateless.
+        #[cfg(target_os = "linux")]
+        {
+            for p in &mut out {
+                p.cpu_pct = self.cpu.sample(p.pid);
+                p.container = crate::proc_meta::container_of(p.pid);
+            }
+            let live: Vec<u32> = out.iter().map(|p| p.pid).collect();
+            self.cpu.prune(&live);
+        }
 
         out.sort_by_key(|p| p.pid); // deterministic order for the table and tests
         Ok(out)

@@ -243,7 +243,9 @@ impl TrainSim {
                 kind: ProcessKind::Compute,
                 mem_bytes: Some(self.vram_python as u64),
                 util_pct: Some(if idle { 1.0 } else { 96.0 }),
-                cpu_pct: None,
+                // A dataloader pegging a few cores while the GPU works (more during an idle
+                // gap, the CPU-bound stall fingerprint) — gives the CPU% column live coverage.
+                cpu_pct: Some(if idle { 320.0 } else { 180.0 }),
                 container: None,
             },
             ProcessSample {
@@ -252,7 +254,7 @@ impl TrainSim {
                 kind: ProcessKind::Graphics,
                 mem_bytes: Some(420 * 1024 * 1024),
                 util_pct: Some(2.0),
-                cpu_pct: None,
+                cpu_pct: Some(6.0),
                 container: None,
             },
         ]
@@ -305,7 +307,7 @@ impl DesktopSim {
             kind: ProcessKind::Graphics,
             mem_bytes: Some(610 * 1024 * 1024),
             util_pct: Some(3.0),
-            cpu_pct: None,
+            cpu_pct: Some(12.0),
             container: None,
         }];
         if self.ollama_present {
@@ -315,8 +317,10 @@ impl DesktopSim {
                 kind: ProcessKind::Compute,
                 mem_bytes: Some(11 * GIB + 350 * 1024 * 1024),
                 util_pct: Some(74.0),
-                cpu_pct: None,
-                container: None,
+                // Runs in a container (the cluster-operator's "which pod" column) and burns a
+                // core or so serving the model — gives both new columns mock coverage.
+                cpu_pct: Some(140.0),
+                container: Some("docker:3f2a9c1b4d5e".into()),
             });
         }
         v
