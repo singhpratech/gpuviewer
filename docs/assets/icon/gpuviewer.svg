@@ -4,36 +4,40 @@
 
   WHY this mark: real flight recorders are ORANGE, not black — that lie is the hook.
   A dark rounded GPU-chip plate carries a stepped telemetry waveform crossed by an
-  orange playhead: "scroll back to 02:14". Geometric, flat, no gradients, no text.
+  orange playhead: "scroll back to 02:14 and see why it stalled." Geometric, flat,
+  no gradients, no text.
 
   Design grid is 32px units on a 512 canvas so every stroke lands on pixel boundaries
   at 16px (1 unit = 1px). Exactly 3 colors on dark:
     plate            #10151D  (near-black slate — the canonical "on dark" background)
-    waveform + ticks #7FD4FF  (light cyan — matches the TUI chart accent)
+    waveform         #7FD4FF  (light cyan — matches the TUI chart accent)
     playhead + rim   #FF8A3D  (recorder orange)
 
-  16px discipline: only three things must survive at 16px — orange-rimmed dark rounded
-  square, one cyan stepped line, one orange vertical with a head. Nudge to the grid,
-  never add detail (no chip pins — they turn to noise below 32px).
+  16px discipline — only three shapes must survive, and each is sized to do so:
+    1. orange-rimmed dark rounded square   (rim 28u -> ~0.9px @16)
+    2. one cyan stepped line               (stroke 44u -> ~1.4px @16)
+    3. one orange playhead with a flag     (stroke 32u -> ~1.0px @16)
+  The waveform and playhead cross at EXACTLY ONE point (the peak) and are otherwise
+  perpendicular in clear space, so the two colors never share a run of pixels and
+  turn to mud when downscaled. No baseline ticks, no chip pins, no sub-32u detail —
+  every earlier "texture" element rasterized to noise below 32px and was cut.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <title>gpuviewer — GPU flight recorder</title>
 
   <!-- 1. Chip plate: at 16px this rasterizes to a 13x13 rounded square with a ~1px orange rim. -->
   <rect x="48" y="48" width="416" height="416" rx="64"
-        fill="#10151D" stroke="#FF8A3D" stroke-width="24"/>
+        fill="#10151D" stroke="#FF8A3D" stroke-width="28"/>
 
-  <!-- 2. Timeline-strip baseline ticks (the only hint of the recording strip). -->
-  <rect x="96" y="348" width="32" height="16" fill="#7FD4FF" opacity="0.55"/>
-  <rect x="384" y="348" width="32" height="16" fill="#7FD4FF" opacity="0.55"/>
+  <!-- 2. Stepped utilization waveform (square steps, like the TUI sparkline): ramps up to a
+          wide peak, then a cliff drop — the moment it stalled. Wide plateaus survive 16px. -->
+  <polyline points="104,344 184,344 184,272 256,272 256,200 344,200 344,344 408,344"
+            fill="none" stroke="#7FD4FF" stroke-width="44"
+            stroke-linecap="square" stroke-linejoin="miter"/>
 
-  <!-- 3. Stepped utilization waveform (square steps, like the TUI sparkline);
-          reads as a 2px stepped line at 16px. -->
-  <polyline points="96,320 160,320 160,232 224,232 224,288 288,288 288,176 352,176 352,256 416,256"
-            fill="none" stroke="#7FD4FF" stroke-width="28" stroke-linecap="square"/>
-
-  <!-- 4. Playhead: drawn last so the orange crosses OVER the cyan; deliberately
-          right-of-center, cutting through the tallest step ("the moment it stalled"). -->
-  <line x1="304" y1="104" x2="304" y2="408" stroke="#FF8A3D" stroke-width="24"/>
-  <path d="M 272 96 L 336 96 L 304 144 Z" fill="#FF8A3D"/>
+  <!-- 3. Playhead: drawn last so the orange crosses OVER the cyan, at the single point where
+          it meets the peak plateau (300,200) — perpendicular, one crossing, colors stay apart.
+          Sits just left of the cliff: "parked on the peak, right before it fell." -->
+  <line x1="300" y1="96" x2="300" y2="416" stroke="#FF8A3D" stroke-width="32"/>
+  <path d="M 264 88 L 336 88 L 300 144 Z" fill="#FF8A3D"/>
 </svg>
