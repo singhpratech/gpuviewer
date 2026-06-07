@@ -49,6 +49,30 @@ jobs:
       # exercise the absence-is-normal paths for free).
       - run: cargo test
 
+      # Lying-green guard (research 07 §P1-13): the fixture-driven suites only prove
+      # anything if cargo actually enumerates their tests — an accidental cfg gate or a
+      # silently-missing fixture tree can shrink a suite toward zero and still exit
+      # green. Fail if the enumerated count drops below the committed floor. RAISE the
+      # floors when fixture tests land; never lower them without a recorded reason.
+      # Linux leg only: the fixture suites are #![cfg(target_os = "linux")].
+      - if: runner.os == 'Linux'
+        name: Fixture-test count floor
+        run: |
+          set -euo pipefail
+          check_floor() {
+            local target="$1" floor="$2" n
+            n="$(cargo test -p gpuviewer-core --test "$target" -- --list | grep -c ': test$' || true)"
+            echo "$target enumerates $n tests (floor: $floor)"
+            if [ "$n" -lt "$floor" ]; then
+              echo "::error::$target enumerates $n tests, below the floor of $floor — a cfg gate or fixture tree is silently dropping tests"
+              exit 1
+            fi
+          }
+          # Floors = enumerated counts on 2026-06-07.
+          check_floor amd_fixtures 19
+          check_floor intel_fixtures 23
+          check_floor nvml_stub_loader 2
+
   # One-off ground-truth probe (design §4.5): dump the paravirt runner's IOAccelerator /
   # AGXAccelerator inventory so the macOS backend's CI assertions are built on citation,
   # not inference. Manual trigger only; every step is best-effort (the example does not
