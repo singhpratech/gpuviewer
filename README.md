@@ -268,7 +268,7 @@ Shipped — in the binary today:
 - **Narrated events:** throttle onset/recovery with clock deltas, process attach/exit with
   freed VRAM, VRAM-pressure ETA, idle gap, suspected hang, CPU spillover, collector
   stall/slow-probe self-reports, history reset.
-- **Chart styles:** braille step-outline (default) or solid fill — `s` toggles, your pick;
+- **Chart styles:** braille step-outline (default) or solid fill — `c` toggles, your pick;
   both break honestly at recording gaps.
 - **Subcommands and sinks:** `report` (plain-text digest), `demo` (pre-seeded incident),
   `export`/`view` (shareable `.gpvr` incident files that replay anywhere, no GPU required),
