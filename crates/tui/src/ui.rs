@@ -361,7 +361,15 @@ mod tests {
     use ratatui::Terminal;
 
     use crate::app::App;
-    use crate::collector::{Collector, Engine};
+    use crate::collector::{Collector, Engine, EngineConfig};
+
+    /// A mock engine that does not persist (tests never touch the on-disk store here).
+    fn mock_engine() -> Engine {
+        Engine::new(EngineConfig {
+            force_mock: true,
+            ..Default::default()
+        })
+    }
 
     /// The processes pane must surface `StaticInfo::process_hint` (the WSL2 / privilege
     /// wall explanation) when present, and render unchanged when it is `None` — the mock
@@ -369,7 +377,7 @@ mod tests {
     #[test]
     fn process_hint_renders_in_processes_pane() {
         // Long interval: the collector thread stays quiet while we drive draws by hand.
-        let collector = Collector::start(Engine::new(true), Duration::from_secs(3600));
+        let collector = Collector::start(mock_engine(), Duration::from_secs(3600), false);
         let shared = Arc::clone(&collector.shared);
         let app = App::new(collector);
         let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
@@ -401,7 +409,7 @@ mod tests {
     /// flipping `Shared::mock` (what a real backend produces) asserts its absence.
     #[test]
     fn footer_mock_tag_tracks_data_source() {
-        let collector = Collector::start(Engine::new(true), Duration::from_secs(3600));
+        let collector = Collector::start(mock_engine(), Duration::from_secs(3600), false);
         let shared = Arc::clone(&collector.shared);
         let app = App::new(collector);
         let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
