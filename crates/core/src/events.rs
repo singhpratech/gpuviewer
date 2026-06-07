@@ -59,6 +59,17 @@ pub enum EventKind {
     /// A GPU-attached process is burning CPU while the GPU sits idle — the classic
     /// CPU-bound dataloader. An inference: always `Confidence::Likely`.
     CpuSpillover,
+    /// A recording session began folding history into the database — the flight
+    /// recorder's own power-on mark. Without it (and its stop twin) the timeline cannot
+    /// distinguish "the GPU sat idle" from "gpuviewer wasn't running": unrecorded time
+    /// renders blank, and the boundary events are what make that blank legible. Emitted
+    /// by the tui collector (it owns the recorder lifecycle). Always `Confidence::Fact`.
+    RecordingStarted,
+    /// The recording session ended cleanly (the stop mark and the partial rollup tail
+    /// reached the store). A session that dies without this mark — SIGKILL, OOM kill,
+    /// power loss — writes nothing, which is itself information: the NEXT session's
+    /// start mark narrates the missing stop. Always `Confidence::Fact`.
+    RecordingStopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

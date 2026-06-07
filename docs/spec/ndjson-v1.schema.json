@@ -122,7 +122,9 @@
             "hang_suspected",
             "cpu_spillover",
             "device_lost",
-            "device_returned"
+            "device_returned",
+            "recording_started",
+            "recording_stopped"
           ],
           "description": "All listed kinds are emitted today. Consumers must ignore kinds not in this list (new ones arrive additively per the compatibility promise)."
         },
