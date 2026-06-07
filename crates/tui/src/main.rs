@@ -2,8 +2,8 @@
 //!
 //! Modes:
 //!   gpuviewer                 interactive TUI
-//!   gpuviewer --json          stream one NDJSON frame per tick to stdout
-//!   gpuviewer --json --once   print a single frame and exit
+//!   gpuviewer --json          stream NDJSON v1 lines per tick to stdout
+//!   gpuviewer --json --once   print one frame line plus its event lines, then exit
 //!
 //! Flags: --mock (use only the simulated GPUs), --interval <ms> (default 1000, min 100).
 
@@ -14,7 +14,9 @@ mod ui;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use collector::{Collector, Engine};
+use collector::{Collector, Engine, FrameDevice};
+use gpuviewer_core::Event;
+use serde::Serialize;
 
 struct Args {
     json: bool,
@@ -83,10 +85,52 @@ fn main() -> Result<()> {
     }
 }
 
+/// NDJSON v1 envelopes (docs/spec/ndjson-v1.md; conformance: tests/ndjson_contract.rs).
+/// Each stdout line carries `"v":1` and a `"type"` discriminator so consumers can route
+/// lines without guessing from field shapes. `"v"` bumps only on breaking change.
+#[derive(Serialize)]
+struct FrameLine<'a> {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    ts_ms: u64,
+    devices: &'a [FrameDevice],
+}
+
+/// One line per event, emitted immediately after the frame line of the tick that produced
+/// it — events are not embedded in the frame, so `tail`-style consumers can filter by
+/// `"type"` alone.
+#[derive(Serialize)]
+struct EventLine<'a> {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(flatten)]
+    event: &'a Event,
+}
+
 fn run_json(mut engine: Engine, interval: Duration, once: bool) -> Result<()> {
     loop {
         let frame = engine.tick();
-        println!("{}", serde_json::to_string(&frame)?);
+        println!(
+            "{}",
+            serde_json::to_string(&FrameLine {
+                v: 1,
+                kind: "frame",
+                ts_ms: frame.ts_ms,
+                devices: &frame.devices,
+            })?
+        );
+        for event in &frame.events {
+            println!(
+                "{}",
+                serde_json::to_string(&EventLine {
+                    v: 1,
+                    kind: "event",
+                    event,
+                })?
+            );
+        }
         if once {
             return Ok(());
         }

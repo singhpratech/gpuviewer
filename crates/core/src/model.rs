@@ -148,6 +148,14 @@ pub struct ProcessSample {
     pub kind: ProcessKind,
     pub mem_bytes: Option<u64>,
     pub util_pct: Option<f32>,
+    /// Process CPU usage as % of one core (100.0 = one full core); `None` when unknown.
+    /// `serde(default)` so frames recorded before this field existed still deserialize.
+    #[serde(default)]
+    pub cpu_pct: Option<f32>,
+    /// Container identity if the process runs in one (e.g. `docker:1a2b3c4d5e6f`);
+    /// `None` for host processes or when unknown. `serde(default)` for old recordings.
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 pub fn now_ms() -> u64 {

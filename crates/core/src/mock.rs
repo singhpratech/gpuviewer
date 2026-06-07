@@ -243,6 +243,8 @@ impl TrainSim {
                 kind: ProcessKind::Compute,
                 mem_bytes: Some(self.vram_python as u64),
                 util_pct: Some(if idle { 1.0 } else { 96.0 }),
+                cpu_pct: None,
+                container: None,
             },
             ProcessSample {
                 pid: 1203,
@@ -250,6 +252,8 @@ impl TrainSim {
                 kind: ProcessKind::Graphics,
                 mem_bytes: Some(420 * 1024 * 1024),
                 util_pct: Some(2.0),
+                cpu_pct: None,
+                container: None,
             },
         ]
     }
@@ -301,6 +305,8 @@ impl DesktopSim {
             kind: ProcessKind::Graphics,
             mem_bytes: Some(610 * 1024 * 1024),
             util_pct: Some(3.0),
+            cpu_pct: None,
+            container: None,
         }];
         if self.ollama_present {
             v.push(ProcessSample {
@@ -309,6 +315,8 @@ impl DesktopSim {
                 kind: ProcessKind::Compute,
                 mem_bytes: Some(11 * GIB + 350 * 1024 * 1024),
                 util_pct: Some(74.0),
+                cpu_pct: None,
+                container: None,
             });
         }
         v

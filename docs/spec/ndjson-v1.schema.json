@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gpuviewer/gpuviewer/docs/spec/ndjson-v1.schema.json",
+  "title": "gpuviewer NDJSON contract v1",
+  "description": "One gpuviewer --json stdout line: a frame or an event. See ndjson-v1.md for semantics. Per the compatibility promise, additive fields may appear in any release, so no object here forbids additional properties; consumers must ignore unknown fields, unknown \"type\" values, and unknown \"kind\" values.",
+  "oneOf": [
+    { "$ref": "#/$defs/frameLine" },
+    { "$ref": "#/$defs/eventLine" }
+  ],
+  "$defs": {
+    "frameLine": {
+      "type": "object",
+      "required": ["v", "type", "ts_ms", "devices"],
+      "properties": {
+        "v": { "const": 1 },
+        "type": { "const": "frame" },
+        "ts_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unix epoch milliseconds; one timestamp per collection frame."
+        },
+        "devices": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/device" }
+        }
+      }
+    },
+    "device": {
+      "type": "object",
+      "required": ["id", "name", "mem_total_bytes", "sample", "processes"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable device identity (PCI address, or a prefixed key for non-PCI devices)."
+        },
+        "name": { "type": "string" },
+        "mem_total_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "sample": {
+          "oneOf": [{ "$ref": "#/$defs/sample" }, { "type": "null" }],
+          "description": "null when the device failed to answer this tick."
+        },
+        "processes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/process" }
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "required": ["ts_ms", "util_pct", "mem_used_bytes", "power_mw", "temp_c", "fan_pct", "sm_clock_mhz", "mem_clock_mhz", "encoder_pct", "decoder_pct", "throttle"],
+      "properties": {
+        "ts_ms": { "type": "integer", "minimum": 0 },
+        "util_pct": {
+          "type": ["number", "null"],
+          "description": "Duty-cycle (time >=1 kernel resident), NOT saturation."
+        },
+        "mem_used_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "power_mw": { "type": ["integer", "null"], "minimum": 0 },
+        "temp_c": { "type": ["number", "null"] },
+        "fan_pct": { "type": ["number", "null"] },
+        "sm_clock_mhz": { "type": ["integer", "null"], "minimum": 0 },
+        "mem_clock_mhz": { "type": ["integer", "null"], "minimum": 0 },
+        "encoder_pct": { "type": ["number", "null"] },
+        "decoder_pct": { "type": ["number", "null"] },
+        "throttle": { "$ref": "#/$defs/throttle" }
+      }
+    },
+    "throttle": {
+      "type": "object",
+      "required": ["thermal", "power_cap", "hw_slowdown", "sync_boost", "other"],
+      "properties": {
+        "thermal": { "type": "boolean" },
+        "power_cap": { "type": "boolean" },
+        "hw_slowdown": { "type": "boolean" },
+        "sync_boost": { "type": "boolean" },
+        "other": {
+          "type": "boolean",
+          "description": "Unknown future driver throttle bits land here, never dropped."
+        }
+      }
+    },
+    "process": {
+      "type": "object",
+      "required": ["pid", "name", "kind", "mem_bytes", "util_pct", "cpu_pct", "container"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string" },
+        "kind": { "enum": ["compute", "graphics", "both", "unknown"] },
+        "mem_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "util_pct": { "type": ["number", "null"] },
+        "cpu_pct": {
+          "type": ["number", "null"],
+          "description": "Percent of one core; 100.0 = one full core, can exceed 100 on multithreaded processes."
+        },
+        "container": {
+          "type": ["string", "null"],
+          "description": "Container identity (e.g. docker:1a2b3c4d5e6f); null for host processes or when unknown."
+        }
+      }
+    },
+    "eventLine": {
+      "type": "object",
+      "required": ["v", "type", "ts_ms", "device", "kind", "severity", "confidence", "title", "evidence"],
+      "properties": {
+        "v": { "const": 1 },
+        "type": { "const": "event" },
+        "ts_ms": { "type": "integer", "minimum": 0 },
+        "device": {
+          "type": "string",
+          "description": "Matches a frame device id."
+        },
+        "kind": {
+          "enum": [
+            "throttle_start",
+            "throttle_end",
+            "process_attached",
+            "process_exited",
+            "vram_pressure",
+            "idle_gap",
+            "collector_stall",
+            "history_reset",
+            "hang_suspected",
+            "cpu_spillover"
+          ],
+          "description": "collector_stall/history_reset/hang_suspected/cpu_spillover are reserved (documented, not yet emitted). Consumers must ignore kinds not in this list."
+        },
+        "severity": { "enum": ["info", "warning", "critical"] },
+        "confidence": {
+          "enum": ["fact", "likely"],
+          "description": "fact = observed state transition; likely = inference, hedged with \"likely\" in the title."
+        },
+        "title": { "type": "string" },
+        "evidence": { "type": "string" }
+      }
+    }
+  }
+}
