@@ -307,32 +307,38 @@ monitors (adaptive polling; low-power cadence surfaced in the footer).
 
 ### Keybinds
 
+Every navigation key has a letter alias — Mac laptops have no `PgUp`/`PgDn`/`Home`/`End`
+and terminals tend to eat the `Fn`+arrow substitutes. One rule across all modes:
+`w`/`a`/`s`/`d` mirror the arrows, `A`/`D` (shifted) mirror `PgUp`/`PgDn`, `g`/`G`
+mirror `Home`/`End`.
+
 | Live | |
 |---|---|
 | `q` / `Esc` | quit |
-| `←` `→` / `Tab` / `Shift-Tab` | switch device |
+| `←` `→` / `a` `d` / `Tab` / `Shift-Tab` | switch device |
 | `p` | pause/resume collection |
-| `↑` `↓` then `Enter` | jump to a story-feed event |
+| `↑` `↓` / `w` `s` then `Enter` | jump to a story-feed event |
 | `r` | replay at the newest recorded moment |
 | `t` | timeline overview |
-| `s` | chart style: braille ↔ solid |
+| `c` | chart style: braille ↔ solid |
 
 | Replay | |
 |---|---|
 | `Esc` / `r` | back to live (inert in `view` — a file has no live mode behind it) |
-| `←` `→` | scrub 10s |
-| `PgUp` / `PgDn` | scrub 5m |
-| `Home` | oldest recorded moment |
-| `↑` `↓` then `Enter` | jump to the selected event |
-| `t` / `s` | timeline · chart style |
+| `←` `→` / `a` `d` | scrub 10s |
+| `PgUp` / `PgDn` / `A` / `D` | scrub 5m |
+| `Home` / `g` | oldest recorded moment |
+| `End` / `G` | newest recorded moment |
+| `↑` `↓` / `w` `s` then `Enter` | jump to the selected event |
+| `t` / `c` | timeline · chart style |
 
 | Timeline | |
 |---|---|
 | `t` / `Esc` | back to live (to the pinned replay in `view` — a file has no live mode) |
 | `+` / `-` | zoom: 1h · 3h · 6h · 12h · 24h · 48h · 7d |
-| `←` `→` | move the time cursor (footer shows the nearest event) |
-| `PgUp` / `PgDn` | jump 10 columns |
-| `Home` / `End` | window edges |
+| `←` `→` / `a` `d` | move the time cursor (footer shows the nearest event) |
+| `PgUp` / `PgDn` / `A` / `D` | jump 10 columns |
+| `Home` / `End` / `g` / `G` | window edges |
 | `Tab` / `Shift-Tab` | switch device |
 | `Enter` | **drill into replay at the cursor** |
 
