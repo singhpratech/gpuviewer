@@ -278,7 +278,8 @@ struct ThrottleLayout {
     /// Offset of `indep_throttle_status` (ASIC-independent u64), when the version carries it.
     indep: Option<usize>,
     /// Offset of the legacy ASIC-specific `throttle_status` (u32). Decoded only as a coarse
-    /// "something is throttling" when no `indep` word exists.
+    /// "something is throttling" when no `indep` word exists — or when the `indep` word
+    /// reads as the firmware's 0xFF "never written" sentinel.
     legacy: Option<usize>,
     /// `sizeof` the struct (natural-aligned). The blob must be at least this big and its
     /// self-declared `structure_size` must match, or it is treated as absence.
@@ -354,58 +355,20 @@ fn throttle_layout(format: u8, content: u8) -> Option<ThrottleLayout> {
             size: 152,
         }),
         (2, 4) => Some(ThrottleLayout {
-            // v2.3 up to @152, then average cpu/soc/gfx voltage+current (6 u16)@152 → 164.
+            // v2.3 up to @152, then average cpu/soc/gfx voltage+current (6 u16)@152 → 164
+            // DATA bytes — but `sizeof` is 168, not 164: the struct's u64 members align the
+            // whole struct to 8, adding 4 tail-pad bytes, and the kernel sets
+            // structure_size = sizeof (smu_cmn.h). Real Van Gogh blobs (Steam Deck,
+            // kernel 6.6+ program-6 firmware) declare 168; gating on 164 rejected them all.
             indep: Some(120),
             legacy: Some(108),
-            size: 164,
+            size: 168,
         }),
-        // gpu_metrics_v3_0 (newer APU) drops the status bitfields for per-cause RESIDENCY
-        // counters; those are decoded separately by offset+name, not as a bitmask.
+        // gpu_metrics_v3_0 (newer APU) carries no instantaneous throttle word at all —
+        // see the explicit (3, 0) branch in `decode_gpu_metrics_throttle` for why its
+        // residency ACCUMULATORS cannot honestly decode from a single sample.
         _ => None,
     }
-}
-
-/// v3_0 throttle-residency counters (kgd_pp_interface.h `gpu_metrics_v3_0`). Each is a u32
-/// accumulator: nonzero means that throttler was active during the firmware's window. A
-/// counter is a fact, so these map to causes by name. Offsets walked under natural
-/// alignment (the struct's two interior pads — before `system_clock_counter` and before
-/// `average_apu_power` — are already accounted for upstream of these fields).
-struct V3ResidencyLayout {
-    prochot: usize,
-    spl: usize,
-    fppt: usize,
-    sppt: usize,
-    thm_core: usize,
-    thm_gfx: usize,
-    thm_soc: usize,
-    size: usize,
-}
-
-/// Resolve the v3_0 residency block, or `None` for any other revision.
-fn v3_residency_layout(format: u8, content: u8) -> Option<V3ResidencyLayout> {
-    if (format, content) != (3, 0) {
-        return None;
-    }
-    // Walk to current_gfx_maxfreq u16 @224 (the field just before the residency block):
-    //   header(4) temps gfx/soc(4)@4 core[16](32)@8 skin(2)@40 gfx_act/vcn(4)@42
-    //   ipu_act[8](16)@46 core_c0[16](32)@62 dram/ipu rd/wr(8)@94 → @102
-    //   pad(2)@102 system_clock_counter u64 @104 → @112
-    //   socket_power u32 @112 ipu_power u16 @116 pad(2)@118
-    //   apu/gfx/dgpu/all_core power(4×u32)@120 → @136
-    //   core_power[16](32)@136 sys_power/stapm/cur_stapm(6)@168 → @174
-    //   8 avg clocks(16)@174 → @190 coreclk[16](32)@190 → @222
-    //   core_maxfreq u16 @222, gfx_maxfreq u16 @224 → residency block @226.
-    Some(V3ResidencyLayout {
-        prochot: 226,
-        spl: 230,
-        fppt: 234,
-        sppt: 238,
-        thm_core: 242,
-        thm_gfx: 246,
-        thm_soc: 250,
-        // time_filter_alphavalue u32 @254 → 258; struct aligns to u64 → 264.
-        size: 264,
-    })
 }
 
 /// Decode AMD throttle status from a raw `gpu_metrics` sysfs blob.
@@ -426,11 +389,22 @@ fn v3_residency_layout(format: u8, content: u8) -> Option<V3ResidencyLayout> {
 /// never narrate a byte we are not certain of.
 ///
 /// Mapping precedence: prefer `indep_throttle_status` (ASIC-independent bits) and split it
-/// into thermal / power_cap / hw_slowdown / other. v3_0 has no status word — its per-cause
-/// residency counters are used instead. For older revisions that expose only the legacy
-/// ASIC-specific `throttle_status`, the per-bit meaning varies by ASIC and is not safe to
-/// map; a nonzero value reliably means "some throttler is active", so it surfaces as `other`
-/// alone rather than as a fabricated specific cause.
+/// into thermal / power_cap / hw_slowdown / other. For older revisions that expose only the
+/// legacy ASIC-specific `throttle_status`, the per-bit meaning varies by ASIC and is not
+/// safe to map; a nonzero value reliably means "some throttler is active", so it surfaces
+/// as `other` alone rather than as a fabricated specific cause.
+///
+/// 0xFF sentinel: the SMU memsets the whole metrics table to 0xFF before writing the
+/// fields this ASIC's firmware supports (smu_cmn.h), so an all-ones word — `u64::MAX`
+/// indep / `u32::MAX` legacy — is the firmware's "never wrote this" marker, NOT 64
+/// simultaneous throttlers. A sentinel word is unobservable: decoding falls through
+/// indep → legacy → `None` as each word in turn proves unwritten. Cyan Skillfish (BC-250
+/// class) is the known shipper: it emits v2_2 without ever writing `indep_throttle_status`,
+/// and without this guard every sample would narrate thermal+power+hw_slowdown+other,
+/// permanently.
+///
+/// v3_0 is recognised but its per-sample throttle decode is deliberately `None` — see the
+/// `(3, 0)` branch below.
 pub fn decode_gpu_metrics_throttle(buf: &[u8]) -> Option<ThrottleReasons> {
     // Common header: structure_size u16 @0, format_revision u8 @2, content_revision u8 @3.
     if buf.len() < HEADER_LEN {
@@ -455,36 +429,49 @@ pub fn decode_gpu_metrics_throttle(buf: &[u8]) -> Option<ThrottleReasons> {
         if let Some(off) = layout.indep {
             // An OOB read after the size gate would mean a wrong layout table, not a quiet
             // GPU — propagate the doubt as None rather than asserting all-false.
-            return read_u64_le(buf, off).map(map_indep_throttle);
+            let bits = read_u64_le(buf, off)?;
+            // All-ones is the SMU's 0xFF-memset "field never written" sentinel (see the
+            // doc comment): this word is unobservable — fall through to the legacy word
+            // rather than asserting every throttler active.
+            if bits != u64::MAX {
+                return Some(map_indep_throttle(bits));
+            }
         }
         if let Some(off) = layout.legacy {
             // Legacy throttle_status is ASIC-specific: nonzero = throttling, cause
             // unmappable. Honest coarse signal beats both silence and a guessed column;
             // a decoded zero is a genuine observation of quiet.
-            return read_u32_le(buf, off).map(|v| ThrottleReasons {
-                other: v != 0,
-                ..Default::default()
-            });
+            let v = read_u32_le(buf, off)?;
+            // All-ones is the same memset sentinel: "unsupported", not "throttling hard".
+            if v != u32::MAX {
+                return Some(ThrottleReasons {
+                    other: v != 0,
+                    ..Default::default()
+                });
+            }
         }
-        // A known version that carries no throttle word has nothing to observe here.
+        // Every throttle word this version carries was either absent or the 0xFF
+        // sentinel: this firmware exposes no throttle observation at all.
         return None;
     }
 
-    if let Some(r) = v3_residency_layout(format, content) {
-        if structure_size != r.size {
-            return None;
-        }
-        // Every counter must actually be readable: a missing field is layout doubt (None),
-        // never silently counted as "that throttler was quiet".
-        let any = |off: usize| read_u32_le(buf, off).map(|v| v != 0);
-        return Some(ThrottleReasons {
-            thermal: any(r.thm_core)? || any(r.thm_gfx)? || any(r.thm_soc)?,
-            // SPL/FPPT/SPPT are the APU power limits.
-            power_cap: any(r.spl)? || any(r.fppt)? || any(r.sppt)?,
-            hw_slowdown: any(r.prochot)?,
-            sync_boost: false,
-            other: false,
-        });
+    // gpu_metrics_v3_0 (Strix Point / Strix Halo / Krackan class APUs, kernel 6.7+) is
+    // recognised but deliberately NOT decoded into a per-sample throttle state. It drops
+    // the status bitfields entirely; what it carries instead are `throttle_residency_*`
+    // u32 fields (compiled offsets 228..252, behind a 2-byte pad after
+    // `current_gfx_maxfreq` u16 @224) that are firmware ACCUMULATOR counters —
+    // "incremented on every metrics table update while X was engaged"
+    // (smu14_driver_if_v14_0_0.h). A nonzero accumulator records that the throttler fired
+    // at SOME point in the firmware's window, not that it is active now: decoding
+    // raw-nonzero as "throttling" would turn one historic PROCHOT into a permanent
+    // hw_slowdown claim on every subsequent sample. Deriving a live state needs a
+    // watermark DELTA between two reads (the fdinfo engine-ns pattern), which this
+    // single-blob pure decoder cannot hold state for — so per the honesty contract the
+    // per-sample decode is None (unobservable), never a stale-nonzero false positive.
+    // (Any future stateful delta decoder must also treat u32::MAX counters as the 0xFF
+    // memset sentinel — unsupported, not saturated.)
+    if (format, content) == (3, 0) {
+        return None;
     }
 
     // Unknown future revision: we cannot observe throttling through a struct we cannot
@@ -1043,17 +1030,55 @@ mod tests {
         b
     }
 
-    /// Build a `gpu_metrics_v3_0` blob (size 264) with the named residency counters set.
+    /// Build a `gpu_metrics_v2_2` blob (size 128): legacy@108, indep@120. Cyan Skillfish
+    /// (BC-250 class) ships exactly this revision with `indep_throttle_status` never
+    /// written by firmware — it reads as the SMU's 0xFF-memset sentinel — so the builder
+    /// takes both words to let tests model that hardware.
+    fn build_v2_2(indep: u64, legacy: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 128];
+        b[0..2].copy_from_slice(&128u16.to_le_bytes());
+        b[2] = 2;
+        b[3] = 2;
+        b[108..112].copy_from_slice(&legacy.to_le_bytes());
+        b[112..114].copy_from_slice(&0xBEEFu16.to_le_bytes()); // fan_pwm decoy (adjacent)
+        b[120..128].copy_from_slice(&indep.to_le_bytes());
+        b
+    }
+
+    /// Build a `gpu_metrics_v2_4` blob at the kernel's real `sizeof` = **168**: 164 data
+    /// bytes (v2.3's 152 + 6×u16 avg voltage/current @152) plus 4 tail-pad bytes from the
+    /// struct's u64 alignment, with structure_size = sizeof (smu_cmn.h). Offsets are
+    /// hardcoded literals cross-checked against the audit's compiled offsetof — never
+    /// derived from `throttle_layout()`. Kernel-true decoys: the tail pad @164-167 is 0xFF
+    /// (the SMU memset) and the voltage/current block is nonzero, so a decoder gating on
+    /// 164 or misreading an offset fails loudly.
+    fn build_v2_4(indep: u64, legacy: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 168];
+        b[0..2].copy_from_slice(&168u16.to_le_bytes());
+        b[2] = 2;
+        b[3] = 4;
+        b[108..112].copy_from_slice(&legacy.to_le_bytes()); // legacy throttle_status
+        b[112..120].copy_from_slice(&(1u64 << 32).to_le_bytes()); // off-by-8 thermal decoy
+        b[120..128].copy_from_slice(&indep.to_le_bytes()); // the real indep word
+        b[152..164].copy_from_slice(&[0xAB; 12]); // avg voltage/current decoys (nonzero)
+        b[164..168].copy_from_slice(&[0xFF; 4]); // 0xFF'd tail pad — kernel-true
+        b
+    }
+
+    /// Build a `gpu_metrics_v3_0` blob (sizeof 264) with the named residency ACCUMULATORS
+    /// set at the compiler-verified offsets 228..252 — a 2-byte pad follows
+    /// `current_gfx_maxfreq` u16 @224. Kernel-true decoy: that pad @226-227 is 0xFF (the
+    /// SMU memset), exactly what an off-by−2 decoder would misread as a 0xFFFF prochot.
     fn build_v3_0(prochot: u32, spl: u32, thm_gfx: u32) -> Vec<u8> {
         let mut b = vec![0u8; 264];
         b[0..2].copy_from_slice(&264u16.to_le_bytes());
         b[2] = 3;
         b[3] = 0;
-        // decoy in current_gfx_maxfreq (@224), just before the residency block:
-        b[224..226].copy_from_slice(&0xBEEFu16.to_le_bytes());
-        b[226..230].copy_from_slice(&prochot.to_le_bytes());
-        b[230..234].copy_from_slice(&spl.to_le_bytes());
-        b[242..246].copy_from_slice(&thm_gfx.to_le_bytes()); // throttle_residency_thm_gfx
+        b[224..226].copy_from_slice(&2900u16.to_le_bytes()); // current_gfx_maxfreq decoy
+        b[226..228].copy_from_slice(&[0xFF, 0xFF]); // 0xFF'd pad — the killer decoy
+        b[228..232].copy_from_slice(&prochot.to_le_bytes()); // throttle_residency_prochot
+        b[232..236].copy_from_slice(&spl.to_le_bytes()); // throttle_residency_spl
+        b[248..252].copy_from_slice(&thm_gfx.to_le_bytes()); // throttle_residency_thm_gfx
         b
     }
 
@@ -1114,21 +1139,86 @@ mod tests {
     }
 
     #[test]
-    fn v3_residency_counters_map_by_name() {
-        // prochot residency → hw_slowdown, spl (power limit) → power_cap.
-        let t = decode_gpu_metrics_throttle(&build_v3_0(5, 9, 0))
-            .expect("well-formed v3_0 must decode");
-        assert!(t.hw_slowdown && t.power_cap);
-        assert!(!t.thermal && !t.other);
-        // thm_gfx residency → thermal.
-        let t = decode_gpu_metrics_throttle(&build_v3_0(0, 0, 3))
-            .expect("well-formed v3_0 must decode");
-        assert!(t.thermal);
-        assert!(!t.hw_slowdown && !t.power_cap);
-        // All-zero residency in a decoded struct is an OBSERVED quiet — Some(all-false).
+    fn v2_4_decodes_at_kernel_sizeof_168() {
+        // SPPT_APU (bit 7) is an APU power limit — the Van Gogh / Steam Deck case. The
+        // legacy decoy, off-by-8 thermal decoy, and 0xFF tail pad must all be ignored.
+        let t = decode_gpu_metrics_throttle(&build_v2_4(1 << SMU_THROTTLER_SPPT_APU_BIT, 0x40))
+            .expect("a real 168-byte v2_4 blob must decode");
+        assert!(t.power_cap);
+        assert!(!t.thermal && !t.hw_slowdown && !t.sync_boost && !t.other);
+    }
+
+    #[test]
+    fn v2_4_blob_claiming_164_is_rejected() {
+        // 164 was this decoder's old (wrong) gate: the kernel's sizeof is 168 because the
+        // struct's u64 members add 4 tail-pad bytes and structure_size = sizeof
+        // (smu_cmn.h). A blob declaring 164 is therefore NOT the struct we know —
+        // exact-size honesty rejects it (None), never best-effort decodes it.
+        let mut b = build_v2_4(1 << SMU_THROTTLER_SPPT_APU_BIT, 0);
+        b.truncate(164);
+        b[0..2].copy_from_slice(&164u16.to_le_bytes());
         assert_eq!(
-            decode_gpu_metrics_throttle(&build_v3_0(0, 0, 0)),
+            decode_gpu_metrics_throttle(&b),
+            None,
+            "a structure_size of 164 does not match v2_4's real sizeof"
+        );
+    }
+
+    #[test]
+    fn indep_all_ff_sentinel_falls_through_to_legacy() {
+        // Cyan Skillfish: v2_2 with indep_throttle_status never written → 0xFF…FF from
+        // the SMU memset. That means "word unsupported", NOT 64 simultaneous throttlers.
+        // With a quiet legacy word the decode is an OBSERVED quiet — Some(all-false) —
+        // never a permanent all-reasons-throttling narration.
+        assert_eq!(
+            decode_gpu_metrics_throttle(&build_v2_2(u64::MAX, 0)),
             Some(ThrottleReasons::default())
+        );
+        // A nonzero legacy word behind the sentinel still surfaces as coarse `other`.
+        let t = decode_gpu_metrics_throttle(&build_v2_2(u64::MAX, 0x2))
+            .expect("legacy word must still decode behind an indep sentinel");
+        assert!(t.other);
+        assert!(!t.thermal && !t.power_cap && !t.hw_slowdown && !t.sync_boost);
+        // The dGPU path falls through the same way: v1_3 with sentinel indep reads the
+        // legacy word at @68 (nonzero in the builder) → coarse `other`.
+        let t = decode_gpu_metrics_throttle(&build_v1_3(u64::MAX))
+            .expect("v1_3 legacy word must decode behind an indep sentinel");
+        assert!(t.other);
+        assert!(!t.thermal && !t.power_cap && !t.hw_slowdown && !t.sync_boost);
+    }
+
+    #[test]
+    fn all_words_sentinel_decodes_to_none() {
+        // Both words carry the 0xFF memset sentinel: this firmware exposes no throttle
+        // observation at all — unobservable (None), never Some(anything).
+        assert_eq!(
+            decode_gpu_metrics_throttle(&build_v2_2(u64::MAX, u32::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_only_sentinel_decodes_to_none() {
+        // v2_1 has no indep word; a 0xFF'd throttle_status means "unsupported", not
+        // "every ASIC-specific throttler active".
+        assert_eq!(decode_gpu_metrics_throttle(&build_v2_1(u32::MAX)), None);
+    }
+
+    #[test]
+    fn v3_residency_accumulators_never_assert_per_sample_throttle() {
+        // v3_0 carries only firmware accumulator counters (no status word): nonzero means
+        // "fired at some point in the firmware's window", which a single sample cannot
+        // turn into a live state. The per-sample decode is None (unobservable) — a
+        // historic PROCHOT must never narrate as a current hw_slowdown.
+        assert_eq!(decode_gpu_metrics_throttle(&build_v3_0(37, 9, 12)), None);
+        // All-zero accumulators are equally non-instantaneous — still None, not an
+        // asserted "observed quiet" fabricated from counters we cannot interpret
+        // per-sample. (The 0xFF'd pad @226-227 must never leak into any decode either.)
+        assert_eq!(decode_gpu_metrics_throttle(&build_v3_0(0, 0, 0)), None);
+        // Counters that are themselves the 0xFF memset sentinel change nothing: None.
+        assert_eq!(
+            decode_gpu_metrics_throttle(&build_v3_0(u32::MAX, u32::MAX, u32::MAX)),
+            None
         );
     }
 

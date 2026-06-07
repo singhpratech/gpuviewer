@@ -17,6 +17,36 @@ new captures taken per kernel/driver release.
 - `amd-igpu-minimal/` — an APU-style device exposing only the enumeration files
   (vendor, device, uevent): no hwmon, no `pp_dpm_*`, no VRAM/busy files, no `/proc`
   tree. Every optional metric must come back `None` without an error.
+- `amd-strixpoint-kernel6.10/` — models a Strix Point class APU (`1002:150e` — PCI id is
+  a placeholder, confirm at capture time) on kernel ~6.10: APU hwmon (edge `temp1` only,
+  `power1_average` plus a `power1_input` decoy that must stay un-preferred, no fan, no
+  `power1_cap`), `pp_dpm_*` tables, the 512 MiB UMA carve-out as `mem_info_vram_*` plus
+  `mem_info_gtt_*` files (unread today — pre-staged for the GTT work), and a
+  `gpu_metrics` **v3_0** blob (sizeof 264). The blob carries residency ACCUMULATORS at
+  the compiled offsets 228–255 (prochot=37, spl=9, sppt=4, thm_gfx=12, thm_soc=3), a
+  `current_gfx_maxfreq` decoy (2900) @224, and **the killer decoy: the 2-byte struct pad
+  @226–227 is 0xFF** (the SMU memsets the table before writing) — exactly what an
+  off-by-−2 decoder misreads as a 0xFFFF prochot. v3_0 has no instantaneous throttle
+  word, so the per-sample decode must be `None` despite the nonzero accumulators.
+- `amd-vangogh-steamdeck-kernel6.8/` — models a Van Gogh / Steam Deck APU (`1002:163f`)
+  on kernel 6.6+ program-6 firmware: hwmon with Van Gogh's unique `power1_label`=slowPPT
+  and a `power2_*`=fastPPT decoy channel (power1 must stay read), edge temp, no fan; the
+  1 GiB `mem_info_vram_*` carve-out plus 8 GiB `mem_info_gtt_*` (where Deck games really
+  allocate — unread today, never silently summed into VRAM); and a `gpu_metrics` **v2_4**
+  blob declaring `structure_size` = **168**, the kernel's real `sizeof` (164 data bytes +
+  4 u64-alignment tail-pad bytes, 0xFF'd kernel-true) — the regression fixture for the
+  164→168 size-gate fix that silently dropped every current-firmware Deck sample.
+  indep@120 = SPPT_APU; legacy@108 = 0x40 decoy; fan_pwm/padding @112–119 = 0xFF. `/proc`
+  has a game pid 1337 (gfx busy-ns, small VRAM, large GTT) and a media-only pid 2001
+  (`drm-engine-dec/enc` + GTT only — every unconsumed key must degrade to honest `None`).
+- `amd-cyanskillfish-bc250-kernel6.8/` — models a Cyan Skillfish / BC-250 class board
+  (`1002:13fe`, PCI id approximate) whose firmware emits `gpu_metrics` **v2_2** (128)
+  but **never writes `indep_throttle_status`**: bytes @120–127 are the SMU's 0xFF memset
+  sentinel (as are the unwritten fan_pwm/padding @112–119), while legacy
+  `throttle_status`@108 = 0 is a genuine observed quiet. The decode must fall through
+  the sentinel to `Some(all-false)` — before the sentinel guard this hardware narrated
+  thermal+power+hw_slowdown+other on every sample, permanently. Minimal sysfs otherwise
+  (no `pp_dpm_*`, no fan, no cap).
 - `intel-i915-kernel6.8/` — models an Arc A770 dGPU (DG2, `8086:56a0`) on the in-tree
   i915 driver around kernel 6.8: card-level `gt_act_freq_mhz`/`gt_cur_freq_mhz`/
   `gt_RP0_freq_mhz` and `lmem_total_bytes`, hwmon with `power1_max` (µW) and the
