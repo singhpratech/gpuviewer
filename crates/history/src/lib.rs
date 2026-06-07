@@ -15,8 +15,8 @@ use gpuviewer_core::{DeviceId, DynamicSample, Event, ProcessKind, ProcessSample}
 pub mod store;
 
 pub use store::{
-    DeviceRow, ExportCounts, ProcessRollup, SampleRollup, SqliteStore, StoreError, Tier,
-    RETAIN_10S_MS, RETAIN_1M_MS, RETAIN_EVENTS_MS, SCHEMA_VERSION,
+    DataSource, DeviceRow, ExportCounts, ProcessRollup, SampleRollup, SqliteStore, StoreError,
+    Tier, RETAIN_10S_MS, RETAIN_1M_MS, RETAIN_EVENTS_MS, SCHEMA_VERSION,
 };
 
 /// Fixed-capacity ring of samples for one device's live window.
@@ -1085,6 +1085,10 @@ mod tests {
 
         let (mock_store, _) = SqliteStore::open_default(true).unwrap();
         let (real_store, _) = SqliteStore::open_default(false).unwrap();
+        // open_default doubles as a recording open, so the default files carry the stamp
+        // their filename encodes — pre-marker defaults get retro-stamped the same way.
+        assert_eq!(mock_store.data_source().unwrap(), Some(DataSource::Mock));
+        assert_eq!(real_store.data_source().unwrap(), Some(DataSource::Real));
         let mock_name = mock_store.path().file_name().unwrap().to_str().unwrap();
         let real_name = real_store.path().file_name().unwrap().to_str().unwrap();
         assert!(
@@ -1112,6 +1116,135 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&scratch_dir);
+    }
+
+    // ===================================================================================
+    // Data-source stamp — the mock/--db contamination guard.
+    // ===================================================================================
+
+    /// A fresh database is stamped with the session's own source (both flavors), and the
+    /// normal next session — same source — keeps recording without friction.
+    #[test]
+    fn fresh_db_is_stamped_with_session_source() {
+        for source in [DataSource::Real, DataSource::Mock] {
+            let scratch = Scratch::new();
+            let (store, was_reset) = SqliteStore::open_recording(&scratch.path, source).unwrap();
+            assert!(!was_reset);
+            assert_eq!(store.data_source().unwrap(), Some(source));
+            drop(store);
+            let (store, _) = SqliteStore::open_recording(&scratch.path, source).unwrap();
+            assert_eq!(
+                store.data_source().unwrap(),
+                Some(source),
+                "a same-source reopen must keep the stamp"
+            );
+        }
+    }
+
+    /// Mock recording into a real-stamped database is refused with the exact actionable
+    /// message — naming the file, the mismatch, and the escape hatches — and the refused
+    /// open must leave the stamp untouched.
+    #[test]
+    fn mock_recording_into_real_db_is_refused() {
+        let scratch = Scratch::new();
+        drop(SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap());
+
+        let err = SqliteStore::open_recording(&scratch.path, DataSource::Mock).unwrap_err();
+        assert!(
+            matches!(err, StoreError::DataSourceMismatch { .. }),
+            "must refuse with DataSourceMismatch, got: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to record mock data into {} — it contains real history \
+                 (use --db elsewhere or --no-persist)",
+                scratch.path.display()
+            ),
+        );
+        // The refusal is a no-op on the file: still stamped real, still openable as real.
+        let reader = SqliteStore::open_readonly(&scratch.path).unwrap();
+        assert_eq!(reader.data_source().unwrap(), Some(DataSource::Real));
+    }
+
+    /// The reverse direction is just as forbidden: real samples hiding inside a mock file
+    /// would mislabel both recordings.
+    #[test]
+    fn real_recording_into_mock_db_is_refused() {
+        let scratch = Scratch::new();
+        drop(SqliteStore::open_recording(&scratch.path, DataSource::Mock).unwrap());
+
+        let err = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to record real data into"),
+            "wrong direction in message: {msg}"
+        );
+        assert!(
+            msg.contains("it contains mock history"),
+            "must name the db's flavor: {msg}"
+        );
+        assert!(
+            msg.contains(scratch.path.to_str().unwrap()),
+            "must name the file: {msg}"
+        );
+    }
+
+    /// Read-only opens never consult the stamp: replaying/reporting mock history is fine
+    /// (the UI labels it "(mock data)") — only co-mingled writes are forbidden. The reader
+    /// can still ASK what the file holds, without claiming it.
+    #[test]
+    fn readonly_open_ignores_the_data_source_stamp() {
+        let scratch = Scratch::new();
+        let (mut store, _) = SqliteStore::open_recording(&scratch.path, DataSource::Mock).unwrap();
+        store
+            .insert_events(&[event_at(
+                &dev("sim"),
+                5,
+                EventKind::ThrottleStart,
+                "likely simulated",
+            )])
+            .unwrap();
+        drop(store);
+
+        // open_readonly takes no source at all — that is the point: reads are unconditional.
+        let reader = SqliteStore::open_readonly(&scratch.path).unwrap();
+        assert_eq!(reader.events_between(0, 10).unwrap().len(), 1);
+        assert_eq!(reader.data_source().unwrap(), Some(DataSource::Mock));
+    }
+
+    /// A pre-marker (legacy) database — created before the stamp existed — is adopted by
+    /// the next recording session's own source with its contents intact, then enforced
+    /// from that stamp onward.
+    #[test]
+    fn legacy_unstamped_db_adopts_next_session_source() {
+        let scratch = Scratch::new();
+        {
+            // Plain `open` writes no stamp — exactly what a pre-marker gpuviewer left behind.
+            let (mut store, _) = SqliteStore::open(&scratch.path).unwrap();
+            assert_eq!(store.data_source().unwrap(), None, "legacy db has no stamp");
+            store
+                .insert_events(&[event_at(
+                    &dev("old"),
+                    3,
+                    EventKind::ThrottleEnd,
+                    "likely legacy",
+                )])
+                .unwrap();
+        }
+
+        let (store, _) = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+        assert_eq!(store.data_source().unwrap(), Some(DataSource::Real));
+        assert_eq!(
+            store.events_between(0, 10).unwrap().len(),
+            1,
+            "adoption must not disturb the legacy contents"
+        );
+        drop(store);
+
+        // From the stamp on, the other flavor is refused like any other mismatch.
+        let err = SqliteStore::open_recording(&scratch.path, DataSource::Mock).unwrap_err();
+        assert!(matches!(err, StoreError::DataSourceMismatch { .. }));
     }
 
     /// open_readonly lets a second connection read while the writer holds the db (WAL).

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gpuviewer_core::{now_ms, Confidence, DeviceId, Event, EventKind, Severity, Vendor};
-use gpuviewer_history::{SqliteStore, Tier};
+use gpuviewer_history::{DataSource, SqliteStore, Tier};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_gpuviewer"))
@@ -265,6 +265,88 @@ fn json_stream_ends_cleanly_when_the_consumer_hangs_up() {
         status.success(),
         "hangup must end the stream cleanly (exit 0), got {status:?}"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The mock/--db contamination guard at the CLI: pointing a --mock session at a database
+/// stamped `real` must be a clean startup refusal — exit nonzero, one actionable line on
+/// stderr naming the file — not a panic, and never a write. The --json path shares the
+/// guard, so that is the mode exercised (no tty needed); both directions are hardware-
+/// independent because the preflight runs before any backend probing.
+#[test]
+fn recording_refuses_cross_mode_db() {
+    let dir = scratch_dir("guard");
+
+    // Mock data into a real-stamped db: refused.
+    let real_db = dir.join("real-history.db");
+    drop(SqliteStore::open_recording(&real_db, DataSource::Real).unwrap());
+    let out = bin()
+        .args([
+            "--json",
+            "--once",
+            "--mock",
+            "--db",
+            real_db.to_str().unwrap(),
+        ])
+        .env("XDG_DATA_HOME", &dir)
+        .env("HOME", &dir)
+        .output()
+        .expect("failed to spawn gpuviewer");
+    assert!(
+        !out.status.success(),
+        "recording mock data into a real db must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to record mock data into")
+            && stderr.contains("real-history.db")
+            && stderr.contains("it contains real history"),
+        "the refusal must name the file and the mismatch: {stderr}"
+    );
+    // The refused run wrote nothing: still stamped real, still zero recorded rows.
+    let store = SqliteStore::open_readonly(&real_db).unwrap();
+    assert_eq!(store.data_source().unwrap(), Some(DataSource::Real));
+    assert!(
+        store.devices().unwrap().is_empty(),
+        "no mock device may have been registered into the real db"
+    );
+    assert!(store
+        .events_between(0, now_ms() + 3_600_000)
+        .unwrap()
+        .is_empty());
+    drop(store);
+
+    // The reverse: a real session pointed at a mock-stamped db is refused the same way.
+    let mock_db = dir.join("mock-history.db");
+    drop(SqliteStore::open_recording(&mock_db, DataSource::Mock).unwrap());
+    let out = bin()
+        .args(["--json", "--once", "--db", mock_db.to_str().unwrap()])
+        .env("XDG_DATA_HOME", &dir)
+        .env("HOME", &dir)
+        .output()
+        .expect("failed to spawn gpuviewer");
+    assert!(
+        !out.status.success(),
+        "recording real data into a mock db must exit nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to record real data into")
+            && stderr.contains("it contains mock history"),
+        "the reverse refusal must be just as explicit: {stderr}"
+    );
+
+    // Read-only paths ignore the stamp: `report` on the mock-stamped db still works.
+    let out = bin()
+        .args(["report", "--db", mock_db.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn gpuviewer");
+    assert!(
+        out.status.success(),
+        "report must read a mock-stamped db regardless; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }
 
