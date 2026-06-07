@@ -350,6 +350,94 @@ fn recording_refuses_cross_mode_db() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The instance lock at the CLI (the audit's duplicate-narration blocker): while one
+/// instance records to a --db, a second instance pointed at the same file must LOSE the
+/// lock but keep working — live-only, exit 0, the reason on stderr — and read-only modes
+/// (`report`) must run concurrently with the holder. Once the holder exits, the lock is
+/// free and the next recording open succeeds (flock semantics: the lock dies with the
+/// process, so nothing can wedge).
+#[test]
+fn second_instance_loses_the_lock_and_runs_live_only() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let dir = scratch_dir("lock");
+    let db = dir.join("shared-history.db");
+
+    // Instance 1: a long-running --json stream — the systemd-unit shape from the audit.
+    let mut holder = bin()
+        .args([
+            "--json",
+            "--mock",
+            "--interval",
+            "100",
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .env("XDG_DATA_HOME", &dir)
+        .env("HOME", &dir)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the holding instance");
+    // Its first frame line proves Engine::new completed — the store is open, the lock held.
+    // Keep the reader alive: dropping it would EPIPE the stream and end the holder early.
+    let mut holder_out = BufReader::new(holder.stdout.take().expect("stdout must be piped"));
+    let mut first_frame = String::new();
+    holder_out
+        .read_line(&mut first_frame)
+        .expect("the holder must emit a first frame");
+    assert!(first_frame.contains("\"frame\""), "got: {first_frame}");
+
+    // Instance 2, same --db: must still do its job (a frame on stdout, exit 0) while
+    // recording nothing, and must say WHY on stderr.
+    let out = bin()
+        .args(["--json", "--once", "--mock", "--db", db.to_str().unwrap()])
+        .env("XDG_DATA_HOME", &dir)
+        .env("HOME", &dir)
+        .output()
+        .expect("failed to spawn the losing instance");
+    assert!(
+        out.status.success(),
+        "the lock loser must keep working (live-only), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"frame\""),
+        "the loser must still emit its frame"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("another gpuviewer instance is already recording")
+            && stderr.contains("shared-history.db"),
+        "the loser must name the conflict and the file: {stderr}"
+    );
+    assert!(
+        stderr.contains("live-only"),
+        "the loser must say it is running live-only: {stderr}"
+    );
+
+    // Read-only modes are unrestricted while the lock is held.
+    let report = bin()
+        .args(["report", "--db", db.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn report");
+    assert!(
+        report.status.success(),
+        "report must read alongside a live recording; stderr: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+
+    // Holder exits -> kernel releases the lock -> the next recording open succeeds.
+    holder.kill().expect("kill holder");
+    holder.wait().expect("wait holder");
+    drop(
+        SqliteStore::open_recording(&db, DataSource::Mock)
+            .expect("the lock must be free once the holder is gone"),
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// --help documents the launch artifacts — demo/export/view must be discoverable.
 #[test]
 fn help_documents_the_launch_artifacts() {

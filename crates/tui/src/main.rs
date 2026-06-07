@@ -88,7 +88,9 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
       --no-persist    do not record history (the replay view and `report` need the recording)\n  \
       --db <path>     history database path (default: $XDG_DATA_HOME/gpuviewer/history.db).\n                  \
                       A database is stamped real or mock on first recording; recording the\n                  \
-                      other kind into it is refused so simulations never pollute real history\n  \
+                      other kind into it is refused so simulations never pollute real history.\n                  \
+                      Only ONE instance records to a database at a time — a second instance\n                  \
+                      runs live-only (read-only modes like report/view are unrestricted)\n  \
       --on-event <c>  run `sh -c <c>` for every emitted event, with GPV_EVENT_KIND,\n                  \
                       GPV_EVENT_SEVERITY, GPV_EVENT_CONFIDENCE, GPV_EVENT_TITLE,\n                  \
                       GPV_EVENT_EVIDENCE, GPV_EVENT_DEVICE, GPV_EVENT_TS_MS, GPV_EVENT_JSON\n                  \
@@ -355,7 +357,8 @@ fn main() -> Result<()> {
     } else {
         DataSource::Real
     };
-    if args.persist {
+    let mut persist = args.persist;
+    if persist {
         if let Some(db) = &args.db {
             match SqliteStore::open_recording(db, session_source) {
                 // Stamped/verified; drop the handle — the engine reopens it for the session.
@@ -365,6 +368,25 @@ fn main() -> Result<()> {
                 // engine's existing best-effort behavior — it retries the open itself and
                 // degrades to live-only with a stderr note rather than killing the view.
                 Err(e @ StoreError::DataSourceMismatch { .. }) => bail!("{e}"),
+                // The duplicate-narration blocker: a second instance recording into the
+                // SAME database would double-count every rollup bucket and narrate every
+                // event twice. The lock loser keeps WORKING — a monitor that refuses to
+                // monitor is worse than one that does not record — so it runs live-only
+                // with the reason on stderr (and the footer's "replay needs persistence"
+                // hint, the same plumbing --no-persist uses). Deciding here, rather than
+                // letting the engine race the holder for its own reopen, keeps the
+                // session deterministic even if the other instance exits a moment later.
+                // (The default, no---db paths get the same outcome inside the engine: its
+                // open fails with the Locked error and it degrades to live-only with the
+                // error printed.)
+                Err(e @ StoreError::Locked { .. }) => {
+                    eprintln!("gpuviewer: {e}");
+                    eprintln!(
+                        "gpuviewer: continuing live-only — history persistence disabled \
+                         for this session"
+                    );
+                    persist = false;
+                }
                 Err(_) => {}
             }
         }
@@ -373,9 +395,9 @@ fn main() -> Result<()> {
     let config = EngineConfig {
         force_mock: args.mock,
         // Persistence is on by default in the live modes (the wedge feature; --no-persist
-        // opts out). --mock records to a separate file so the demo/CI never pollute real
-        // flight history.
-        persist: args.persist,
+        // opts out, and losing the instance-lock race above turns it off too). --mock
+        // records to a separate file so the demo/CI never pollute real flight history.
+        persist,
         db_path: args.db.clone(),
         interval: args.interval,
         on_event: args.on_event.clone(),
@@ -387,7 +409,9 @@ fn main() -> Result<()> {
     // too. With an explicit --db just verified/stamped "real", ticking would contaminate
     // it, so refuse before the first tick (no samples or events have been recorded yet; a
     // default-path session already switched to history-mock.db inside the engine).
-    if args.persist && !args.mock && engine.mock_in_use() {
+    // `persist`, not `args.persist`: a lock loser records nothing, so there is nothing to
+    // contaminate — bailing would wrongly kill its live-only session.
+    if persist && !args.mock && engine.mock_in_use() {
         if let Some(db) = &args.db {
             bail!(
                 "no real GPU found — this session would record mock (simulated) data into {} \
@@ -793,6 +817,17 @@ fn run_demo(args: DemoArgs) -> Result<()> {
     // run: the demo must be reproducible, and it must never touch history.db (nor even the
     // mock file a real `--mock` session may be recording to).
     let path = default_data_dir()?.join("history-demo.db");
+    // Probe the instance lock BEFORE deleting: another live session may be recording to
+    // this very file (a second `demo`, or `--mock --db .../history-demo.db`), and deleting
+    // a recording out from under its writer is the destructive cousin of the audit's
+    // duplicate-narration blocker. The probe handle drops immediately and seed_demo
+    // re-locks; the instant between is a demo-only race we accept over threading a lock
+    // handle through the seeder. Any non-lock error (no file yet, corrupt leftovers) is
+    // exactly what the recreate below resolves.
+    if let Err(e @ StoreError::Locked { .. }) = SqliteStore::open_recording(&path, DataSource::Mock)
+    {
+        bail!("{e}");
+    }
     let _ = std::fs::remove_file(&path);
     for ext in ["-wal", "-shm"] {
         let mut side = path.as_os_str().to_os_string();
