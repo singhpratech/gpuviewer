@@ -2,6 +2,7 @@
 name = "gpuviewer-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Telemetry core for gpuviewer: vendor backends, data model, event derivation"

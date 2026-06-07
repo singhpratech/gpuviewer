@@ -5,6 +5,9 @@ members = ["crates/core", "crates/history", "crates/tui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Empirically verified: 1.95 is the oldest toolchain that builds the workspace
+# (libsqlite3-sys 0.38's build script uses `cfg_select!`, stabilized in 1.95).
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/singhpratech/gpuviewer"
 
@@ -16,12 +19,10 @@ serde_json = "1"
 anyhow = "1"
 ratatui = "0.30"
 chrono = "0.4"
-# Pinned to 0.39 (not the latest 0.40): rusqlite 0.40 pulls libsqlite3-sys 0.38, whose
-# build script uses the `cfg_select!` std macro, still unstable on this toolchain (rustc
-# 1.94.0, issue #115585). 0.39 -> libsqlite3-sys 0.37 builds cleanly. Bump to 0.40 once the
-# toolchain stabilizes cfg_select. `bundled` so SQLite is compiled in (no system lib, no
-# soname churn — same rationale as not linking librocm_smi64).
-rusqlite = { version = "0.39", features = ["bundled"] }
+# `bundled` so SQLite is compiled in (no system lib, no soname churn — same rationale as
+# not linking librocm_smi64). 0.40's libsqlite3-sys needs `cfg_select!` (stable since
+# rustc 1.95) — reflected in the workspace rust-version below.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"
