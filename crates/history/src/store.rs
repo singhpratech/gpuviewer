@@ -11,6 +11,10 @@
 //!   read as a real measurement and quietly lie on the replay chart — never do that.
 //! - WAL mode so the TUI's replay view can open a second read-only connection
 //!   ([`SqliteStore::open_readonly`]) while the collector keeps writing.
+//! - A `meta.data_source` stamp ("real"/"mock") guards every RECORDING open
+//!   ([`SqliteStore::open_recording`]): simulated sessions can never write into a real
+//!   recording, nor real sessions into a mock one. Reads ignore the stamp — replaying
+//!   mock history is fine (the UI labels it), only co-mingled writes are not.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpuviewer_core::{
     Confidence, DeviceId, Event, EventKind, ProcessKind, Severity, ThrottleReasons, Vendor,
 };
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 /// Schema version stamped into `PRAGMA user_version` and `meta.schema_version`. Bump when
 /// the table shape changes so a future migration step can branch on it.
@@ -53,6 +57,43 @@ impl Tier {
             Tier::TenSec => "samples_10s",
             Tier::OneMin => "samples_1m",
         }
+    }
+}
+
+/// Provenance of the rows a recording session writes: real hardware or the mock simulation.
+/// Stamped into `meta.data_source` on a database's first recording open and verified on every
+/// later one — the product's core asset is that the recording is trustworthy, so simulated
+/// samples must never be able to land in a real history file (nor real samples in a mock
+/// one), no matter where `--db` points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataSource {
+    /// Collected from real hardware backends.
+    Real,
+    /// Produced by the mock simulation (`--mock`, the no-GPU fallback, and `demo`).
+    Mock,
+}
+
+impl DataSource {
+    /// The token stored in `meta.data_source` (and printed in refusal messages).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DataSource::Real => "real",
+            DataSource::Mock => "mock",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "real" => Some(DataSource::Real),
+            "mock" => Some(DataSource::Mock),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DataSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -143,6 +184,16 @@ pub enum StoreError {
     /// `export_to` refused to clobber an existing output file — a .gpvr someone may
     /// already have shared must never be silently replaced.
     OutputExists(PathBuf),
+    /// A recording open found the database stamped with the OTHER data source. Writing
+    /// would silently corrupt the product's core asset (mock rows in a real recording, or
+    /// real rows hiding inside a simulation file), so it is refused before any row lands.
+    /// `db_source` keeps the raw stored token so an unrecognized future value still names
+    /// itself in the message instead of being mistaken for one of ours.
+    DataSourceMismatch {
+        path: PathBuf,
+        db_source: String,
+        session_source: DataSource,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -155,6 +206,16 @@ impl std::fmt::Display for StoreError {
             StoreError::OutputExists(p) => {
                 write!(f, "refusing to overwrite existing file {}", p.display())
             }
+            StoreError::DataSourceMismatch {
+                path,
+                db_source,
+                session_source,
+            } => write!(
+                f,
+                "refusing to record {session_source} data into {} — it contains {db_source} \
+                 history (use --db elsewhere or --no-persist)",
+                path.display()
+            ),
         }
     }
 }
@@ -169,6 +230,7 @@ impl From<rusqlite::Error> for StoreError {
 
 /// The writer connection plus its file path. The `Recorder` owns one of these; the replay
 /// view opens its own read-only connection via [`SqliteStore::open_readonly`].
+#[derive(Debug)]
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
@@ -205,17 +267,35 @@ impl SqliteStore {
         }
     }
 
-    /// Resolve the default history path and open it. `mock=true` selects a SEPARATE file
-    /// (`history-mock.db`) so simulated runs can NEVER contaminate the real recording —
-    /// the demo and CI must not pollute a user's flight history.
+    /// Open `path` for RECORDING as `source`, enforcing the data-source stamp: a fresh (or
+    /// pre-marker) database is stamped with this session's source; one stamped with the
+    /// OTHER source is refused ([`StoreError::DataSourceMismatch`]) before any row is
+    /// written. Read paths ([`Self::open_readonly`]) never consult the stamp — replaying
+    /// or reporting on mock history is fine (the UI labels it "(mock data)"), only
+    /// co-mingling WRITES is forbidden.
+    pub fn open_recording(
+        path: impl AsRef<Path>,
+        source: DataSource,
+    ) -> Result<(Self, bool), StoreError> {
+        let (store, was_reset) = Self::open(path)?;
+        store.claim_data_source(source)?;
+        Ok((store, was_reset))
+    }
+
+    /// Resolve the default history path and open it for recording. `mock=true` selects a
+    /// SEPARATE file (`history-mock.db`) so simulated runs can NEVER contaminate the real
+    /// recording — the demo and CI must not pollute a user's flight history. The same flag
+    /// doubles as the data-source stamp: the default files are only ever opened with the
+    /// mode their name encodes, so routing through [`Self::open_recording`] also
+    /// retro-stamps pre-marker default databases correctly.
     pub fn open_default(mock: bool) -> Result<(Self, bool), StoreError> {
         let dir = default_data_dir()?;
-        let file = if mock {
-            "history-mock.db"
+        let (file, source) = if mock {
+            ("history-mock.db", DataSource::Mock)
         } else {
-            "history.db"
+            ("history.db", DataSource::Real)
         };
-        Self::open(dir.join(file))
+        Self::open_recording(dir.join(file), source)
     }
 
     /// A second, read-only connection to an existing database. WAL mode lets this reader run
@@ -234,6 +314,21 @@ impl SqliteStore {
     /// The on-disk path of this store's database.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The database's data-source stamp, if it has one. `None` for a pre-marker file (or an
+    /// unrecognized token). Works on read-only connections — a viewer may want to label
+    /// what a file holds without ever claiming it.
+    pub fn data_source(&self) -> Result<Option<DataSource>, StoreError> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'data_source'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.as_deref().and_then(DataSource::parse))
     }
 
     // ---- open helpers ----
@@ -302,6 +397,43 @@ impl SqliteStore {
             params![now.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Verify (or establish) the `meta.data_source` stamp for a recording session.
+    ///
+    /// An absent stamp is claimed with the session's own source. One rule covers two cases:
+    /// - A fresh database: trivially correct — this session is its first writer.
+    /// - A pre-marker database (created before the stamp existed): we cannot know what it
+    ///   holds. The default-path files are unambiguous by construction (`history.db` only
+    ///   ever recorded real sessions; `history-mock.db`/`history-demo.db` only mock ones)
+    ///   and are always opened with the matching mode, so the self-stamp is exact there.
+    ///   An arbitrary `--db` file is unknowable — refusing it outright would brick every
+    ///   database existing users already have, so the conservative rule is: behave exactly
+    ///   as before this change for the adopting open, then enforce from the stamp onward.
+    fn claim_data_source(&self, source: DataSource) -> Result<(), StoreError> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'data_source'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            None => {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES ('data_source', ?1)",
+                    params![source.as_str()],
+                )?;
+                Ok(())
+            }
+            Some(s) if s == source.as_str() => Ok(()),
+            Some(s) => Err(StoreError::DataSourceMismatch {
+                path: self.path.clone(),
+                db_source: s,
+                session_source: source,
+            }),
+        }
     }
 
     // ---- writes (each batch is one transaction) ----

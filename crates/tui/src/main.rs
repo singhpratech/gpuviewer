@@ -26,7 +26,8 @@ use gpuviewer_core::{
     now_ms, Confidence, DeviceId, Event, EventEngine, EventKind, GpuBackend, Severity, StaticInfo,
 };
 use gpuviewer_history::{
-    DeviceRow, Recorder, SqliteStore, Tier, RETAIN_10S_MS, RETAIN_1M_MS, RETAIN_EVENTS_MS,
+    DataSource, DeviceRow, Recorder, SqliteStore, StoreError, Tier, RETAIN_10S_MS, RETAIN_1M_MS,
+    RETAIN_EVENTS_MS,
 };
 use serde::Serialize;
 
@@ -85,7 +86,9 @@ const HELP: &str = "gpuviewer — the GPU flight recorder\n\n\
       --no-backoff    disable the adaptive low-power cadence (idle GPUs are normally polled\n                  \
                       slower so polling does not keep them awake)\n  \
       --no-persist    do not record history (the replay view and `report` need the recording)\n  \
-      --db <path>     history database path (default: $XDG_DATA_HOME/gpuviewer/history.db)\n  \
+      --db <path>     history database path (default: $XDG_DATA_HOME/gpuviewer/history.db).\n                  \
+                      A database is stamped real or mock on first recording; recording the\n                  \
+                      other kind into it is refused so simulations never pollute real history\n  \
       --on-event <c>  run `sh -c <c>` for every emitted event, with GPV_EVENT_KIND,\n                  \
                       GPV_EVENT_SEVERITY, GPV_EVENT_CONFIDENCE, GPV_EVENT_TITLE,\n                  \
                       GPV_EVENT_EVIDENCE, GPV_EVENT_DEVICE, GPV_EVENT_TS_MS, GPV_EVENT_JSON\n                  \
@@ -339,6 +342,34 @@ fn main() -> Result<()> {
     }
 
     let args = parse_args()?;
+
+    // Contamination guard (the mock/--db hole): recording is always-on, and --db can point
+    // a --mock session at ANY database — including a user's real history.db. Every recording
+    // database carries a real/mock stamp; preflight the explicit --db here so a cross-mode
+    // open is refused with one clean error BEFORE the engine writes a single row. Both the
+    // TUI and --json paths flow through this. The default paths need no preflight: the
+    // engine resolves them per mode through `open_default`, which applies the same stamp
+    // rule itself (and mock already gets its own file there).
+    let session_source = if args.mock {
+        DataSource::Mock
+    } else {
+        DataSource::Real
+    };
+    if args.persist {
+        if let Some(db) = &args.db {
+            match SqliteStore::open_recording(db, session_source) {
+                // Stamped/verified; drop the handle — the engine reopens it for the session.
+                Ok(_) => {}
+                // The mismatch is the one error that MUST stop the run: recording would
+                // corrupt the file. Anything else (permissions, disk full) keeps the
+                // engine's existing best-effort behavior — it retries the open itself and
+                // degrades to live-only with a stderr note rather than killing the view.
+                Err(e @ StoreError::DataSourceMismatch { .. }) => bail!("{e}"),
+                Err(_) => {}
+            }
+        }
+    }
+
     let config = EngineConfig {
         force_mock: args.mock,
         // Persistence is on by default in the live modes (the wedge feature; --no-persist
@@ -350,6 +381,21 @@ fn main() -> Result<()> {
         on_event: args.on_event.clone(),
     };
     let engine = Engine::new(config);
+
+    // The preflight assumed --mock tells the whole story, but the mock backend is also the
+    // automatic fallback when no real GPU is found — that session records simulated data
+    // too. With an explicit --db just verified/stamped "real", ticking would contaminate
+    // it, so refuse before the first tick (no samples or events have been recorded yet; a
+    // default-path session already switched to history-mock.db inside the engine).
+    if args.persist && !args.mock && engine.mock_in_use() {
+        if let Some(db) = &args.db {
+            bail!(
+                "no real GPU found — this session would record mock (simulated) data into {} \
+                 (pass --mock with a separate --db, or --no-persist)",
+                db.display()
+            );
+        }
+    }
 
     if args.json {
         run_json(engine, args.interval, args.once)
@@ -793,7 +839,9 @@ fn run_demo(args: DemoArgs) -> Result<()> {
 /// indistinguishable from a recording that ran all morning. Returns `(events recorded,
 /// throttle episodes among them)`.
 fn seed_demo(path: &Path, from_ms: u64, to_ms: u64) -> Result<(usize, usize)> {
-    let (store, _) = SqliteStore::open(path)
+    // The demo is simulation — stamp the (freshly recreated) file `mock` so a later real
+    // session pointed at it with --db is refused instead of mixing hardware history in.
+    let (store, _) = SqliteStore::open_recording(path, DataSource::Mock)
         .map_err(|e| anyhow::anyhow!("cannot create demo database at {}: {e}", path.display()))?;
     let mut rec = Recorder::new(store);
     let mut mock = MockBackend::new();
