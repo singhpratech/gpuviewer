@@ -17,21 +17,37 @@ supporting market/API/stack evidence (researched June 2026, with issue numbers).
 cargo build                 # build all crates
 cargo test                  # all tests run against the mock backend — no GPU needed
 cargo test -p gpuviewer-core --lib          # single-crate tests
-cargo run --release -- --mock               # TUI with simulated GPUs (the demo)
-cargo run --release -- --json --once --mock # one NDJSON frame to stdout (CI/scripting)
+cargo run --release -- --mock               # TUI with simulated GPUs
+cargo run --release -- --json --once --mock # one NDJSON frame + events to stdout (CI/scripting)
 cargo run --release -- --json --mock --interval 100   # fast-forward sim, NDJSON stream
+cargo run --release -- demo                 # seed 8h of simulated history, open scrolled back
+cargo run --release -- demo --seed-only     # just build history-demo.db (no tty needed)
+cargo run --release -- report --since 12h   # plain-text digest of recorded history
+cargo run --release -- export --since 12h out.gpvr    # shareable incident slice
+cargo run --release -- view out.gpvr        # replay a .gpvr read-only, no GPU required
 ```
 
+Flags: `--db <path>` (history database, default `$XDG_DATA_HOME/gpuviewer/history.db`),
+`--no-persist` (disable recording — replay and `report` need it), `--no-backoff` (disable
+the adaptive idle cadence), `--on-event 'CMD'` (run a command per event with `GPV_EVENT_*`
+env vars, rate-capped).
+
 Binary is `gpuviewer` (crate `gpuviewer-tui`). With no real backend available the mock is
-the automatic fallback, so the TUI always renders.
+the automatic fallback, so the TUI always renders. Recording is always-on by default;
+`--mock` records to a separate `history-mock.db` and `demo` to `history-demo.db`, so
+simulations never pollute real history.
 
 ## Workspace layout
 
 - `crates/core` — model (`model.rs`), `GpuBackend` trait + registry (`backend.rs`),
   event derivation (`events.rs`), mock simulation (`mock.rs`). Zero deps except serde.
-- `crates/history` — `DeviceHistory` ring + `HistoryStore` (events log). SQLite rollups next.
-- `crates/tui` — `collector.rs` (Engine = tick loop shared by TUI thread and `--json` mode),
-  `app.rs` (event loop), `ui.rs` (tabs/charts/gauges/process table/story feed).
+- `crates/history` — `DeviceHistory` ring + `HistoryStore` (events log), plus the shipped
+  SQLite tier: `SqliteStore` (`store.rs` — 10s/1m rollups, event log, WAL, retention,
+  `.gpvr` export) and `Recorder` (folds frames into buckets).
+- `crates/tui` — `collector.rs` (Engine = tick loop shared by TUI thread and `--json` mode,
+  adaptive backoff, collector self-honesty events), `app.rs` (event loop: live + scroll-back
+  replay with event-anchored seek), `ui.rs` (tabs/charts/gauges/process table/story feed),
+  `main.rs` (CLI: `report`/`demo`/`export`/`view` subcommands, NDJSON emission).
 
 ## Roadmap sequencing (do not reorder casually)
 
@@ -89,7 +105,11 @@ macOS per-process GPU (OS-prohibited — see below).
 - `MockBackend` implements `GpuBackend` with scripted streams — all history/event/UI tests
   run against it.
 - sysfs/fdinfo collectors take a **root-dir parameter**; tests run against committed fixture
-  trees captured from real hardware (`tests/fixtures/`). Capture new fixtures per
-  kernel/driver release.
+  trees (`crates/core/tests/fixtures/`). Current trees are **synthetic** (hand-written,
+  with decoy values a wrong code path would read — see the fixtures README); replace/augment
+  with captures from real hardware per kernel/driver release.
+- The NDJSON contract has a conformance suite (`crates/tui/tests/ndjson_contract.rs`) that
+  runs the built binary and asserts the output against `docs/spec/ndjson-v1.md` +
+  `ndjson-v1.schema.json`. Stream changes must update spec, schema, and suite together.
 - NVML loader plumbing tested against a CI-built stub `.so` exporting NVML symbols.
 - Real-hardware smoke tests are a manual pre-release checklist, not CI.
