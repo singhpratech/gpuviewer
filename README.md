@@ -95,11 +95,21 @@ GPU1 (Radeon RX 7900 XTX): util avg 12% / max 87%, temp max 71°C, mem max 12.4 
 
 ## Install
 
-Packaged builds (Linux `tar.gz`/`.deb`/`.rpm`, Windows `zip`, macOS `tar.gz` — with
-checksums and build-provenance attestations) are produced per release tag. Every install
-path, platform note (Windows SmartScreen, macOS quarantine), and verification step lives
-in [`docs/packaging/installing.md`](docs/packaging/installing.md). Building from source
-always works: `cargo build --release`.
+```sh
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/singhpratech/gpuviewer/main/install.sh | sh
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/singhpratech/gpuviewer/main/install.ps1 | iex
+```
+
+The scripts verify the download's SHA256 against the release's checksum file before
+installing, drop a single binary in your user bin dir, and never need root/admin. They
+work once the first release is tagged; until then `cargo build --release` always does.
+
+Packaged builds (Linux `tar.gz`/`.deb`/`.rpm`/AppImage, Windows `zip`, macOS `tar.gz` —
+with checksums and build-provenance attestations) are produced per release tag. Every
+install path, platform note (Windows SmartScreen, macOS quarantine), and verification step
+lives in [`docs/packaging/installing.md`](docs/packaging/installing.md).
 
 ## Quick start
 

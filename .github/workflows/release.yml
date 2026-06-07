@@ -147,11 +147,31 @@ jobs:
           cargo generate-rpm -p crates/tui
           cp target/debian/*.deb target/generate-rpm/*.rpm dist/
 
+      # AppImage = the distro-agnostic channel: the .deb/.rpm above cover only the Debian
+      # and RHEL families, an AppImage runs on any glibc->=floor distro with no package
+      # manager and no root. It does NOT bundle glibc, so the same Ubuntu-22.04 glibc 2.35
+      # floor as the tarball applies. It deliberately does NOT bundle libnvidia-ml.so.1 —
+      # that lib is dlopen'd at runtime (host/driver specific), bundling a vendor driver lib
+      # is exactly the soname-churn trap the project avoids.
+      #
+      # appimagetool is SHA-pinned here (same SHA-pin culture as the action pins): CI passes
+      # a pre-fetched, verified copy via APPIMAGETOOL so make-appimage.sh skips its own
+      # download. We re-verify the SHA256 and fail the job on mismatch before handing it over.
+      - name: Build AppImage
+        run: |
+          APPIMAGETOOL_SHA256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          tool="$RUNNER_TEMP/appimagetool.AppImage"
+          curl -fsSL -o "$tool" \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "${APPIMAGETOOL_SHA256}  ${tool}" | sha256sum -c -
+          chmod +x "$tool"
+          APPIMAGETOOL="$tool" VERSION="${TAG#v}" OUT=dist tools/make-appimage.sh target/release/gpuviewer
+
       # Explicit patterns, not *: the glob must not pick up the checksum file itself.
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.deb *.rpm > "SHA256SUMS-${TARGET}"
+          sha256sum *.tar.gz *.deb *.rpm *.AppImage > "SHA256SUMS-${TARGET}"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -160,6 +180,7 @@ jobs:
             dist/*.tar.gz
             dist/*.deb
             dist/*.rpm
+            dist/*.AppImage
 
       - name: Upload to draft release
         env:
@@ -317,6 +338,7 @@ jobs:
             "gpuviewer-$V-x86_64-unknown-linux-gnu.tar.gz" \
             "gpuviewer_${V}-1_amd64.deb" \
             "gpuviewer-${V}-1.x86_64.rpm" \
+            "gpuviewer-$V-x86_64.AppImage" \
             "SHA256SUMS-x86_64-unknown-linux-gnu" \
             "gpuviewer-$V-x86_64-pc-windows-msvc.zip" \
             "SHA256SUMS-x86_64-pc-windows-msvc" \
