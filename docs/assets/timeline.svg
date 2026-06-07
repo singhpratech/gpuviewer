@@ -1,0 +1,244 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="956" height="608" viewBox="0 0 956 608" font-family="ui-monospace,SFMono-Regular,Menlo,&quot;DejaVu Sans Mono&quot;,Consolas,monospace" font-size="14px">
+<rect width="956" height="608" rx="10" fill="#161b22" stroke="#30363d"/>
+<circle cx="22" cy="18" r="6" fill="#ff5f57"/>
+<circle cx="42" cy="18" r="6" fill="#febc2e"/>
+<circle cx="62" cy="18" r="6" fill="#28c840"/>
+<text x="478" y="22" text-anchor="middle" fill="#8b949e" font-size="12px">gpuviewer demo — timeline (t) at 12h: the whole recording at a glance; unrecorded time stays blank</text>
+<rect x="8" y="38" width="940" height="556" rx="6" fill="#0d1117"/>
+<rect x="24.4" y="46.0" width="25.2" height="18" fill="#3fb950"/>
+<rect x="284.8" y="46.0" width="25.2" height="18" fill="#ff7b72"/>
+<rect x="24.4" y="82.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="100.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="118.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="136.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="154.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="172.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="190.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="208.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="226.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="244.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="24.4" y="262.0" width="907.2" height="18" fill="#39c5cf"/>
+<rect x="41.2" y="316.0" width="16.8" height="18" fill="#bc8cff"/>
+<rect x="91.6" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="133.6" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="184.0" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="226.0" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="268.0" y="316.0" width="16.8" height="18" fill="#bc8cff"/>
+<rect x="318.4" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="360.4" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="402.4" y="316.0" width="16.8" height="18" fill="#bc8cff"/>
+<rect x="452.8" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="494.8" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="536.8" y="316.0" width="16.8" height="18" fill="#bc8cff"/>
+<rect x="587.2" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="629.2" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="679.6" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="721.6" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="763.6" y="316.0" width="16.8" height="18" fill="#bc8cff"/>
+<rect x="814.0" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="856.0" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="906.4" y="316.0" width="8.4" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="334.0" width="33.6" height="18" fill="#bc8cff"/>
+<rect x="74.8" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="116.8" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="167.2" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="209.2" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="251.2" y="334.0" width="33.6" height="18" fill="#bc8cff"/>
+<rect x="301.6" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="343.6" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="385.6" y="334.0" width="33.6" height="18" fill="#bc8cff"/>
+<rect x="436.0" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="478.0" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="528.4" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="570.4" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="612.4" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="662.8" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="704.8" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="746.8" y="334.0" width="33.6" height="18" fill="#bc8cff"/>
+<rect x="797.2" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="839.2" y="334.0" width="25.2" height="18" fill="#bc8cff"/>
+<rect x="881.2" y="334.0" width="33.6" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="352.0" width="117.6" height="18" fill="#bc8cff"/>
+<rect x="150.4" y="352.0" width="218.4" height="18" fill="#bc8cff"/>
+<rect x="377.2" y="352.0" width="126.0" height="18" fill="#bc8cff"/>
+<rect x="511.6" y="352.0" width="126.0" height="18" fill="#bc8cff"/>
+<rect x="646.0" y="352.0" width="218.4" height="18" fill="#bc8cff"/>
+<rect x="872.8" y="352.0" width="58.8" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="370.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="388.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="406.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="424.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="442.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="460.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="478.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="24.4" y="496.0" width="907.2" height="18" fill="#bc8cff"/>
+<rect x="923.2" y="532.0" width="8.4" height="18" fill="#e3b341"/>
+<text x="24.4" y="59.5" fill="#6e7681" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="600" text-decoration="underline"> 0</text>
+<text x="49.6" y="59.5" fill="#c9d1d9" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="600" text-decoration="underline"> GeForce RTX 4090 (mock)</text>
+<text x="268.0" y="59.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="293.2" y="59.5" fill="#484f58" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1</text>
+<text x="318.4" y="59.5" fill="#c9d1d9" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Radeon RX 7900 XTX (mock)</text>
+<text x="16.0" y="77.5" fill="#c9d1d9" textLength="924.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ util % — peak per col, 1 col ≈ 4m26s — TIMELINE ───────────────────────────────────────────────────────────┐</text>
+<text x="16.0" y="95.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="95.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="95.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="113.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="113.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="113.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="131.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="131.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="131.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="149.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="149.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="149.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="167.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="167.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="167.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="185.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="185.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="185.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="203.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="203.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="203.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="221.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="221.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="221.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="239.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="239.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="239.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="257.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="257.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="257.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="275.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="275.5" fill="#39c5cf" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="275.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="293.5" fill="#c9d1d9" textLength="924.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="16.0" y="311.5" fill="#c9d1d9" textLength="924.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ vram / 24.0 GiB — peak per col, 1 col ≈ 4m26s — TIMELINE ──────────────────────────────────────────────────┐</text>
+<text x="16.0" y="329.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="41.2" y="329.5" fill="#bc8cff" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██</text>
+<text x="83.2" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="91.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="125.2" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="133.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="167.2" y="329.5" fill="#bc8cff" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄▄</text>
+<text x="184.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="217.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="226.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="259.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="268.0" y="329.5" fill="#bc8cff" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██</text>
+<text x="310.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="318.4" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="352.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="360.4" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="394.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="402.4" y="329.5" fill="#bc8cff" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██</text>
+<text x="444.4" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="452.8" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="486.4" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="494.8" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="528.4" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="536.8" y="329.5" fill="#bc8cff" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██</text>
+<text x="578.8" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="587.2" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="620.8" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="629.2" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="671.2" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="679.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="713.2" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="721.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="755.2" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="763.6" y="329.5" fill="#bc8cff" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██</text>
+<text x="805.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="814.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="847.6" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="856.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="898.0" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="906.4" y="329.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█</text>
+<text x="931.6" y="329.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="347.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="347.5" fill="#bc8cff" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████</text>
+<text x="66.4" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="74.8" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="108.4" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="116.8" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="158.8" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="167.2" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="200.8" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="209.2" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="242.8" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="251.2" y="347.5" fill="#bc8cff" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████</text>
+<text x="293.2" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="301.6" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="335.2" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="343.6" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="377.2" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="385.6" y="347.5" fill="#bc8cff" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████</text>
+<text x="427.6" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="436.0" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="469.6" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="478.0" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="511.6" y="347.5" fill="#bc8cff" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄▄</text>
+<text x="528.4" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="562.0" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="570.4" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="604.0" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="612.4" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="654.4" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="662.8" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="696.4" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="704.8" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="738.4" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="746.8" y="347.5" fill="#bc8cff" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████</text>
+<text x="788.8" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="797.2" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="830.8" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="839.2" y="347.5" fill="#bc8cff" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███</text>
+<text x="881.2" y="347.5" fill="#bc8cff" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████</text>
+<text x="923.2" y="347.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="931.6" y="347.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="365.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="365.5" fill="#bc8cff" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██████████████</text>
+<text x="142.0" y="365.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="150.4" y="365.5" fill="#bc8cff" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██████████████████████████</text>
+<text x="368.8" y="365.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="377.2" y="365.5" fill="#bc8cff" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███████████████</text>
+<text x="503.2" y="365.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="511.6" y="365.5" fill="#bc8cff" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███████████████</text>
+<text x="637.6" y="365.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="646.0" y="365.5" fill="#bc8cff" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██████████████████████████</text>
+<text x="864.4" y="365.5" fill="#bc8cff" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▄</text>
+<text x="872.8" y="365.5" fill="#bc8cff" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███████</text>
+<text x="931.6" y="365.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="383.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="383.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="383.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="401.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="401.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="401.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="419.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="419.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="419.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="437.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="437.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="437.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="455.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="455.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="455.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="473.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="473.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="473.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="491.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="491.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="491.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="509.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="24.4" y="509.5" fill="#bc8cff" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">████████████████████████████████████████████████████████████████████████████████████████████████████████████</text>
+<text x="931.6" y="509.5" fill="#c9d1d9" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="16.0" y="527.5" fill="#c9d1d9" textLength="924.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="24.4" y="545.5" fill="#e3b341" textLength="898.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="600">+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++</text>
+<text x="923.2" y="545.5" fill="#0d1117" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="600">+</text>
+<text x="24.4" y="563.5" fill="#56d4dd" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="600">cursor 09:12:27</text>
+<text x="158.8" y="563.5" fill="#c9d1d9" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">· util 99% · vram 20.4 GiB</text>
+<text x="385.6" y="563.5" fill="#6e7681" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">· nearest 09:12:27</text>
+<text x="545.2" y="563.5" fill="#d29922" textLength="394.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">⚠ GPU0 began throttling (thermal) — clocks 2507</text>
+<text x="24.4" y="581.5" fill="#6e7681" textLength="915.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">TIMELINE 12h (8h recorded)  t/esc live · +/- zoom · ←/→ cursor · pgup/pgdn jump · home/end · enter drill to r</text>
+</svg>

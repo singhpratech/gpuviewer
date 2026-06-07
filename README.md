@@ -1,36 +1,80 @@
-# gpuviewer — the GPU flight recorder
+<div align="center">
 
-> **It was already recording. Scroll back to 02:14 — it'll tell you why.**
+# gpuviewer
 
-gpuviewer is a Linux GPU monitor (NVIDIA · AMD · Intel) that records persistent, per-process
-history and a narrated event log **just by being open** — no daemon to install, no recording
-you had to remember to start. When last night's training run stalled, you scroll back through
-the timeline to the moment it happened and read the story: the throttle onset with clock
-deltas, the VRAM climb with an ETA, the process that exited and what it freed. Facts are
-asserted plainly; inferences are always labeled **"likely"** and expand to the raw evidence
-behind them. One unprivileged binary.
+### — the GPU flight recorder —
 
-## Quick start
+**It was already recording. Scroll back to 02:14 — it'll tell you why.**
 
-```sh
-cargo run --release -- --mock        # the TUI on simulated GPUs — no hardware needed
-```
+[![CI](https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Platform](https://img.shields.io/badge/platform-Linux-success)](#status)
+[![Vendors](https://img.shields.io/badge/GPUs-NVIDIA%20·%20AMD%20·%20Intel-76b900)](#status)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-f74c00?logo=rust&logoColor=white)](#architecture)
 
-(`--mock` is also the automatic fallback when no GPU is found; mock data is always labeled
-"(mock data)" and records to a separate database, never your real history.)
+</div>
 
-**The demo.** Seeds 8 hours of simulated history — throttle episodes, training idle gaps, a
-VRAM climb toward the cap, an `ollama` attach/exit cycle — into its own database, then opens
-the TUI **already scrolled back to the last throttle onset**. The first thing you see is the
-answer to "why did it slow down", not a live gauge:
+---
 
-```sh
-cargo run --release -- demo
-```
+Your training run stalled at 02:14. You were asleep. Every other monitor would have shown
+you a beautiful live gauge — of a moment that no longer exists.
 
-**The morning-after digest.** Plain text, no ANSI, paste-able into Slack or a bug report:
+**gpuviewer** is a Linux GPU monitor (NVIDIA · AMD · Intel) that records persistent,
+per-process history and a narrated event log **just by being open** — no daemon to install,
+no recording you had to remember to start. The next morning you scroll back to the moment
+it happened and read the story: the throttle onset with clock deltas, the VRAM climb with
+an ETA, the process that exited and what it freed. Facts are asserted plainly; inferences
+are always labeled **"likely"** and expand to the raw evidence behind them. One
+unprivileged binary.
 
-```sh
+<p align="center">
+  <img src="docs/assets/replay.svg" width="920" alt="gpuviewer replay view: braille charts, process table, throttling gauges, and the narrated story feed, scrolled back to a throttle onset">
+</p>
+<p align="center"><sub><em>The built-in demo (<code>gpuviewer demo</code>, simulated data, labeled as such) opens
+already scrolled back to the night's last throttle onset — the first thing you see is the answer, not a gauge.</em></sub></p>
+
+## Three altitudes on one recording
+
+| | view | question it answers |
+|---|---|---|
+| 🔭 | **Timeline** (`t`) | *"What did the whole night look like?"* — hours of history as solid strips, event markers underneath |
+| 🎞️ | **Replay** (`r`, or `Enter` on anything) | *"What exactly happened at 02:14?"* — full charts, processes, gauges, story feed at any recorded moment |
+| 📡 | **Live** | *"What is it doing right now?"* — and it's recording the other two views while you watch |
+
+You move between them with single keys: spot the anomaly on the timeline, `Enter` to drill
+into replay at that exact column, `Esc` back to live. The cursor line always shows the
+nearest recorded event.
+
+<p align="center">
+  <img src="docs/assets/timeline.svg" width="920" alt="gpuviewer timeline view: hours of utilization and VRAM history as solid strips with an event lane and time cursor">
+</p>
+<p align="center"><sub><em>The timeline zooms from 1h to 7d (<code>+</code>/<code>-</code>). Each column is the recorded peak —
+and time that wasn't recorded stays <strong>blank</strong>, never painted as zero. The footer says exactly how much is real: "12h (8h recorded)".</em></sub></p>
+
+## What it tells you
+
+Example narrations, in the exact shape the event engine emits them. The tag is the
+confidence tier: facts are observed state transitions; inferences always say "likely" in
+the sentence itself and carry the raw numbers in an auditable evidence field.
+
+- `[fact]` GPU0 began throttling (thermal) — clocks 2520→1815 MHz
+- `[fact]` GPU0 stopped throttling after 1m 31s
+- `[likely]` GPU0 VRAM 92% and climbing ~270 MiB/min — likely full in ~8 min (largest holder: python pid 4521)
+- `[likely]` GPU0 sat idle 47s while python (pid 4521) stayed attached — likely a dataloader or checkpoint stall
+- `[likely]` GPU0: python (pid 4521) likely hung — held 20.1 GiB for 10m 12s with zero GPU activity, process still alive
+- `[likely]` ollama (pid 7777) loaded 11.3 GiB but GPU1 is ~idle while its CPU runs hot — likely partial CPU offload (model may not fit in VRAM)
+- `[fact]` collection stalled 4.2s — a backend probe blocked; the data gap is recorded, last good frame at 02:14:31
+- `[fact]` python (pid 4521) left GPU0, freeing 21.3 GiB
+
+Inference thresholds are deliberately conservative — a hang is only narrated after ten
+unbroken minutes of held VRAM with zero engine activity, and any break in the premise drops
+the claim silently. A confidently-wrong narration is worse than no narration.
+
+## The morning-after digest
+
+Plain text, no ANSI, paste-able into Slack or a bug report:
+
+```console
 $ gpuviewer report --since 22:00
 gpuviewer report — 2026-06-06 22:00 .. 2026-06-07 08:41 (23 events: 17 facts, 6 inferences)
 
@@ -45,15 +89,33 @@ GPU1 (Radeon RX 7900 XTX): util avg 12% / max 87%, temp max 71°C, mem max 12.4 
 06:58:40  INFO  [fact]    python (pid 4521) left GPU0, freeing 21.3 GiB
 ```
 
+## Quick start
+
+```sh
+cargo build --release                # binary at target/release/gpuviewer
+gpuviewer                            # live TUI — already recording
+gpuviewer demo                       # 8h simulated incident, opens at the throttle onset
+gpuviewer report --since 12h         # the digest above, from your real history
+gpuviewer export --since 2h oom.gpvr # shareable incident slice
+gpuviewer view oom.gpvr              # replays anywhere — no GPU required
+```
+
+No GPU? No problem — `--mock` (also the automatic fallback) runs the full TUI on simulated
+GPUs. Mock data is always labeled "(mock data)" and records to a separate database, never
+your real history.
+
 **Scripting and agents.** One NDJSON frame per tick plus that tick's narrated events, every
 metric nullable, versioned and conformance-tested:
 
 ```sh
-gpuviewer --json --once --mock       # one frame + its events to stdout, then exit 0
+gpuviewer --json --once              # one frame + its events to stdout, then exit 0
 ```
 
 The stream contract — frames *and* events in one timestamped stream, JSON Schema, written
-compatibility promise — is [`docs/spec/ndjson-v1.md`](docs/spec/ndjson-v1.md).
+compatibility promise — is [`docs/spec/ndjson-v1.md`](docs/spec/ndjson-v1.md). Events can
+also drive your own plumbing: `--on-event 'CMD'` runs a command per event with
+`GPV_EVENT_*` in the environment (rate-capped), e.g.
+`--on-event 'curl -s -d "$GPV_EVENT_TITLE" ntfy.sh/mytopic'`.
 
 ## How it compares
 
@@ -93,30 +155,10 @@ If one of those fits your problem better, use it — LACT for fan/OC control, ne
 fleet dashboards, gpud for cluster health verdicts. (Cells reflect our reading of each tool
 as of June 2026; corrections welcome.)
 
-## What it tells you
-
-Example narrations, in the exact shape the event engine emits them. The tag is the
-confidence tier: facts are observed state transitions; inferences always say "likely" in
-the sentence itself and carry the raw numbers in an auditable evidence field.
-
-- `[fact]` GPU0 began throttling (thermal) — clocks 2520→1815 MHz
-- `[fact]` GPU0 stopped throttling after 1m 31s
-- `[likely]` GPU0 VRAM 92% and climbing ~270 MiB/min — likely full in ~8 min (largest holder: python pid 4521)
-- `[likely]` GPU0 sat idle 47s while python (pid 4521) stayed attached — likely a dataloader or checkpoint stall
-- `[likely]` GPU0: python (pid 4521) likely hung — held 20.1 GiB for 10m 12s with zero GPU activity, process still alive
-- `[likely]` ollama (pid 7777) loaded 11.3 GiB but GPU1 is ~idle while its CPU runs hot — likely partial CPU offload (model may not fit in VRAM)
-- `[fact]` collection stalled 4.2s — a backend probe blocked; the data gap is recorded, last good frame at 02:14:31
-- `[fact]` python (pid 4521) left GPU0, freeing 21.3 GiB
-
-Inference thresholds are deliberately conservative — a hang is only narrated after ten
-unbroken minutes of held VRAM with zero engine activity, and any break in the premise drops
-the claim silently. A confidently-wrong narration is worse than no narration.
-
-Events can also drive your own plumbing: `--on-event 'CMD'` runs a command for every emitted
-event with `GPV_EVENT_*` variables in the environment (rate-capped), e.g.
-`--on-event 'curl -s -d "$GPV_EVENT_TITLE" ntfy.sh/mytopic'`.
-
 ## The honesty contract
+
+A flight recorder you can't trust is decoration. Every design decision below exists because
+a confidently-wrong number would kill the whole premise:
 
 - **Facts vs inferences.** Every event carries `confidence: fact | likely`. Facts (a
   throttle bit set, a process gone from the list) are asserted plainly. Inferences (stall,
@@ -132,6 +174,8 @@ event with `GPV_EVENT_*` variables in the environment (rate-capped), e.g.
   process pane says so; without root/`CAP_SYS_PTRACE`, fdinfo can only attribute your own
   processes and the pane shows a "your processes only" hint rather than pretending the list
   is complete.
+- **Unrecorded time renders blank.** On the timeline and every chart, a gap in the recording
+  is a visible hole — never interpolated, never painted as zero activity.
 - **The recorder reports on itself.** A blocked driver probe or missed tick becomes a
   recorded `[fact]` event ("collection stalled … the data gap is recorded") — a hole in the
   recording never masquerades as the GPU having gone quiet. A quarantined-and-recreated
@@ -150,10 +194,34 @@ event with `GPV_EVENT_*` variables in the environment (rate-capped), e.g.
 - **No vendor SDK is hard-linked, no vendor CLI is exec'd.** NVML is loaded at runtime; AMD
   and Intel are read straight from the kernel's sysfs/fdinfo interfaces.
 
+## The journey
+
+This project was built research-first, and the research is in the repo:
+
+1. **Study the field before writing code.** [`docs/research/`](docs/research/) holds the
+   June-2026 evidence — the market gap, every competitor's actual capabilities (with issue
+   numbers), the vendor API minefield, and the stack decision record
+   ([`04-synthesis.md`](docs/research/04-synthesis.md)). The architecture wasn't guessed;
+   it was argued in writing.
+2. **Learn from other people's scars.** No vendor SDK is hard-linked because soname churn
+   broke btop on AMD twice. NVML is loaded by its versioned name (`libnvidia-ml.so.1`)
+   because the bare `.so` only exists with the CUDA toolkit installed. Polling is adaptive
+   because monitoring tools have kept GPUs awake (bottom #1291) and broken GFXOFF. WSL2's
+   per-process wall is detected and explained because crashing on it is a known trap
+   (nvtop #459).
+3. **Mock-first, so everything is testable.** The full suite passes on machines with no
+   GPU: a deterministic mock backend implements the same trait as the real ones, sysfs/fdinfo
+   collectors read from committed fixture trees, and the NDJSON contract has a conformance
+   suite that runs the built binary against the spec.
+4. **Ship the recorder, then the narrator, then the time machine.** History rollups came
+   first, then the event engine with the facts-vs-likely contract, then scroll-back replay,
+   then `.gpvr` export, and most recently the zoomed-out timeline — each layer riding on the
+   one before it.
+
 ## Status
 
-**Working pre-release (v0.1.0) — Linux.** Build from source: `cargo build --release`
-(binary at `target/release/gpuviewer`); no packaged binaries yet.
+**Working pre-release (v0.1.0) — Linux.** Build from source: `cargo build --release`;
+no packaged binaries yet.
 
 Shipped — in the binary today:
 
@@ -165,12 +233,17 @@ Shipped — in the binary today:
   per-process rollups (memory, util, CPU%, container identity when knowable), retention
   sweeps, and corrupt-database quarantine. Raw 1 Hz samples never touch disk — the live
   window rides in RAM rings.
-- **Scroll-back replay:** `r` from the live view, or Enter on any event in the story feed to
-  jump straight to it; scrub by 10s/5m; works on your real history, the demo, and exported
-  recordings.
+- **Timeline overview:** the whole recording as solid strips, 1h–7d zoom, peak-per-column
+  (labeled as such), event lane, time cursor with nearest-event readout, `Enter` drills into
+  replay at the cursor. Gaps stay blank.
+- **Scroll-back replay:** `r` from the live view, or `Enter` on any event in the story feed
+  to jump straight to it; scrub by 10s/5m; works on your real history, the demo, and
+  exported recordings.
 - **Narrated events:** throttle onset/recovery with clock deltas, process attach/exit with
   freed VRAM, VRAM-pressure ETA, idle gap, suspected hang, CPU spillover, collector
   stall/slow-probe self-reports, history reset.
+- **Chart styles:** braille step-outline (default) or solid fill — `s` toggles, your pick;
+  both break honestly at recording gaps.
 - **Subcommands and sinks:** `report` (plain-text digest), `demo` (pre-seeded incident),
   `export`/`view` (shareable `.gpvr` incident files that replay anywhere, no GPU required),
   `--json` (NDJSON contract v1 with JSON Schema and a conformance test that runs the built
@@ -193,34 +266,45 @@ gpuviewer-core      trait GpuBackend (nvtop's vtable, translated to Rust)
                     ├─ amd:    sysfs/hwmon/gpu_metrics(v1.1–v3.0)/fdinfo (zero library deps)
                     ├─ intel:  fdinfo (i915 + xe dialects) + sysfs
                     └─ mock:   deterministic simulation (CI + demo; no GPU required)
-gpuviewer-history   RAM rings (live window) → 10s/1m SQLite rollups + event log  [shipped]
-gpuviewer-tui       ratatui 0.30 — live view, scroll-back replay, story feed
+gpuviewer-history   RAM rings (live window) → 10s/1m SQLite rollups + event log
+gpuviewer-tui       ratatui — live · timeline · replay, story feed
                     + report · demo · export (.gpvr) · view   (+ --json mode)
 ```
 
-Built in Rust. Missing drivers degrade gracefully, `NOT_SUPPORTED` is a normal per-metric
-outcome, and the tool never out-consumes what it monitors (adaptive polling; low-power
-cadence surfaced in the footer).
+Built in Rust, all-Rust dependency tree. Missing drivers degrade gracefully,
+`NOT_SUPPORTED` is a normal per-metric outcome, and the tool never out-consumes what it
+monitors (adaptive polling; low-power cadence surfaced in the footer).
 
 ### Keybinds
 
-| Live view | |
+| Live | |
 |---|---|
 | `q` / `Esc` | quit |
 | `←` `→` / `Tab` / `Shift-Tab` | switch device |
 | `p` | pause/resume collection |
-| `↑` `↓` | select an event in the story feed |
-| `Enter` | scroll back to the selected event |
-| `r` | enter replay at the newest recorded moment |
+| `↑` `↓` then `Enter` | jump to a story-feed event |
+| `r` | replay at the newest recorded moment |
+| `t` | timeline overview |
+| `s` | chart style: braille ↔ solid |
 
-| Replay view | |
+| Replay | |
 |---|---|
-| `q` | quit |
 | `Esc` / `r` | back to live (inert in `view` — a file has no live mode behind it) |
 | `←` `→` | scrub 10s |
 | `PgUp` / `PgDn` | scrub 5m |
-| `Home` | jump to the oldest recorded moment |
+| `Home` | oldest recorded moment |
 | `↑` `↓` then `Enter` | jump to the selected event |
+| `t` / `s` | timeline · chart style |
+
+| Timeline | |
+|---|---|
+| `t` / `Esc` | back to live (to the pinned replay in `view` — a file has no live mode) |
+| `+` / `-` | zoom: 1h · 3h · 6h · 12h · 24h · 48h · 7d |
+| `←` `→` | move the time cursor (footer shows the nearest event) |
+| `PgUp` / `PgDn` | jump 10 columns |
+| `Home` / `End` | window edges |
+| `Tab` / `Shift-Tab` | switch device |
+| `Enter` | **drill into replay at the cursor** |
 
 ### Retention defaults
 
@@ -261,9 +345,3 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
-
----
-
-The product/architecture decision record and the June-2026 market, vendor-API, and
-competitive evidence live in [`docs/research/`](docs/research/) — start with
-`04-synthesis.md`; the comparison table above is sourced from `05-competitive-deep-dive.md`.
