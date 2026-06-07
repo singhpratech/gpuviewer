@@ -21,7 +21,7 @@ chrono = "0.4"
 # 1.94.0, issue #115585). 0.39 -> libsqlite3-sys 0.37 builds cleanly. Bump to 0.40 once the
 # toolchain stabilizes cfg_select. `bundled` so SQLite is compiled in (no system lib, no
 # soname churn — same rationale as not linking librocm_smi64).
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"
