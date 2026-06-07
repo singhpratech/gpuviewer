@@ -1,0 +1,332 @@
+# Release pipeline — hand-rolled on purpose (docs/design/cross-platform.md §7).
+# cargo-dist was rejected: 2025 abandonment-and-rescue history, it owns the workflow
+# file, and it generates tag-pinned (not SHA-pinned) steps — all of which fight this
+# repo's SHA-pinned minimal-CI culture. Revisit only past ~5 target triples.
+#
+# Shape: draft → [linux, windows, macos] → verify-assets. Release creation/upload uses
+# the preinstalled gh CLI (no third-party release action to pin or audit). The release
+# is created as a DRAFT and STAYS a draft — verify-assets only checks completeness;
+# the owner reviews and publishes manually. (Deliberate deviation from §7 step 3,
+# "publish job undrafts", per the release-workstream brief.)
+#
+# All action SHAs captured 2026-06-07 (checkout/rust-toolchain reuse ci.yml's pins).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Default-deny; every job states exactly what it needs.
+permissions: {}
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the draft release
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Archives are named from the tag, but cargo-deb/cargo-generate-rpm name their
+      # packages from the manifest version — a mismatch would ship contradictory
+      # version numbers in one release. Fail before any build starts.
+      - name: Fail fast if tag and manifest version disagree
+        run: |
+          want="${TAG#v}"
+          have="$(cargo pkgid -p gpuviewer-tui | sed 's/.*@//')"
+          if [ "$want" != "$have" ]; then
+            echo "::error::tag $TAG does not match gpuviewer-tui version $have — bump the workspace version or retag"
+            exit 1
+          fi
+
+      # --verify-tag refuses to create a release if the tag is missing on the remote
+      # (guards re-runs after a tag was deleted). Re-runs of a partially-failed
+      # pipeline reuse the existing draft instead of failing on "already exists".
+      # The notes carry the unsigned-binary instructions (§7) so users see them on
+      # the release page itself, not only in docs.
+      - name: Create draft release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release for $TAG already exists — reusing it (workflow re-run)"
+            exit 0
+          fi
+          gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file - <<'NOTES'
+          Prebuilt binaries are **not code-signed**. Full install notes:
+          [docs/packaging/installing.md](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md).
+
+          ### macOS
+          Browser downloads carry the `com.apple.quarantine` attribute, and macOS Sequoia
+          15.1+ removed the ctrl-click "Open anyway" bypass. Either approve the binary under
+          **System Settings → Privacy & Security** after the first blocked launch, or clear
+          the attribute:
+
+          ```sh
+          xattr -d com.apple.quarantine ./gpuviewer
+          ```
+
+          or download with curl/wget, which set no quarantine attribute in the first place:
+
+          ```sh
+          curl -LO <asset URL>
+          ```
+
+          ### Windows
+          SmartScreen flags the unsigned exe: choose **More info → Run anyway**.
+
+          ### Verify what you downloaded
+          Each `SHA256SUMS-<target>` asset lists the artifact hashes (`sha256sum -c` /
+          `shasum -a 256 -c` / `Get-FileHash`), and every artifact has GitHub build
+          provenance:
+
+          ```sh
+          gh attestation verify <file> -R singhpratech/gpuviewer
+          ```
+
+          ### Linux packages and the NVIDIA driver
+          The `.deb`/`.rpm` intentionally declare **no** NVIDIA driver dependency:
+          gpuviewer dlopens `libnvidia-ml.so.1` at runtime and degrades gracefully to the
+          other backends (or the mock) when it is absent.
+          NOTES
+
+  linux:
+    needs: draft
+    # ubuntu-22.04 = glibc 2.35 floor; ubuntu-latest (24.04) would silently raise it
+    # to 2.39. Known caveats (§7): RHEL 9 = glibc 2.34 is already below the floor, and
+    # 22.04 runners retire ~early 2027 — adopt cargo-zigbuild then if needed.
+    # Target is x86_64-unknown-linux-gnu — gnu, NEVER musl: statically-linked musl
+    # cannot dlopen at all, and even dynamic musl cannot load the glibc-linked
+    # libnvidia-ml.so.1 — the NVML path would be dead.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # upload assets to the draft release
+      id-token: write # attest-build-provenance (OIDC)
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      # No build cache on release builds: tags are rare and a clean build is worth
+      # more than the minutes saved.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package tar.gz
+        run: |
+          VERSION="${TAG#v}"
+          DIR="gpuviewer-${VERSION}-${TARGET}"
+          mkdir -p "dist/$DIR"
+          cp target/release/gpuviewer README.md LICENSE-MIT LICENSE-APACHE "dist/$DIR/"
+          tar -C dist -czf "dist/$DIR.tar.gz" "$DIR"
+          rm -r "dist/$DIR"
+
+      # CI-only host tools, not workspace deps (design §8); versions fixed by §7,
+      # --locked so their own lockfiles pin transitive deps.
+      - name: Install packaging tools
+        run: |
+          cargo install --locked cargo-deb --version 3.7.0
+          cargo install --locked cargo-generate-rpm --version 0.21.0
+
+      # Both tools' dependency scanners read DT_NEEDED only — the dlopen'd
+      # libnvidia-ml.so.1 is invisible to them, so neither package declares an NVIDIA
+      # driver dependency. That is CORRECT (degrading to other backends/mock is the
+      # designed behavior) — do not add one manually.
+      # Note the asymmetric -p arguments: cargo-deb takes the package NAME,
+      # cargo-generate-rpm takes the package DIRECTORY.
+      - name: Build .deb and .rpm
+        run: |
+          cargo deb -p gpuviewer-tui --no-build
+          cargo generate-rpm -p crates/tui
+          cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+
+      # Explicit patterns, not *: the glob must not pick up the checksum file itself.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.deb *.rpm > "SHA256SUMS-${TARGET}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+  # Shipped from v1.5 per the roadmap. zip only, no MSI: WiX v6 gates binaries behind
+  # the Open Source Maintenance Fee EULA, and an unsigned MSI trips SmartScreen exactly
+  # like an unsigned exe — toolchain burden, zero trust benefit without code signing.
+  windows:
+    needs: draft
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $name = "gpuviewer-$version-$env:TARGET"
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Compress-Archive `
+            -Path target/release/gpuviewer.exe, README.md, LICENSE-MIT, LICENSE-APACHE `
+            -DestinationPath "dist/$name.zip"
+
+      # Written byte-for-byte in sha256sum format with LF line endings so the file
+      # also passes `sha256sum -c` on Linux/macOS (Set-Content would emit CRLF).
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem dist/*.zip | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name
+          }
+          $path = Join-Path $pwd "dist/SHA256SUMS-$env:TARGET"
+          [System.IO.File]::WriteAllText($path, ($lines -join "`n") + "`n")
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/*.zip
+
+      - name: Upload to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload $env:TAG (Get-ChildItem dist).FullName --clobber
+
+  # Shipped from v2 per the roadmap. Plain tar.gz; ICNS deliberately skipped (§6: a
+  # bare Mach-O has no icon surface — revisit with the iced .app bundle). Unsigned —
+  # the archive carries INSTALL-macos.txt with the quarantine workaround.
+  macos:
+    needs: draft
+    # macos-15 standard runners are arm64, so the host build IS aarch64-apple-darwin.
+    runs-on: macos-15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package tar.gz
+        run: |
+          VERSION="${TAG#v}"
+          DIR="gpuviewer-${VERSION}-${TARGET}"
+          mkdir -p "dist/$DIR"
+          cp target/release/gpuviewer README.md LICENSE-MIT LICENSE-APACHE "dist/$DIR/"
+          cat > "dist/$DIR/INSTALL-macos.txt" <<'EOF'
+          gpuviewer — unsigned binary, first-launch note (macOS)
+
+          This binary is not code-signed or notarized. If you downloaded the archive with
+          a browser, macOS attached the com.apple.quarantine attribute (Safari/Chrome set
+          it; Archive Utility propagates it into the extracted files) and Gatekeeper will
+          block the first launch. Since macOS Sequoia 15.1 the ctrl-click "Open anyway"
+          bypass is gone. Pick one:
+
+          1. Approve it: System Settings -> Privacy & Security -> "Open Anyway" after the
+             first blocked launch.
+
+          2. Clear the quarantine attribute:
+
+                 xattr -d com.apple.quarantine ./gpuviewer
+
+          3. Download with curl or wget instead of a browser — neither sets the
+             quarantine attribute:
+
+                 curl -LO <release asset URL>
+
+          Building from source always works: see docs/packaging/installing.md in the
+          repository.
+          EOF
+          tar -C dist -czf "dist/$DIR.tar.gz" "$DIR"
+          rm -r "dist/$DIR"
+
+      - name: Checksums
+        run: |
+          cd dist
+          shasum -a 256 *.tar.gz > "SHA256SUMS-${TARGET}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+  # Completeness gate only — it does NOT publish. The release stays a draft and the
+  # owner publishes manually after reviewing assets and notes.
+  verify-assets:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      # write, not read: the GitHub API hides DRAFT releases from pull-level tokens,
+      # so even viewing the draft requires push-level (contents: write) auth.
+      # This job edits nothing.
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Verify the draft has every expected asset
+        run: |
+          V="${TAG#v}"
+          have="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          missing=0
+          for want in \
+            "gpuviewer-$V-x86_64-unknown-linux-gnu.tar.gz" \
+            "gpuviewer_${V}-1_amd64.deb" \
+            "gpuviewer-${V}-1.x86_64.rpm" \
+            "SHA256SUMS-x86_64-unknown-linux-gnu" \
+            "gpuviewer-$V-x86_64-pc-windows-msvc.zip" \
+            "SHA256SUMS-x86_64-pc-windows-msvc" \
+            "gpuviewer-$V-aarch64-apple-darwin.tar.gz" \
+            "SHA256SUMS-aarch64-apple-darwin"
+          do
+            if ! grep -Fxq "$want" <<<"$have"; then
+              echo "::error::missing release asset: $want"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+          echo "Draft release $TAG is complete. It stays a DRAFT on purpose — review and publish it manually."
