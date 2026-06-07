@@ -88,7 +88,7 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
         .iter()
         .enumerate()
         .map(|(i, info)| {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" {} ", i),
                     Style::default()
@@ -96,7 +96,17 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
                         .bg(vendor_color(info.vendor)),
                 ),
                 Span::raw(format!(" {} ", info.name)),
-            ])
+            ];
+            // A lost device is flagged in the strip itself so the dead tab is visible
+            // while ANOTHER device is selected — per-device loss must never hide behind
+            // tab selection (the footer stays quiet: the other devices are still live).
+            if shared.lost.get(i).copied().flatten().is_some() {
+                spans.push(Span::styled(
+                    "LOST ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(spans)
         })
         .collect();
     let tabs = Tabs::new(titles)
@@ -116,10 +126,12 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
     let now_ms = gpuviewer_core::now_ms() as f64;
     let hist = shared.history.device(&info.id);
 
-    // Once the collector is dead these headlines describe a frozen snapshot, not the
-    // present — tag them the way replay tags its panes, so the values cannot read as
-    // current (the audit's tick-panic frozen-UI hole, rendering half).
-    let stale_tag = if shared.stopped.is_some() {
+    // Once the collector is dead — or THIS device stopped answering (device_lost) —
+    // these headlines describe a frozen snapshot, not the present — tag them the way
+    // replay tags its panes, so the values cannot read as current (the audit's
+    // tick-panic frozen-UI hole, rendering half; same shape per-device).
+    let device_lost = shared.lost.get(app.selected).copied().flatten().is_some();
+    let stale_tag = if shared.stopped.is_some() || device_lost {
         " STALE"
     } else {
         ""
@@ -917,6 +929,24 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info:
             " stale — collection stopped ",
             Style::default().fg(Color::Red).italic(),
         ));
+    } else if let Some(at) = shared.lost.get(app.selected).copied().flatten() {
+        // The per-device flavor of the same affordance: this device stopped answering,
+        // so its list (and the charts' frozen tails) are the last data it gave. The age
+        // is measured from the last good SAMPLE, not the loss declaration — the data
+        // went quiet before the verdict did.
+        let age = shared.latest[app.selected]
+            .as_ref()
+            .map(|s| {
+                format!(
+                    "last data {} ago",
+                    fmt_span(gpuviewer_core::now_ms().saturating_sub(s.ts_ms))
+                )
+            })
+            .unwrap_or_else(|| "no data this session".into());
+        block = block.title_bottom(Line::styled(
+            format!(" stale — device lost {}, {age} ", fmt_clock(at)),
+            Style::default().fg(Color::Red).italic(),
+        ));
     }
     let table = Table::new(rows, PROC_WIDTHS)
         .header(proc_header())
@@ -1201,7 +1231,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use gpuviewer_core::{DeviceId, ProcessKind, ProcessSample};
+    use gpuviewer_core::{DeviceId, DynamicSample, ProcessKind, ProcessSample, ThrottleReasons};
     use gpuviewer_history::SampleRollup;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1510,5 +1540,67 @@ mod tests {
             screen.contains("stale — collection stopped"),
             "the process pane must flag its list as stale:\n{screen}"
         );
+    }
+
+    /// The per-device flavor of the staleness affordances: a LOST device's panes read
+    /// stale (chart STALE tags, a process-pane flag carrying the loss time and the data
+    /// age, a tab-strip marker) while the footer does NOT claim collection stopped — the
+    /// other devices are still live. Recovery clears every marker.
+    #[test]
+    fn lost_device_panes_read_stale_without_stop_banner() {
+        let collector = test_collector(None);
+        let shared = Arc::clone(&collector.shared);
+        let app = App::new(collector);
+
+        // Give the selected device a last good sample so "last data … ago" has an age.
+        shared.lock().unwrap().latest[0] = Some(DynamicSample {
+            ts_ms: gpuviewer_core::now_ms().saturating_sub(34_000),
+            util_pct: Some(72.0),
+            mem_used_bytes: Some(4 << 30),
+            power_mw: None,
+            temp_c: None,
+            fan_pct: None,
+            sm_clock_mhz: None,
+            mem_clock_mhz: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            throttle: ThrottleReasons::default(),
+        });
+
+        // Alive: no stale affordances anywhere.
+        let screen = draw(&app, &shared);
+        assert!(!screen.contains("STALE"));
+        assert!(!screen.contains("LOST"));
+        assert!(!screen.contains("device lost"));
+
+        shared.lock().unwrap().lost[0] = Some(1_000_000_000_000);
+        let screen = draw(&app, &shared);
+        assert!(
+            screen.contains("STALE"),
+            "a lost device's chart headlines must read stale, not current:\n{screen}"
+        );
+        assert!(
+            screen.contains("LOST"),
+            "the tab strip must flag the lost device:\n{screen}"
+        );
+        assert!(
+            screen.contains("stale — device lost"),
+            "the process pane must carry the loss flag:\n{screen}"
+        );
+        assert!(
+            screen.contains("last data"),
+            "the affordance must carry the age of the last good data:\n{screen}"
+        );
+        assert!(
+            !screen.contains("COLLECTION STOPPED"),
+            "one lost device is not a collector stop — other devices are live:\n{screen}"
+        );
+
+        // Recovery clears every marker.
+        shared.lock().unwrap().lost[0] = None;
+        let screen = draw(&app, &shared);
+        assert!(!screen.contains("STALE"));
+        assert!(!screen.contains("LOST"));
+        assert!(!screen.contains("device lost"));
     }
 }

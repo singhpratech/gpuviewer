@@ -120,7 +120,9 @@
             "collector_stall",
             "history_reset",
             "hang_suspected",
-            "cpu_spillover"
+            "cpu_spillover",
+            "device_lost",
+            "device_returned"
           ],
           "description": "All listed kinds are emitted today. Consumers must ignore kinds not in this list (new ones arrive additively per the compatibility promise)."
         },
