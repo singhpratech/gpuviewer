@@ -125,8 +125,8 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         .map(|u| format!("{u:.0}%"))
         .unwrap_or_else(|| "—".into());
     let ds = vec![Dataset::default()
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
+        .marker(symbols::Marker::HalfBlock)
+        .graph_type(GraphType::Bar)
         .style(Style::default().fg(Color::Cyan))
         .data(&util_pts)];
     let chart = Chart::new(ds)
@@ -207,20 +207,20 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
     let at = bucket_at(samples, app.cursor_ms);
 
     // Utilization (bucket averages) across the window.
-    let util_pts: Vec<(f64, f64)> = samples
-        .iter()
-        .filter_map(|r| {
+    let util_pts: Vec<(f64, f64)> = hold_bucket_width(
+        samples.iter().filter_map(|r| {
             r.util_avg
                 .map(|u| ((r.bucket_ms as f64 - cursor) / 1000.0, u as f64))
-        })
-        .collect();
+        }),
+        Tier::TenSec.width_ms() as f64 / 1000.0,
+    );
     let cursor_util = at
         .and_then(|r| r.util_avg)
         .map(|u| format!("{u:.0}%"))
         .unwrap_or_else(|| "—".into());
     let ds = vec![Dataset::default()
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
+        .marker(symbols::Marker::HalfBlock)
+        .graph_type(GraphType::Bar)
         .style(Style::default().fg(Color::Cyan))
         .data(&util_pts)];
     let chart = Chart::new(ds)
@@ -242,13 +242,13 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
     f.render_widget(chart, util_a);
 
     // VRAM (bucket averages).
-    let vram_pts: Vec<(f64, f64)> = samples
-        .iter()
-        .filter_map(|r| {
+    let vram_pts: Vec<(f64, f64)> = hold_bucket_width(
+        samples.iter().filter_map(|r| {
             r.mem_avg
                 .map(|m| ((r.bucket_ms as f64 - cursor) / 1000.0, m as f64 / GIB))
-        })
-        .collect();
+        }),
+        Tier::TenSec.width_ms() as f64 / 1000.0,
+    );
     let cursor_mem = at
         .and_then(|r| r.mem_avg)
         .map(fmt_bytes)
@@ -280,6 +280,20 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
     );
 }
 
+/// Bucket rollups plot one point per bucket — sparser than the chart's columns, which
+/// leaves x-quantization blanks that read as missing data. Hold each bucket's value across
+/// its real width (sub-points every 2s) so the wave is square and a blank column means
+/// exactly one thing: nothing was recorded there.
+fn hold_bucket_width(
+    pts: impl Iterator<Item = (f64, f64)>,
+    width_s: f64,
+) -> Vec<(f64, f64)> {
+    const STEP_S: f64 = 2.0;
+    let n = (width_s / STEP_S).max(1.0) as usize;
+    pts.flat_map(|(x, y)| (0..n).map(move |i| (x + i as f64 * STEP_S, y)))
+        .collect()
+}
+
 /// The 10s rollup covering `cursor_ms`, if recorded. Exact-bucket only: a cursor sitting
 /// in a gap shows "—" on every gauge rather than a neighboring bucket's values.
 fn bucket_at(samples: &[SampleRollup], cursor_ms: u64) -> Option<&SampleRollup> {
@@ -304,8 +318,8 @@ fn render_vram_chart(
         .map(fmt_bytes)
         .unwrap_or_else(|| "?".into());
     let ds = vec![Dataset::default()
-        .marker(symbols::Marker::Braille)
-        .graph_type(GraphType::Line)
+        .marker(symbols::Marker::HalfBlock)
+        .graph_type(GraphType::Bar)
         .style(Style::default().fg(Color::Magenta))
         .data(pts)];
     let y_max = if total_gib > 0.0 { total_gib } else { 1.0 };
