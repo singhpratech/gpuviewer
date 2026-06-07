@@ -15,7 +15,17 @@
 //!   ([`SqliteStore::open_recording`]): simulated sessions can never write into a real
 //!   recording, nor real sessions into a mock one. Reads ignore the stamp — replaying
 //!   mock history is fine (the UI labels it), only co-mingled writes are not.
+//! - An exclusive **instance lock** (`<db>.lock` sidecar, kernel advisory lock) held by
+//!   every write handle for its lifetime: two live gpuviewer instances folding frames into
+//!   the same file would double-count every rollup bucket and insert every narrated event
+//!   twice — the audit's duplicate-narration blocker. The lock loser stays usable
+//!   (live-only); read-only opens never take the lock, so `report`/`view`/replay run
+//!   concurrently with a recording instance.
+//! - A UNIQUE index over `(ts_ms, device_id, kind, title)` on the event log with
+//!   `INSERT OR IGNORE` — defense in depth behind the lock: even a pre-lock binary running
+//!   alongside a new one cannot land the same narration twice.
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,7 +36,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 /// Schema version stamped into `PRAGMA user_version` and `meta.schema_version`. Bump when
 /// the table shape changes so a future migration step can branch on it.
-pub const SCHEMA_VERSION: u32 = 1;
+/// v2: the event-dedupe UNIQUE index (`idx_events_dedupe`), added by
+/// [`SqliteStore::migrate_event_dedupe`] on open with pre-existing duplicates collapsed.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Retention windows. Public because the UI tells the user how far back history reaches
 /// ("10s detail for 48h, 1m for 30 days").
@@ -194,6 +206,20 @@ pub enum StoreError {
         db_source: String,
         session_source: DataSource,
     },
+    /// Another live instance already holds the database's exclusive instance lock. Letting
+    /// a second writer in would double-count every rollup bucket and insert every narrated
+    /// event twice (the audit's duplicate-narration blocker), so a write open is refused
+    /// while the lock is held. The loser is expected to keep running live-only — this is
+    /// "someone else is recording", not "the database is broken".
+    Locked { path: PathBuf },
+    /// The instance-lock sidecar could not be created or locked for a reason other than
+    /// contention (permissions, an exotic filesystem without advisory locks). Refused
+    /// rather than recorded unlocked: an unenforceable lock silently reopens the
+    /// double-recording hole the lock exists to close.
+    LockIo {
+        lock_path: PathBuf,
+        error: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -216,6 +242,18 @@ impl std::fmt::Display for StoreError {
                  history (use --db elsewhere or --no-persist)",
                 path.display()
             ),
+            StoreError::Locked { path } => write!(
+                f,
+                "another gpuviewer instance is already recording to {} (instance lock {} \
+                 is held) — close it, or use --db elsewhere / --no-persist",
+                path.display(),
+                lock_path_for(path).display()
+            ),
+            StoreError::LockIo { lock_path, error } => write!(
+                f,
+                "cannot acquire the instance lock {}: {error}",
+                lock_path.display()
+            ),
         }
     }
 }
@@ -234,6 +272,13 @@ impl From<rusqlite::Error> for StoreError {
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
+    /// The exclusive instance lock on the `<db>.lock` sidecar, held for this write
+    /// handle's whole lifetime so a second recording instance is refused for exactly as
+    /// long as this one could write ([`StoreError::Locked`]). `None` on read-only
+    /// connections and on export destinations (a fresh file no second instance can race
+    /// for). Never touched after acquisition — closing the `File` (drop, or the process
+    /// dying ANY way, including SIGKILL) is what releases the kernel lock.
+    instance_lock: Option<File>,
 }
 
 impl SqliteStore {
@@ -253,18 +298,27 @@ impl SqliteStore {
             }
         }
 
+        // Instance lock FIRST, before any look at the database itself (the audit's
+        // duplicate-narration blocker: one writer per file, ever). The ordering is
+        // load-bearing twice over: a lock refusal must return here, where it can never
+        // reach the corruption machinery below — a database that is merely BUSY (another
+        // instance recording) must not be quarantined as corrupt — and winning the lock
+        // before `try_open_init` means two racing opens can never both initialize/write.
+        let lock = Self::acquire_instance_lock(&path)?;
+
         let existed = path.exists();
-        match Self::try_open_init(&path) {
-            Ok(store) if !existed => Ok((store, false)),
-            Ok(store) if store.quick_check_ok() => Ok((store, false)),
+        let (mut store, was_reset) = match Self::try_open_init(&path) {
+            Ok(store) if !existed => (store, false),
+            Ok(store) if store.quick_check_ok() => (store, false),
             // Open succeeded but the integrity check failed, or open/init itself failed:
             // either way the existing file is unusable. Rename it aside and start fresh.
             _ => {
                 Self::quarantine(&path)?;
-                let store = Self::try_open_init(&path)?;
-                Ok((store, true))
+                (Self::try_open_init(&path)?, true)
             }
-        }
+        };
+        store.instance_lock = Some(lock);
+        Ok((store, was_reset))
     }
 
     /// Open `path` for RECORDING as `source`, enforcing the data-source stamp: a fresh (or
@@ -300,7 +354,9 @@ impl SqliteStore {
 
     /// A second, read-only connection to an existing database. WAL mode lets this reader run
     /// concurrently with the writer connection — the TUI replay view uses it while the
-    /// collector keeps appending. Does not create or modify the file.
+    /// collector keeps appending. Does not create or modify the file, and deliberately does
+    /// NOT take the instance lock: only concurrent WRITERS double-record; `report`, `view`,
+    /// and replay must keep working alongside a live recording instance.
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open_with_flags(
@@ -308,7 +364,11 @@ impl SqliteStore {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            instance_lock: None,
+        })
     }
 
     /// The on-disk path of this store's database.
@@ -338,10 +398,52 @@ impl SqliteStore {
         let store = Self {
             conn,
             path: path.to_path_buf(),
+            // No lock here: `open` slots the session lock in after the integrity check;
+            // export destinations (`copy_window`) are fresh single-use files that need none.
+            instance_lock: None,
         };
         store.init_pragmas()?;
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Acquire the exclusive per-database instance lock: a kernel advisory lock
+    /// (`File::try_lock`, std-only, stable since Rust 1.89 — flock semantics on Linux) on
+    /// the `<db>.lock` sidecar.
+    ///
+    /// WHY a kernel lock and not a pidfile: the lock dies with the process — a crash
+    /// (panic, SIGKILL, OOM, power loss) releases it automatically, so a previous run can
+    /// never wedge future ones. The sidecar file left on disk is inert; its existence means
+    /// nothing (only the currently-held lock does), which is exactly the staleness bug
+    /// pidfiles have and this design cannot.
+    ///
+    /// WHY a sidecar and not the database file itself: SQLite owns the db file's locking
+    /// protocol (WAL readers and the writer coordinate through it); piling a foreign
+    /// exclusive lock onto the same file could starve the concurrent read-only opens the
+    /// product depends on.
+    fn acquire_instance_lock(db_path: &Path) -> Result<File, StoreError> {
+        let lock_path = lock_path_for(db_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            // Explicitly no truncate: the file carries no data (the kernel lock state is
+            // the whole mechanism), and truncating a sidecar another instance holds locked
+            // would be pointless churn.
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| StoreError::LockIo {
+                lock_path: lock_path.clone(),
+                error,
+            })?;
+        match file.try_lock() {
+            // Hold the handle: the lock lives exactly as long as this `File` (the store
+            // keeps it for the session; drop or process death releases it).
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => Err(StoreError::Locked {
+                path: db_path.to_path_buf(),
+            }),
+            Err(TryLockError::Error(error)) => Err(StoreError::LockIo { lock_path, error }),
+        }
     }
 
     fn init_pragmas(&self) -> Result<(), StoreError> {
@@ -383,18 +485,66 @@ impl SqliteStore {
 
     fn init_schema(&self) -> Result<(), StoreError> {
         self.conn.execute_batch(SCHEMA_SQL)?;
+        // Migrations run after the base tables exist and before the version stamps, so a
+        // database is only ever stamped with a shape it actually has.
+        self.migrate_event_dedupe()?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         let now = now_ms_wall();
-        // Stamp metadata only on a fresh database; `INSERT OR IGNORE` keeps `created_ms`
-        // pinned to first creation across reopens.
+        // `schema_version` is REPLACED (it must describe the shape the file has NOW, which
+        // the migration above may just have changed); `created_ms` stays `INSERT OR
+        // IGNORE` so it remains pinned to first creation across reopens.
         self.conn.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?1)",
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
         )?;
         self.conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('created_ms', ?1)",
             params![now.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Schema v1 → v2: collapse any duplicate narrations already in the event log, then
+    /// add the UNIQUE index that makes new ones impossible.
+    ///
+    /// Defense in depth behind the instance lock (the audit's duplicate-narration
+    /// blocker): the lock stops two NEW binaries from co-recording, but a database that
+    /// was already double-recorded by pre-lock binaries — or that a pre-lock binary keeps
+    /// writing to alongside a new one — must still converge to one row per narration.
+    /// "GPU0 began throttling" twice at the same second kills the trust thesis.
+    ///
+    /// Gated on the index's existence rather than `user_version`: idempotent, self-healing
+    /// if a version stamp ever exists without the index, and a cheap no-op probe on every
+    /// later open (no scan of `events`).
+    ///
+    /// The DELETE and CREATE INDEX share one transaction deliberately: a process dying
+    /// between them would otherwise leave rows deleted WITHOUT the constraint gained —
+    /// data loss with nothing to show for it. All-or-nothing means a crashed migration
+    /// simply reruns whole on the next open.
+    fn migrate_event_dedupe(&self) -> Result<(), StoreError> {
+        let have_index: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_dedupe'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if have_index.is_some() {
+            return Ok(());
+        }
+        // Keep MIN(id) per (ts, device, kind, title) group: ids are append-ordered, so the
+        // survivor is the original narration and the deleted rows are its echoes. Severity/
+        // confidence/evidence are not in the key — a duplicated narration differing only
+        // there is still the same line on screen twice, which is exactly the bug.
+        self.conn.execute_batch(
+            "BEGIN;
+             DELETE FROM events WHERE id NOT IN (
+                 SELECT MIN(id) FROM events GROUP BY ts_ms, device_id, kind, title
+             );
+             CREATE UNIQUE INDEX idx_events_dedupe ON events (ts_ms, device_id, kind, title);
+             COMMIT;",
         )?;
         Ok(())
     }
@@ -539,6 +689,12 @@ impl SqliteStore {
 
     /// Append events (one transaction). The `evidence` and reconstruction fields are stored
     /// as serde strings so [`SqliteStore::events_between`] can rebuild the exact `Event`.
+    ///
+    /// `INSERT OR IGNORE` against `idx_events_dedupe`: the same narration (same instant,
+    /// device, kind, title) lands at most once no matter who replays it — a second writer
+    /// the instance lock could not see (a pre-lock binary), a future double-feed bug,
+    /// anything. Duplicate narration is the trust-killer the audit calls the
+    /// duplicate-narration blocker, so the log itself refuses it.
     pub fn insert_events(&mut self, events: &[Event]) -> Result<(), StoreError> {
         if events.is_empty() {
             return Ok(());
@@ -546,7 +702,7 @@ impl SqliteStore {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(&format!(
-                "INSERT INTO events ({EVENT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+                "INSERT OR IGNORE INTO events ({EVENT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7)"
             ))?;
             for e in events {
                 stmt.execute(params![
@@ -837,9 +993,13 @@ impl SqliteStore {
         )?;
         // Fresh autoincrement ids in the copy; ORDER BY preserves the source's intra-tick
         // event order so `events_between` reads the export in the original sequence.
+        // OR IGNORE because the source is opened read-only and may predate the dedupe
+        // migration (a pre-v2 file can still hold duplicate narrations): the export must
+        // collapse them against the fresh file's unique index, not abort on them.
         let events = tx.execute(
             &format!(
-                "INSERT INTO events ({EVENT_COLS}) SELECT {EVENT_COLS} FROM src.events \
+                "INSERT OR IGNORE INTO events ({EVENT_COLS}) SELECT {EVENT_COLS} \
+                 FROM src.events \
                  WHERE ts_ms >= ?1 AND ts_ms <= ?2 ORDER BY ts_ms ASC, id ASC"
             ),
             params![from, to],
@@ -950,6 +1110,14 @@ fn kind_from_proc_str(s: &str) -> ProcessKind {
 /// per-reason bucket counters live in one place.
 pub fn throttle_flags(t: &ThrottleReasons) -> (bool, bool, bool, bool) {
     (t.any(), t.thermal, t.power_cap, t.hw_slowdown)
+}
+
+/// The instance-lock sidecar path: `<db>.lock` next to the database, following the
+/// `-wal`/`-shm` sidecar convention so it is obviously associated with its file.
+fn lock_path_for(db_path: &Path) -> PathBuf {
+    let mut p = db_path.as_os_str().to_os_string();
+    p.push(".lock");
+    PathBuf::from(p)
 }
 
 /// Percent-encode a filesystem path for a `file:` SQLite URI: `%`, `?`, and `#` would
@@ -1065,3 +1233,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts_ms);
 ";
+// NOTE: the UNIQUE dedupe index on events (idx_events_dedupe) is deliberately NOT in
+// SCHEMA_SQL. Creating it here would fail on a pre-v2 database that already holds
+// duplicate narrations — and a failed init reads as corruption to `open`, which would
+// quarantine a perfectly healthy file. `migrate_event_dedupe` (which collapses the
+// duplicates first, in the same transaction) is the only place that creates it.

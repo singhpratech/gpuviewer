@@ -499,7 +499,7 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
-            for ext in ["-wal", "-shm"] {
+            for ext in ["-wal", "-shm", ".lock"] {
                 let mut p = self.path.as_os_str().to_os_string();
                 p.push(ext);
                 let _ = std::fs::remove_file(p);
@@ -1465,6 +1465,267 @@ mod tests {
             b"someone's shared incident file",
             "the existing file must be untouched"
         );
+    }
+
+    // ===================================================================================
+    // Instance lock — one recording instance per database file. The audit's
+    // duplicate-narration blocker: two live instances folding frames into the SAME
+    // history.db double-count every rollup bucket and insert every narrated event twice.
+    // ===================================================================================
+
+    /// While one handle holds the lock, every further WRITE open — `open_recording` (the
+    /// stamped path) and plain `open` (the engine's `--db` path) alike — is refused with
+    /// the distinct `Locked` error, whose message names the file and the escape hatches.
+    #[test]
+    fn second_recording_open_is_refused_while_lock_is_held() {
+        let scratch = Scratch::new();
+        let _held = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+
+        let err = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Locked { .. }),
+            "a second recording open must fail with Locked, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("another gpuviewer instance is already recording"),
+            "the refusal must say who has it: {msg}"
+        );
+        assert!(
+            msg.contains(scratch.path.to_str().unwrap()),
+            "the refusal must name the file: {msg}"
+        );
+        assert!(
+            msg.contains("--no-persist"),
+            "the refusal must offer the live-only escape hatch: {msg}"
+        );
+
+        let err = SqliteStore::open(&scratch.path).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Locked { .. }),
+            "the plain write open must be refused identically, got: {err}"
+        );
+    }
+
+    /// Losing the lock race must never harm the database: no quarantine (`Locked` is
+    /// "busy", not "corrupt"), no data loss, and the holder keeps writing afterwards.
+    #[test]
+    fn losing_the_lock_race_never_quarantines_the_database() {
+        let scratch = Scratch::new();
+        let (mut held, _) = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+        held.insert_events(&[event_at(&dev("g"), 5, EventKind::ThrottleStart, "kept")])
+            .unwrap();
+
+        assert!(SqliteStore::open(&scratch.path).is_err());
+
+        // No *.corrupt-* sibling may appear: the loser must return before the corruption
+        // machinery, or it would rename a healthy, busy database out from under the holder.
+        let dir = scratch.path.parent().unwrap();
+        let stem = scratch.path.file_name().unwrap().to_str().unwrap();
+        let quarantined = std::fs::read_dir(dir).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&format!("{stem}.corrupt-")))
+        });
+        assert!(
+            !quarantined,
+            "a busy database must never be quarantined as corrupt"
+        );
+
+        // The holder is unharmed: old rows intact, new writes still land.
+        held.insert_events(&[event_at(
+            &dev("g"),
+            6,
+            EventKind::ThrottleEnd,
+            "still writing",
+        )])
+        .unwrap();
+        assert_eq!(held.events_between(0, 10).unwrap().len(), 2);
+    }
+
+    /// Read paths run concurrently with a recording instance: `report`/`view`/replay all
+    /// open read-only, which takes no lock (only co-writers double-record).
+    #[test]
+    fn readonly_open_succeeds_alongside_a_held_lock() {
+        let scratch = Scratch::new();
+        let (mut held, _) = SqliteStore::open_recording(&scratch.path, DataSource::Mock).unwrap();
+        held.insert_events(&[event_at(
+            &dev("sim"),
+            7,
+            EventKind::VramPressure,
+            "likely visible to readers",
+        )])
+        .unwrap();
+
+        let reader = SqliteStore::open_readonly(&scratch.path).unwrap();
+        assert_eq!(
+            reader.events_between(0, 10).unwrap().len(),
+            1,
+            "a reader must work while the recording lock is held"
+        );
+        // And a second reader too — readers never exclude each other.
+        let reader2 = SqliteStore::open_readonly(&scratch.path).unwrap();
+        assert_eq!(reader2.events_between(0, 10).unwrap().len(), 1);
+    }
+
+    /// Dropping the holding store releases the lock (the `File` closes with it), so the
+    /// next instance records normally — crash-release is the same mechanism, exercised by
+    /// the kernel instead of Drop. The stale `.lock` sidecar left on disk must not matter.
+    #[test]
+    fn lock_released_on_drop_lets_the_next_instance_record() {
+        let scratch = Scratch::new();
+        drop(SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap());
+
+        // The sidecar file still exists (release is the kernel lock dying, not the file
+        // being deleted) — and relocking it must succeed regardless.
+        let mut lock_file = scratch.path.as_os_str().to_os_string();
+        lock_file.push(".lock");
+        assert!(
+            std::path::Path::new(&lock_file).exists(),
+            "the sidecar persists; only the kernel lock is released"
+        );
+
+        let (mut store, was_reset) =
+            SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+        assert!(!was_reset, "relocking must not look like a reset");
+        store
+            .insert_events(&[event_at(&dev("g"), 1, EventKind::ProcessExited, "next run")])
+            .unwrap();
+    }
+
+    // ===================================================================================
+    // Event dedupe — defense in depth behind the instance lock: the log itself refuses
+    // the same narration twice, so even a pre-lock binary racing a new one (or a future
+    // double-feed bug) cannot produce "GPU0 began throttling" twice at the same second.
+    // ===================================================================================
+
+    /// The same event inserted twice — across calls or within one batch — lands once.
+    /// A genuinely different event at the same instant (other device, other title) is NOT
+    /// collapsed: the key is (ts, device, kind, title), not just the timestamp.
+    #[test]
+    fn same_event_inserted_twice_lands_once() {
+        let scratch = Scratch::new();
+        let (mut store, _) = SqliteStore::open(&scratch.path).unwrap();
+        let e = event_at(
+            &dev("gpu0"),
+            5_000,
+            EventKind::ThrottleStart,
+            "began throttling",
+        );
+
+        store.insert_events(std::slice::from_ref(&e)).unwrap();
+        // A second writer replaying the tick, then a duplicate within one batch.
+        store.insert_events(std::slice::from_ref(&e)).unwrap();
+        store.insert_events(&[e.clone(), e.clone()]).unwrap();
+        assert_eq!(
+            store.events_between(0, 10_000).unwrap().len(),
+            1,
+            "one narration, no matter how many times it is fed"
+        );
+
+        // Same instant, different device / different title: distinct narrations, all kept.
+        store
+            .insert_events(&[
+                event_at(
+                    &dev("gpu1"),
+                    5_000,
+                    EventKind::ThrottleStart,
+                    "began throttling",
+                ),
+                event_at(
+                    &dev("gpu0"),
+                    5_000,
+                    EventKind::ThrottleStart,
+                    "another story",
+                ),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.events_between(0, 10_000).unwrap().len(),
+            3,
+            "the dedupe key must not over-collapse distinct events"
+        );
+    }
+
+    /// Migration: a pre-v2 database (built by hand exactly as two double-recording
+    /// pre-lock binaries left it — v1 events table, no dedupe index, duplicate rows) opens
+    /// cleanly, with duplicates collapsed to the FIRST insertion and the constraint live
+    /// from then on. No reset, no loss of distinct rows.
+    #[test]
+    fn migration_collapses_preexisting_duplicate_events() {
+        let scratch = Scratch::new();
+        {
+            // The v1 shape verbatim: same table, only idx_events_ts, user_version 1.
+            let conn = rusqlite::Connection::open(&scratch.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     ts_ms      INTEGER NOT NULL,
+                     device_id  TEXT NOT NULL,
+                     kind       TEXT NOT NULL,
+                     severity   TEXT NOT NULL,
+                     confidence TEXT NOT NULL,
+                     title      TEXT NOT NULL,
+                     evidence   TEXT NOT NULL
+                 );
+                 CREATE INDEX idx_events_ts ON events (ts_ms);
+                 PRAGMA user_version = 1;
+                 -- Three copies of one narration (double-recorded, then some), with
+                 -- evidence differing so the keep-MIN(id) rule is observable; one
+                 -- distinct event that must survive untouched.
+                 INSERT INTO events (ts_ms, device_id, kind, severity, confidence, title, evidence)
+                 VALUES
+                   (5000, 'gpu0', 'throttle_start', 'warning', 'fact', 'GPU0 began throttling', 'original'),
+                   (5000, 'gpu0', 'throttle_start', 'warning', 'fact', 'GPU0 began throttling', 'echo one'),
+                   (5000, 'gpu0', 'throttle_start', 'warning', 'fact', 'GPU0 began throttling', 'echo two'),
+                   (6000, 'gpu0', 'throttle_end',   'info',    'fact', 'GPU0 stopped throttling', 'distinct');",
+            )
+            .unwrap();
+        }
+
+        let (mut store, was_reset) = SqliteStore::open(&scratch.path).unwrap();
+        assert!(
+            !was_reset,
+            "a healthy pre-v2 database migrates in place, never resets"
+        );
+
+        let evs = store.events_between(0, 10_000).unwrap();
+        assert_eq!(evs.len(), 2, "3 copies -> 1, plus the distinct event");
+        assert_eq!(
+            evs[0].evidence, "original",
+            "MIN(id) — the FIRST insertion — must be the survivor"
+        );
+        assert_eq!(evs[1].title, "GPU0 stopped throttling");
+
+        // The constraint is live from the migration on: re-feeding the duplicate is a no-op.
+        store
+            .insert_events(&[Event {
+                ts_ms: 5_000,
+                device: dev("gpu0"),
+                kind: EventKind::ThrottleStart,
+                severity: Severity::Warning,
+                confidence: Confidence::Fact,
+                title: "GPU0 began throttling".into(),
+                evidence: "post-migration echo".into(),
+            }])
+            .unwrap();
+        assert_eq!(store.events_between(0, 10_000).unwrap().len(), 2);
+    }
+
+    /// Reopening an already-migrated database must not rerun the collapse (the probe on
+    /// the index keeps every later open scan-free) — and must keep the constraint.
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let scratch = Scratch::new();
+        let e = event_at(&dev("g"), 1_000, EventKind::IdleGap, "likely a stall");
+        {
+            let (mut store, _) = SqliteStore::open(&scratch.path).unwrap();
+            store.insert_events(std::slice::from_ref(&e)).unwrap();
+        }
+        let (mut store, was_reset) = SqliteStore::open(&scratch.path).unwrap();
+        assert!(!was_reset);
+        store.insert_events(std::slice::from_ref(&e)).unwrap();
+        assert_eq!(store.events_between(0, 2_000).unwrap().len(), 1);
     }
 
     /// latest_event_ms: overall max, per-kind max, and None for an absent kind — the demo
