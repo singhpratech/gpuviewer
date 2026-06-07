@@ -521,26 +521,87 @@ fn fmt_clock(ms: u64) -> String {
         .unwrap_or_else(|| "--:--:--".into())
 }
 
-/// Whether a single device's frame reads as idle for the adaptive-backoff decision: device
-/// util below the threshold AND no attached process itself shows real GPU use. Pure so the
-/// backoff state machine is unit-tested without a tick loop.
+/// Whether a single device's frame reads as idle for the adaptive-backoff decision. Pure so
+/// the backoff state machine is unit-tested without a tick loop.
 ///
-/// A device with no util sample is treated as NOT idle: we cannot prove it is asleep, and
-/// stretching the cadence on an unknown could miss a throttle onset.
-pub fn device_is_idle(sample: Option<&DynamicSample>, procs: &[ProcessSample]) -> bool {
+/// `util_pct`, when reported, is authoritative: below the threshold AND no attached process
+/// itself showing real GPU use → idle. When the device CANNOT report utilization — Intel
+/// never does (the device-level PMU needs root/CAP_PERFMON; intel.rs hardcodes honest
+/// `None`), so the old "None → not idle" rule pinned the whole loop at full cadence forever
+/// on any machine containing such a device, killing the bottom #1291 mitigation exactly
+/// where it matters (docs/research/06-production-platform-deepdive.md, "cross-cutting
+/// defect") — fall back to activity signals the device DOES report, via
+/// [`util_less_activity`]. With no signal at all the device is backoff-eligible: unknown
+/// must not mean "busy". The worry behind the old rule — backing off through a throttle
+/// onset — is covered by the fallback: an onset asserts a throttle reason and moves clocks,
+/// both of which snap the cadence back. No utilization value is fabricated anywhere;
+/// absence stays absence in everything rendered or recorded.
+///
+/// A failed probe (`sample` = `None`) still reads as NOT idle: that is a fault to watch at
+/// full rate, not an unknown-but-quiet device.
+pub fn device_is_idle(
+    prev: Option<&DynamicSample>,
+    sample: Option<&DynamicSample>,
+    procs: &[ProcessSample],
+) -> bool {
     let Some(s) = sample else { return false };
-    let Some(util) = s.util_pct else { return false };
-    if util >= IDLE_UTIL_PCT {
-        return false;
-    }
-    !procs
+    // An attached process provably computing holds full cadence regardless of how (or
+    // whether) the device-level story is told.
+    if procs
         .iter()
         .any(|p| p.util_pct.map(|u| u >= IDLE_UTIL_PCT).unwrap_or(false))
+    {
+        return false;
+    }
+    match s.util_pct {
+        Some(util) => util < IDLE_UTIL_PCT,
+        None => !util_less_activity(prev, s),
+    }
+}
+
+/// Activity signals for a device that cannot report utilization. Every check is a genuine
+/// observation already carried by the model — nothing here invents a util number.
+fn util_less_activity(prev: Option<&DynamicSample>, s: &DynamicSample) -> bool {
+    // Video engines busy: encode/decode is real work even with zero 3D/compute load.
+    if s.encoder_pct.map(|u| u >= IDLE_UTIL_PCT).unwrap_or(false)
+        || s.decoder_pct.map(|u| u >= IDLE_UTIL_PCT).unwrap_or(false)
+    {
+        return true;
+    }
+    // An asserted throttle reason means the device is being limited, hence working.
+    if s.throttle.any() {
+        return true;
+    }
+    // The remaining signals are deltas against the last good sample; with no baseline yet
+    // there is nothing to compare (the streak threshold absorbs the first tick anyway).
+    let Some(p) = prev else { return false };
+    // VRAM moved since we last looked: something allocated or freed.
+    if let (Some(a), Some(b)) = (p.mem_used_bytes, s.mem_used_bytes) {
+        if a.abs_diff(b) >= IDLE_MEM_DELTA_BYTES {
+            return true;
+        }
+    }
+    // Clocks moved past wobble — or the device left a parked state where the actual
+    // frequency reads as absent (Intel act-freq is None inside RC6): it woke up to work.
+    match (p.sm_clock_mhz, s.sm_clock_mhz) {
+        (Some(a), Some(b)) => a.abs_diff(b) > IDLE_CLOCK_JITTER_MHZ,
+        (None, Some(_)) => true,
+        _ => false,
+    }
 }
 
 /// A device counts as idle below this util (device or any process). Matches the "low-power
 /// cadence" wedge: a desktop GPU at <5% with nothing computing is genuinely asleep.
 const IDLE_UTIL_PCT: f32 = 5.0;
+
+/// VRAM movement between consecutive good samples below this is allocator churn (a desktop
+/// compositor recycles small buffers constantly), not activity worth full cadence.
+const IDLE_MEM_DELTA_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Clock movement at or below this is sensor wobble around a parked frequency. Any real
+/// load (or throttle onset) shifts clocks by hundreds of MHz, so the signal still catches
+/// a wake-up within one tick.
+const IDLE_CLOCK_JITTER_MHZ: u32 = 25;
 
 /// Consecutive all-idle ticks before the cadence stretches.
 pub const BACKOFF_AFTER_IDLE_TICKS: u32 = 60;
@@ -550,8 +611,8 @@ const BACKOFF_MULTIPLIER: u32 = 5;
 const BACKOFF_CAP: Duration = Duration::from_secs(10);
 
 /// The effective sleep for the next loop iteration given how many consecutive all-idle ticks
-/// have elapsed. ANY non-idle tick resets `idle_streak` to 0 (the caller's job), which snaps
-/// the cadence back to the configured interval instantly. Pure for unit testing.
+/// have elapsed. ANY non-idle tick resets `idle_streak` to 0 ([`Backoff::observe`]'s job),
+/// which snaps the cadence back to the configured interval instantly. Pure for unit testing.
 ///
 /// WHY this exists (CLAUDE.md / bottom #1291): polling has side effects — NVIDIA temp polling
 /// keeps GPUs awake and AMD GRBM register reads break GFXOFF. On a genuinely idle GPU the
@@ -563,6 +624,64 @@ pub fn effective_interval(interval: Duration, idle_streak: u32) -> Duration {
         (interval * BACKOFF_MULTIPLIER).min(BACKOFF_CAP)
     } else {
         interval
+    }
+}
+
+/// The adaptive-backoff state machine: consecutive all-idle ticks stretch the cadence
+/// ([`effective_interval`]); any non-idle tick snaps it back instantly. Owns the
+/// previous-sample baseline that [`device_is_idle`]'s util-less fallback diffs against —
+/// kept off `Shared` so the whole policy is a plain value a scripted-stream test drives
+/// without threads, locks, or a clock. The footer never lies about the result: it renders
+/// the same `effective_interval_ms` atomic the loop actually sleeps on.
+pub struct Backoff {
+    /// `--no-backoff` → false: always the configured interval, streak irrelevant.
+    enabled: bool,
+    interval: Duration,
+    /// Consecutive all-idle ticks; any non-idle tick resets it to 0.
+    idle_streak: u32,
+    /// Last good sample per device (collection order) — the delta baseline. Carried across
+    /// failed-probe ticks: "VRAM moved since we last could look" is still activity.
+    prev: Vec<Option<DynamicSample>>,
+}
+
+impl Backoff {
+    pub fn new(enabled: bool, interval: Duration, devices: usize) -> Self {
+        Self {
+            enabled,
+            interval,
+            idle_streak: 0,
+            prev: vec![None; devices],
+        }
+    }
+
+    /// Fold one tick's frame in; returns the sleep before the next tick.
+    pub fn observe(&mut self, frame: &Frame) -> Duration {
+        let mut all_idle = true;
+        for (i, fd) in frame.devices.iter().enumerate() {
+            let prev = self.prev.get(i).and_then(Option::as_ref);
+            if !device_is_idle(prev, fd.sample.as_ref(), &fd.processes) {
+                all_idle = false;
+            }
+            if let (Some(slot), Some(s)) = (self.prev.get_mut(i), &fd.sample) {
+                *slot = Some(s.clone());
+            }
+        }
+        if !self.enabled {
+            return self.interval;
+        }
+        if all_idle {
+            self.idle_streak = self.idle_streak.saturating_add(1);
+        } else {
+            self.idle_streak = 0;
+        }
+        effective_interval(self.interval, self.idle_streak)
+    }
+
+    /// A paused tick observes nothing: do not let the idle streak grow (it would back off
+    /// on resume against stale state) and poll the pause flag at the configured interval.
+    pub fn skip(&mut self) -> Duration {
+        self.idle_streak = 0;
+        self.interval
     }
 }
 
@@ -622,20 +741,18 @@ impl Collector {
         let s = Arc::clone(&shared);
         let p = Arc::clone(&paused);
         std::thread::spawn(move || {
-            // Consecutive all-idle ticks; any non-idle tick snaps it back to 0.
-            let mut idle_streak: u32 = 0;
+            let mut cadence = Backoff::new(backoff, interval, n);
             loop {
-                let mut all_idle = true;
-                if !p.load(Ordering::Relaxed) {
+                let effective = if !p.load(Ordering::Relaxed) {
                     let frame = engine.tick();
+                    // Classify before the lock — Backoff carries its own delta baseline,
+                    // so the idle decision never touches (or contends on) Shared.
+                    let effective = cadence.observe(&frame);
                     let mut sh = s.lock().unwrap();
                     for (i, fd) in frame.devices.iter().enumerate() {
                         if let Some(sample) = &fd.sample {
                             sh.history.push_sample(&fd.id, sample.clone());
                             sh.latest[i] = Some(sample.clone());
-                        }
-                        if !device_is_idle(fd.sample.as_ref(), &fd.processes) {
-                            all_idle = false;
                         }
                         sh.processes[i] = fd.processes.clone();
                     }
@@ -643,22 +760,9 @@ impl Collector {
                     // Publish the tick AFTER its data is folded in, so a reader seeing
                     // the new seq always sees the new frame too.
                     sh.tick_seq += 1;
+                    effective
                 } else {
-                    // While paused we are not observing anything, so do not let the idle
-                    // streak grow (it would back off on resume against stale state).
-                    all_idle = false;
-                }
-
-                // Update the streak and the effective cadence for the next sleep.
-                let effective = if backoff {
-                    if all_idle {
-                        idle_streak = idle_streak.saturating_add(1);
-                    } else {
-                        idle_streak = 0;
-                    }
-                    effective_interval(interval, idle_streak)
-                } else {
-                    interval
+                    cadence.skip()
                 };
                 effective_interval_ms.store(effective.as_millis() as u64, Ordering::Relaxed);
                 std::thread::sleep(effective);
@@ -739,6 +843,37 @@ mod tests {
             cpu_pct: None,
             container: None,
         }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Script one tick's frame for [`Backoff`] from per-device (sample, processes) pairs —
+    /// the scripted-stream harness for the cadence tests, same spirit as the MockBackend's
+    /// scripted streams but with full control over every Option field.
+    fn frame_of(devs: Vec<(Option<DynamicSample>, Vec<ProcessSample>)>) -> Frame {
+        Frame {
+            ts_ms: 0,
+            devices: devs
+                .into_iter()
+                .enumerate()
+                .map(|(i, (sample, processes))| FrameDevice {
+                    id: DeviceId(format!("test:{i}")),
+                    name: format!("dev{i}"),
+                    mem_total_bytes: None,
+                    sample,
+                    processes,
+                })
+                .collect(),
+            events: Vec::new(),
+        }
+    }
+
+    /// The dev machine's Intel iGPU, as the audit describes it: util NEVER reported, no
+    /// mem-used, clock parked at the minimum tick after tick, a quiet compositor attached.
+    fn quiet_igpu() -> (Option<DynamicSample>, Vec<ProcessSample>) {
+        let mut s = sample(None);
+        s.sm_clock_mhz = Some(300);
+        (Some(s), vec![proc(Some(1.0))])
     }
 
     #[test]
@@ -849,18 +984,202 @@ mod tests {
     #[test]
     fn device_is_idle_requires_low_device_and_process_util() {
         // Device below 5% and no busy process → idle.
-        assert!(device_is_idle(Some(&sample(Some(2.0))), &[proc(Some(1.0))]));
+        assert!(device_is_idle(
+            None,
+            Some(&sample(Some(2.0))),
+            &[proc(Some(1.0))]
+        ));
         // Device busy → not idle.
-        assert!(!device_is_idle(Some(&sample(Some(40.0))), &[]));
+        assert!(!device_is_idle(None, Some(&sample(Some(40.0))), &[]));
         // Device idle but a process is computing → not idle (work is queued/running).
         assert!(!device_is_idle(
+            None,
             Some(&sample(Some(1.0))),
             &[proc(Some(80.0))]
         ));
-        // Unknown device util → never assume idle (could mask a throttle onset).
-        assert!(!device_is_idle(Some(&sample(None)), &[]));
-        // No sample at all → not idle.
-        assert!(!device_is_idle(None, &[]));
+        // No sample at all (failed probe) → not idle: a fault is watched at full rate.
+        assert!(!device_is_idle(None, None, &[]));
+    }
+
+    /// The audit's cross-cutting defect (06-production-platform-deepdive.md): Intel reports
+    /// `util_pct: None` on every tick, and the old "None → not idle" rule made such a device
+    /// pin the loop at full cadence forever. A util-less device with no other activity
+    /// signal must be backoff-eligible — unknown is not "busy".
+    #[test]
+    fn util_less_device_with_no_activity_signal_is_backoff_eligible() {
+        // Bare sample (everything None, no throttle): no signal at all.
+        assert!(device_is_idle(None, Some(&sample(None)), &[]));
+        // The ubiquitous iGPU shape: a quiet compositor attached is not activity…
+        assert!(device_is_idle(
+            Some(&sample(None)),
+            Some(&sample(None)),
+            &[proc(Some(1.0))]
+        ));
+        // …and a process whose own util is unknown is not proof of work either (the old
+        // process check already treated unknown process util as not-busy).
+        assert!(device_is_idle(None, Some(&sample(None)), &[proc(None)]));
+    }
+
+    /// Every fallback signal is a real observation; each one alone must hold full cadence
+    /// on a device that cannot report utilization.
+    #[test]
+    fn util_less_device_with_genuine_activity_is_not_idle() {
+        // fdinfo engine-busy on an attached process.
+        assert!(!device_is_idle(
+            None,
+            Some(&sample(None)),
+            &[proc(Some(80.0))]
+        ));
+
+        // VRAM moved at least the churn threshold since the last good sample…
+        let mut prev = sample(None);
+        prev.mem_used_bytes = Some(GIB);
+        let mut cur = sample(None);
+        cur.mem_used_bytes = Some(GIB + IDLE_MEM_DELTA_BYTES);
+        assert!(!device_is_idle(Some(&prev), Some(&cur), &[]));
+        // …but sub-threshold churn (compositor buffer recycling) is not activity.
+        cur.mem_used_bytes = Some(GIB + IDLE_MEM_DELTA_BYTES - 1);
+        assert!(device_is_idle(Some(&prev), Some(&cur), &[]));
+
+        // Clocks moved past wobble.
+        let mut prev = sample(None);
+        prev.sm_clock_mhz = Some(300);
+        let mut cur = sample(None);
+        cur.sm_clock_mhz = Some(900);
+        assert!(!device_is_idle(Some(&prev), Some(&cur), &[]));
+        // Single-bin wobble around a parked frequency is not activity.
+        cur.sm_clock_mhz = Some(300 + IDLE_CLOCK_JITTER_MHZ);
+        assert!(device_is_idle(Some(&prev), Some(&cur), &[]));
+        // Waking out of a parked/RC6 state (clock absent → present) is, even with no
+        // delta to compute.
+        prev.sm_clock_mhz = None;
+        cur.sm_clock_mhz = Some(300);
+        assert!(!device_is_idle(Some(&prev), Some(&cur), &[]));
+
+        // A busy video engine.
+        let mut enc = sample(None);
+        enc.encoder_pct = Some(60.0);
+        assert!(!device_is_idle(None, Some(&enc), &[]));
+
+        // An asserted throttle reason — the throttle-onset worry behind the old rule.
+        let mut thr = sample(None);
+        thr.throttle.thermal = true;
+        assert!(!device_is_idle(None, Some(&thr), &[]));
+    }
+
+    // ---- backoff state machine (scripted streams) ----
+
+    /// Regression for the audit's backoff-vs-Intel defect: a device that can NEVER report
+    /// utilization but is otherwise quiet must not pin the loop at full cadence — after the
+    /// idle-streak threshold the cadence stretches exactly as for a measurably-idle GPU.
+    #[test]
+    fn always_none_util_device_does_not_pin_cadence() {
+        let interval = Duration::from_secs(1);
+        let mut cadence = Backoff::new(true, interval, 1);
+        for i in 1..BACKOFF_AFTER_IDLE_TICKS {
+            assert_eq!(
+                cadence.observe(&frame_of(vec![quiet_igpu()])),
+                interval,
+                "tick {i}: configured cadence until the streak threshold"
+            );
+        }
+        assert_eq!(
+            cadence.observe(&frame_of(vec![quiet_igpu()])),
+            Duration::from_secs(5),
+            "a quiet always-None-util device must reach the low-power cadence"
+        );
+    }
+
+    /// A device with real activity holds full cadence forever — both the measured form
+    /// (util reported high) and the util-less-but-provably-active form (clocks moving
+    /// under a load we cannot measure directly).
+    #[test]
+    fn active_device_holds_full_cadence() {
+        let interval = Duration::from_secs(1);
+
+        let mut cadence = Backoff::new(true, interval, 1);
+        for _ in 0..BACKOFF_AFTER_IDLE_TICKS * 2 {
+            let f = frame_of(vec![(Some(sample(Some(90.0))), vec![])]);
+            assert_eq!(
+                cadence.observe(&f),
+                interval,
+                "measured load: never stretch"
+            );
+        }
+
+        let mut cadence = Backoff::new(true, interval, 1);
+        let mut clock = 600u32;
+        for _ in 0..BACKOFF_AFTER_IDLE_TICKS * 2 {
+            clock = if clock == 600 { 1_100 } else { 600 };
+            let mut s = sample(None);
+            s.sm_clock_mhz = Some(clock);
+            assert_eq!(
+                cadence.observe(&frame_of(vec![(Some(s), vec![])])),
+                interval,
+                "util-less device with moving clocks: never stretch"
+            );
+        }
+    }
+
+    /// Backoff requires ALL devices idle: the util-less iGPU no longer pins the cadence,
+    /// but it must not unpin a machine whose other GPU is genuinely busy (the NVIDIA+Intel
+    /// hybrid from the audit, with the dGPU under load this time).
+    #[test]
+    fn busy_device_next_to_util_less_one_holds_full_cadence() {
+        let interval = Duration::from_secs(1);
+        let mut cadence = Backoff::new(true, interval, 2);
+        for _ in 0..BACKOFF_AFTER_IDLE_TICKS * 2 {
+            let f = frame_of(vec![(Some(sample(Some(95.0))), vec![]), quiet_igpu()]);
+            assert_eq!(cadence.observe(&f), interval);
+        }
+    }
+
+    /// Once stretched, a wake on the util-less device — visible only through a process
+    /// turning busy — snaps the cadence back within one tick.
+    #[test]
+    fn wake_on_util_less_device_snaps_cadence_back() {
+        let interval = Duration::from_secs(1);
+        let mut cadence = Backoff::new(true, interval, 1);
+        for _ in 0..BACKOFF_AFTER_IDLE_TICKS + 5 {
+            cadence.observe(&frame_of(vec![quiet_igpu()]));
+        }
+        assert_eq!(
+            cadence.observe(&frame_of(vec![quiet_igpu()])),
+            Duration::from_secs(5),
+            "precondition: well into low-power cadence"
+        );
+        let (s, _) = quiet_igpu();
+        let woke = frame_of(vec![(s, vec![proc(Some(40.0))])]);
+        assert_eq!(
+            cadence.observe(&woke),
+            interval,
+            "wake snaps back instantly"
+        );
+    }
+
+    /// `--no-backoff` means exactly that: the configured interval regardless of idleness.
+    #[test]
+    fn disabled_backoff_never_stretches() {
+        let interval = Duration::from_secs(1);
+        let mut cadence = Backoff::new(false, interval, 1);
+        for _ in 0..BACKOFF_AFTER_IDLE_TICKS * 2 {
+            assert_eq!(cadence.observe(&frame_of(vec![quiet_igpu()])), interval);
+        }
+    }
+
+    /// Paused ticks observe nothing, so they must reset the streak rather than let it
+    /// ride into a stretch that would apply on resume against stale state.
+    #[test]
+    fn paused_ticks_reset_the_streak() {
+        let interval = Duration::from_secs(1);
+        let mut cadence = Backoff::new(true, interval, 1);
+        for _ in 0..BACKOFF_AFTER_IDLE_TICKS - 1 {
+            cadence.observe(&frame_of(vec![quiet_igpu()]));
+        }
+        assert_eq!(cadence.skip(), interval);
+        // One more idle tick would have crossed the threshold pre-pause; post-pause the
+        // streak starts over.
+        assert_eq!(cadence.observe(&frame_of(vec![quiet_igpu()])), interval);
     }
 
     // ---- --on-event sink ----
