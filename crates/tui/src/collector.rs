@@ -723,6 +723,17 @@ impl Engine {
         }
     }
 
+    /// Test seam for the inter-tick stall-gap narration: inject the previous tick's end
+    /// instant directly. `tick` measures the gap against `Instant::now()` with no clock
+    /// abstraction, so without this seam the only way to drive the stall path would be a
+    /// real 5s+ sleep — exactly the wall-clock flakiness the suite avoids. The injected
+    /// instant is a genuine `Instant` (typically `now - gap`), so the production
+    /// comparison code runs unmodified; nothing about the measurement is faked.
+    #[cfg(test)]
+    pub(crate) fn set_last_tick_end(&mut self, t: Instant) {
+        self.last_tick_end = Some(t);
+    }
+
     /// The `device` anchor for collector-scoped events (stall, panic, session boundary):
     /// the first registered device, or a stable placeholder when none exists. One helper
     /// so every recorder-lifecycle fact follows the same convention.
@@ -1902,9 +1913,13 @@ mod tests {
             evidence: "e".into(),
         });
 
-        // Wait (bounded) for the detached child to write the file.
+        // Wait (bounded) for the detached child to write the file. The budget is ~10s of
+        // 10ms polls: Windows CI runners spawn cmd.exe slowly enough that a 2s budget is
+        // flake territory, and a real wiring regression must fail THIS assertion (with
+        // the diff below), never decay into a timeout that reads as infrastructure noise.
+        // The fast path is unchanged — the loop exits on the first poll that sees output.
         let mut got = String::new();
-        for _ in 0..200 {
+        for _ in 0..1000 {
             if let Ok(s) = std::fs::read_to_string(&out) {
                 if !s.trim().is_empty() {
                     got = s;
@@ -2252,6 +2267,33 @@ mod tests {
         )
     }
 
+    /// A never-failing persisting [`flaky_engine`] over `path`, retrying (bounded) while
+    /// the store's instance lock is transiently held. WHY: the lock is `flock`-based and
+    /// lives on the open file DESCRIPTION — when an unrelated test's `Command::spawn`
+    /// forks while a previous holder's lock fd is open, the child inherits the fd and
+    /// keeps the lock alive until exec closes it (CLOEXEC). The spawning thread is
+    /// vfork-blocked through that window, but OTHER test threads (this one) keep running
+    /// into it, so a test that re-acquires a lock its own process just dropped can lose
+    /// the race for a few microseconds. Transient by construction; a REAL lock leak
+    /// still fails the budget loudly. Tests opening a path's lock for the FIRST time
+    /// are not exposed (a never-held lock cannot have been inherited) and use
+    /// [`flaky_engine`] directly.
+    fn flaky_engine_persisting(path: &std::path::Path) -> Engine {
+        for _ in 0..500 {
+            let engine = flaky_engine(Some(path.to_path_buf()), |_| false);
+            if engine.db_path().is_some() {
+                return engine;
+            }
+            drop(engine);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "instance lock on {} still held after 5s — a real lock leak, not the \
+             fork-inheritance window",
+            path.display()
+        );
+    }
+
     /// The new kinds' wire tokens must match the spec/schema/suite spelling exactly.
     /// The conformance suite cannot see them on a mock run (the mock never loses a
     /// device), so the token spelling is pinned here instead.
@@ -2508,6 +2550,368 @@ mod tests {
         cleanup_db(&path);
     }
 
+    // ---- collector self-honesty: stall gap + slow probe (CollectorStall) ----
+
+    /// A backend whose `refresh_dynamic` genuinely takes longer than [`SLOW_PROBE`] on
+    /// scripted tick indices — the slow-probe note's trigger (NVML PCIe-throughput calls
+    /// and a sleeping GPU waking really do block like this). The probe duration is
+    /// measured with a real `Instant` inside `tick` (no clock seam exists there), so the
+    /// scripted slowness must be real elapsed time inside the probe; sleeping 50ms past
+    /// the threshold means scheduler jitter can only ADD time — the test can never flake
+    /// toward "not slow".
+    struct SluggishBackend<F: Fn(u32) -> bool + Send> {
+        tick: u32,
+        slow: F,
+    }
+
+    impl<F: Fn(u32) -> bool + Send> GpuBackend for SluggishBackend<F> {
+        fn name(&self) -> &'static str {
+            "sluggish"
+        }
+        fn devices(&mut self) -> Vec<DeviceId> {
+            vec![DeviceId("sluggish:0".into())]
+        }
+        fn static_info(&mut self, dev: &DeviceId) -> Result<StaticInfo, BackendError> {
+            Ok(StaticInfo {
+                id: dev.clone(),
+                vendor: Vendor::Unknown,
+                name: "Sluggish GPU".into(),
+                backend: "sluggish".into(),
+                mem_total_bytes: Some(8 << 30),
+                power_limit_mw: None,
+                max_sm_clock_mhz: None,
+                temp_slowdown_c: None,
+                driver_version: None,
+                process_hint: None,
+                source_caveat: None,
+            })
+        }
+        fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {
+            let t = self.tick;
+            self.tick += 1;
+            if (self.slow)(t) {
+                std::thread::sleep(SLOW_PROBE + Duration::from_millis(50));
+            }
+            Ok(sample(Some(50.0)))
+        }
+        fn refresh_processes(
+            &mut self,
+            _dev: &DeviceId,
+        ) -> Result<Vec<ProcessSample>, BackendError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An engine over a [`SluggishBackend`] with the given slowness script, live-only.
+    fn sluggish_engine(slow: impl Fn(u32) -> bool + Send + 'static) -> Engine {
+        Engine::with_backends(
+            vec![Box::new(SluggishBackend { tick: 0, slow })],
+            EngineConfig::default(),
+        )
+    }
+
+    /// The inter-tick stall gap — the collector narrating its OWN hole: a between-tick
+    /// gap past [`stall_threshold`] must surface as a `CollectorStall` WARNING fact on
+    /// the next successful tick, anchored to the first device, with the threshold in the
+    /// auditable evidence — and a normal next gap must NOT re-narrate (the stall is a
+    /// per-occurrence fact, not a latched state). Driven through the `set_last_tick_end`
+    /// seam: `tick` reads `Instant::now()` directly, and sleeping a real 5s+ gap would
+    /// be exactly the wall-clock flake the suite forbids.
+    #[test]
+    fn inter_tick_gap_past_threshold_narrates_a_collector_stall() {
+        let mut engine = flaky_engine(None, |_| false);
+
+        // First tick: no previous tick end exists, so no gap can be claimed.
+        let TickOutcome::Frame(first) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(
+            first
+                .events
+                .iter()
+                .all(|e| e.kind != EventKind::CollectorStall),
+            "no stall may be narrated before a gap was ever measurable"
+        );
+
+        // Inject a previous-tick end 6s in the past — past the 5s threshold at the
+        // default 1s interval (stall_threshold = max(3×1s, 5s)).
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(6))
+            .expect("system uptime exceeds 6s");
+        engine.set_last_tick_end(past);
+        let TickOutcome::Frame(stalled) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        let stalls: Vec<&Event> = stalled
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::CollectorStall)
+            .collect();
+        assert_eq!(stalls.len(), 1, "the gap must be narrated exactly once");
+        let e = stalls[0];
+        assert_eq!(
+            e.severity,
+            Severity::Warning,
+            "a recording hole is a warning"
+        );
+        assert_eq!(
+            e.confidence,
+            Confidence::Fact,
+            "the gap was measured, not inferred"
+        );
+        assert_eq!(
+            e.device.0, "flaky:0",
+            "anchored to the first device like every collector-scoped fact"
+        );
+        assert!(
+            e.title.contains("collection stalled"),
+            "title must say collection stalled: {}",
+            e.title
+        );
+        assert!(
+            e.title.contains("last good frame at"),
+            "title must place the last good frame in time: {}",
+            e.title
+        );
+        assert!(
+            e.evidence.contains("inter-tick gap") && e.evidence.contains("stall threshold"),
+            "evidence must carry the measured gap and the threshold it crossed: {}",
+            e.evidence
+        );
+        assert!(
+            stalled.devices[0].sample.is_some(),
+            "the narrating tick itself collected normally — the hole is behind it"
+        );
+
+        // Recovery: the next tick's gap is normal and must stay silent.
+        let TickOutcome::Frame(after) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(
+            after
+                .events
+                .iter()
+                .all(|e| e.kind != EventKind::CollectorStall),
+            "a normal gap after a narrated stall must not re-narrate"
+        );
+    }
+
+    /// The slow-probe foreshadowing note: one probe past [`SLOW_PROBE`] narrates an INFO
+    /// `CollectorStall` fact against the slow device itself; a second slow probe inside
+    /// the cooldown stays silent (a persistently-slow driver must not flood the feed);
+    /// a fast probe afterwards narrates nothing — and every tick, slow or not, still
+    /// collects real data (slow is not lost).
+    #[test]
+    fn slow_probe_notes_once_per_cooldown_and_recovers_silently() {
+        // Ticks 0 and 1 are slow; tick 2 is fast.
+        let mut engine = sluggish_engine(|t| t <= 1);
+
+        let TickOutcome::Frame(first) = engine.tick_guarded() else {
+            panic!("sluggish ticks never panic");
+        };
+        let notes: Vec<&Event> = first
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::CollectorStall)
+            .collect();
+        assert_eq!(notes.len(), 1, "a slow probe must be noted");
+        let e = notes[0];
+        assert_eq!(
+            e.severity,
+            Severity::Info,
+            "a slow probe is a foreshadowing note, not an alarm"
+        );
+        assert_eq!(
+            e.confidence,
+            Confidence::Fact,
+            "the probe duration was measured"
+        );
+        assert_eq!(
+            e.device.0, "sluggish:0",
+            "the note is anchored to the slow device itself"
+        );
+        assert!(
+            e.title.contains("probe took") && e.title.contains("driver slow to respond"),
+            "title must name the slowness and its shape: {}",
+            e.title
+        );
+        assert!(
+            e.title.contains("sluggish"),
+            "title must name which backend was slow: {}",
+            e.title
+        );
+        assert!(
+            e.evidence.contains("refresh_dynamic") && e.evidence.contains("threshold"),
+            "evidence must carry the probe and the threshold it crossed: {}",
+            e.evidence
+        );
+        assert!(
+            first.devices[0].sample.is_some(),
+            "the slow tick still collected — slow is not lost"
+        );
+
+        // A second slow probe within the cooldown: rate-capped, no second note.
+        let TickOutcome::Frame(second) = engine.tick_guarded() else {
+            panic!("sluggish ticks never panic");
+        };
+        assert!(
+            second
+                .events
+                .iter()
+                .all(|e| e.kind != EventKind::CollectorStall),
+            "a persistently-slow driver must not flood the story feed"
+        );
+        assert!(second.devices[0].sample.is_some());
+
+        // Recovery: a fast probe narrates nothing and collection is normal.
+        let TickOutcome::Frame(third) = engine.tick_guarded() else {
+            panic!("sluggish ticks never panic");
+        };
+        assert!(
+            third
+                .events
+                .iter()
+                .all(|e| e.kind != EventKind::CollectorStall),
+            "a recovered (fast) probe must stay silent"
+        );
+        assert!(third.devices[0].sample.is_some());
+    }
+
+    // ---- history reset (corrupt-db quarantine narration) ----
+
+    /// The recorder narrating its own amnesia: a corrupt history file is quarantined at
+    /// open and the store starts fresh — the collector must say so as a one-shot
+    /// `HistoryReset` WARNING fact riding the FIRST tick (before the session's start
+    /// mark), and the fresh store must work normally underneath it. Without the
+    /// narration, the vanished history would masquerade as the GPU having no past.
+    #[test]
+    fn corrupt_history_file_narrates_history_reset_on_the_first_tick() {
+        const GARBAGE: &[u8] = b"definitely not a sqlite database";
+        let path = scratch_db();
+        std::fs::write(&path, GARBAGE).unwrap();
+
+        let mut engine = flaky_engine(Some(path.clone()), |_| false);
+        let TickOutcome::Frame(first) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        let resets: Vec<usize> = first
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == EventKind::HistoryReset)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            resets.len(),
+            1,
+            "the quarantine must be narrated exactly once"
+        );
+        let e = &first.events[resets[0]];
+        assert_eq!(
+            e.severity,
+            Severity::Warning,
+            "lost history is a warning, not routine lifecycle"
+        );
+        assert_eq!(
+            e.confidence,
+            Confidence::Fact,
+            "the quarantine happened — observed, not inferred"
+        );
+        assert_eq!(
+            e.device.0, "flaky:0",
+            "anchored to the first device like every collector-scoped fact"
+        );
+        assert!(
+            e.title.contains("corrupt") && e.title.contains("started fresh"),
+            "title must state the loss and the recovery: {}",
+            e.title
+        );
+        assert!(
+            e.evidence.contains(".corrupt-"),
+            "evidence must point at the preserved quarantine file: {}",
+            e.evidence
+        );
+        assert!(
+            e.evidence.contains("fresh database"),
+            "evidence must state a fresh database was created: {}",
+            e.evidence
+        );
+        let start_pos = first
+            .events
+            .iter()
+            .position(|ev| ev.kind == EventKind::RecordingStarted)
+            .expect("the session's start mark rides the first frame too");
+        assert!(
+            resets[0] < start_pos,
+            "the reset narrates before this session's start mark — the amnesia \
+             predates the session"
+        );
+
+        // One-shot: the second tick must not repeat it.
+        let TickOutcome::Frame(second) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(
+            second
+                .events
+                .iter()
+                .all(|e| e.kind != EventKind::HistoryReset),
+            "the reset is narrated once, on the first tick only"
+        );
+        drop(engine); // Drop flushes the recording tail.
+
+        // Downstream coherence: the fresh database is real and working — the narration
+        // itself persisted into it (so replay and `report` see the reset), the start
+        // mark landed, and the devices registered.
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let events = store.events_between(0, now_ms() + 60_000).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::HistoryReset)
+                .count(),
+            1,
+            "the reset fact survives into replay and report"
+        );
+        assert!(
+            events.iter().any(|e| e.kind == EventKind::RecordingStarted),
+            "the fresh store carries this session's start mark"
+        );
+        assert!(
+            !store.devices().unwrap().is_empty(),
+            "the fresh store registered the devices"
+        );
+        drop(store);
+
+        // The corrupt original was preserved (renamed aside, never deleted) — find it,
+        // verify the bytes survived, and clean it up with the db.
+        let dir = path.parent().unwrap();
+        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
+        let quarantined: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|d| d.ok())
+            .map(|d| d.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+            })
+            .collect();
+        assert!(
+            !quarantined.is_empty(),
+            "the corrupt file must be preserved for manual recovery, not deleted"
+        );
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            GARBAGE,
+            "preservation means the original bytes survive untouched"
+        );
+        for q in quarantined {
+            let _ = std::fs::remove_file(q);
+        }
+        cleanup_db(&path);
+    }
+
     // ---- session boundaries (recording_started / recording_stopped) ----
 
     /// The new kinds' wire tokens must match the spec/schema/suite spelling exactly —
@@ -2616,7 +3020,7 @@ mod tests {
         // is not a race wait — it only guarantees the two start marks land on distinct
         // millisecond timestamps, so the dedupe index cannot collapse them.)
         std::thread::sleep(Duration::from_millis(2));
-        drop(flaky_engine(Some(path.clone()), |_| false));
+        drop(flaky_engine_persisting(&path));
         let store = SqliteStore::open_readonly(&path).unwrap();
         let events = store.events_between(0, now_ms() + 60_000).unwrap();
         let second_start = events
@@ -2664,7 +3068,7 @@ mod tests {
                 .unwrap();
         }
 
-        drop(flaky_engine(Some(path.clone()), |_| false));
+        drop(flaky_engine_persisting(&path));
 
         let store = SqliteStore::open_readonly(&path).unwrap();
         let events = store.events_between(0, now_ms() + 60_000).unwrap();
