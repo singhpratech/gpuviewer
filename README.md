@@ -139,6 +139,11 @@ event with `GPV_EVENT_*` variables in the environment (rate-capped), e.g.
 - **Polling must not perturb what it measures.** Idle GPUs are polled on a stretched cadence
   (up to 5× the interval) so monitoring doesn't keep them awake or break GFXOFF; the
   effective cadence is shown in the footer rather than hidden; `--no-backoff` opts out.
+- **Self-impact is measured, not assumed.** On the dev machine (RTX 4090 Laptop + Intel
+  iGPU, two backends polled at a 1 s interval), 60 s of headless recording costs
+  1.6 CPU-seconds — ≈2.7% of one core — at ~25 MiB RSS, and the full TUI measures
+  the same ≈2.8%. Numbers vary with GPU count, driver, and kernel; remeasure yours with
+  `/usr/bin/time -v gpuviewer --json > /dev/null`.
 - **Mock data is always labeled.** The footer says "(mock data)" exactly when the data is
   mock — including replays of mock recordings — and mock/demo runs record to separate
   database files, never your real history.
