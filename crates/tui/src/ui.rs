@@ -116,6 +116,15 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
     let now_ms = gpuviewer_core::now_ms() as f64;
     let hist = shared.history.device(&info.id);
 
+    // Once the collector is dead these headlines describe a frozen snapshot, not the
+    // present — tag them the way replay tags its panes, so the values cannot read as
+    // current (the audit's tick-panic frozen-UI hole, rendering half).
+    let stale_tag = if shared.stopped.is_some() {
+        " STALE"
+    } else {
+        ""
+    };
+
     // Utilization chart.
     let util_pts: Vec<(f64, f64)> = hist
         .map(|h| {
@@ -139,7 +148,7 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" util {} ", latest_util)),
+                .title(format!(" util {latest_util}{stale_tag} ")),
         )
         .x_axis(Axis::default().bounds([-CHART_WINDOW_S, 0.0]))
         .y_axis(
@@ -174,7 +183,7 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         &VramChartCtx {
             headline: &latest_mem,
             x_bounds: [-CHART_WINDOW_S, 0.0],
-            title_tag: "",
+            title_tag: stale_tag,
             sample_w_s: 1.0,
             style: app.chart_style,
         },
@@ -900,9 +909,18 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info:
         })
         .collect();
 
+    let mut block = proc_block(info);
+    if shared.stopped.is_some() {
+        // The list is the last one collected, not the present process set — say so where
+        // the user is looking, like the charts' STALE tag.
+        block = block.title_bottom(Line::styled(
+            " stale — collection stopped ",
+            Style::default().fg(Color::Red).italic(),
+        ));
+    }
     let table = Table::new(rows, PROC_WIDTHS)
         .header(proc_header())
-        .block(proc_block(info));
+        .block(block);
     f.render_widget(table, area);
 }
 
@@ -1083,6 +1101,24 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
     // product exists to avoid. The rule holds in replay too — a mock run records to
     // the mock database, so its replay is also mock data.
     let mock_tag = if shared.mock { " (mock data)" } else { "" };
+    // A dead collector outranks every hint: in the live mode the panes are frozen at the
+    // stop, so the footer becomes the stop banner — when, why, and what the panes now
+    // mean. (Replay and the timeline already label their data as recorded history; the
+    // live view is the one place stale data could masquerade as current.)
+    if app.mode == Mode::Live {
+        if let Some(stop) = &shared.stopped {
+            let line = Line::from(format!(
+                " ✖ COLLECTION STOPPED {} — collector panicked: {} — panes show the last \
+                 data before the stop · q quit{mock_tag}",
+                fmt_clock(stop.at_ms),
+                stop.reason
+            ))
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Left);
+            f.render_widget(line, area);
+            return;
+        }
+    }
     let text = match app.mode {
         // The file viewer has no live mode behind the recording, so the "esc live" hint
         // would be a dead key dressed as a feature — the file's name and the read-only
@@ -1172,7 +1208,7 @@ mod tests {
 
     use super::{fmt_span, timeline_columns};
     use crate::app::App;
-    use crate::collector::{test_collector, Collector, Engine, EngineConfig};
+    use crate::collector::{test_collector, Collector, CollectorStop, Engine, EngineConfig};
 
     /// A rollup row carrying only a bucket key and a util peak — everything else absent,
     /// the way a sparse recording looks.
@@ -1435,6 +1471,44 @@ mod tests {
         assert!(
             screen.contains("low-power cadence 5s"),
             "active backoff must be announced:\n{screen}"
+        );
+    }
+
+    /// The rendering half of the tick-panic frozen-UI fix: once `Shared::stopped` is set,
+    /// the footer must state COLLECTION STOPPED with the time and the panic summary, and
+    /// the live panes must read stale — charts tagged like replay tags its panes, the
+    /// process table flagged — never as current data.
+    #[test]
+    fn stopped_collector_banner_and_stale_tags() {
+        let collector = test_collector(None);
+        let shared = Arc::clone(&collector.shared);
+        let app = App::new(collector);
+
+        // Alive: no banner, no stale tags anywhere.
+        let screen = draw(&app, &shared);
+        assert!(!screen.contains("COLLECTION STOPPED"));
+        assert!(!screen.contains("STALE"));
+
+        shared.lock().unwrap().stopped = Some(CollectorStop {
+            at_ms: 1_000_000_000_000,
+            reason: "attempt to multiply with overflow".into(),
+        });
+        let screen = draw(&app, &shared);
+        assert!(
+            screen.contains("COLLECTION STOPPED"),
+            "the footer must state the stop:\n{screen}"
+        );
+        assert!(
+            screen.contains("attempt to multiply with overflow"),
+            "the panic summary must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("STALE"),
+            "chart headlines must read stale, not current:\n{screen}"
+        );
+        assert!(
+            screen.contains("stale — collection stopped"),
+            "the process pane must flag its list as stale:\n{screen}"
         );
     }
 }

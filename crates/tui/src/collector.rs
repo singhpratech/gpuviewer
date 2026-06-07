@@ -72,6 +72,44 @@ pub fn is_stall(gap: Duration, interval: Duration) -> bool {
     gap > stall_threshold(interval)
 }
 
+/// Consecutive panicked ticks the collector survives before declaring itself dead. One
+/// panicked tick is dropped-frame weather (a decoder edge case on one bad sample — the
+/// same per-tick family as `NVML_ERROR_NOT_SUPPORTED` or an absent sysfs file); this many
+/// in a row is a deterministic fault, and retrying forever would narrate an event per tick
+/// while burning a core on a known-broken probe.
+pub const MAX_CONSECUTIVE_PANICS: u32 = 3;
+
+/// What one guarded tick ([`Engine::tick_guarded`]) produced. `Frame` is the normal path;
+/// `Panicked` means the tick body panicked and its frame is lost — the carried event
+/// narrates that hole (already persisted and `--on-event`-fired where those channels
+/// survived), and `fatal` tells the caller whether the panic budget is spent and the
+/// loop must stop, loudly.
+pub enum TickOutcome {
+    Frame(Frame),
+    Panicked {
+        /// The `CollectorStall` fact narrating this panic.
+        event: Event,
+        /// One-line panic message, for [`Shared::stopped`] and the stderr trail.
+        summary: String,
+        /// True once [`MAX_CONSECUTIVE_PANICS`] ticks panicked consecutively: the caller
+        /// must stop collecting and say so — never keep rendering as if live.
+        fatal: bool,
+    },
+}
+
+/// Best-effort one-liner from a panic payload: `panic!`, `assert!`, and the built-in
+/// index/overflow panics all carry `&str` or `String`; anything else is named rather
+/// than displayed — the message must never be swallowed entirely.
+fn panic_summary(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".into()
+    }
+}
+
 /// A single backend `refresh_dynamic` probe taking longer than this is worth a one-line
 /// Info note ("nvidia probe took 1.2s — driver slow to respond"): NVML/sysfs calls can block
 /// (PCIe-throughput queries, a sleeping GPU waking) and a slow probe foreshadows a stall.
@@ -129,6 +167,8 @@ pub struct Engine {
     pending_reset: Option<Event>,
     /// `--on-event` sink, shared with the JSON path so both modes fire it.
     sink: Option<EventSink>,
+    /// Consecutive panicked ticks ([`Engine::tick_guarded`]); any clean tick resets it.
+    consecutive_panics: u32,
 }
 
 impl Engine {
@@ -137,7 +177,16 @@ impl Engine {
     /// permission) logs to stderr and the monitor continues WITHOUT a recorder — losing the
     /// recording is never worth crashing the live view.
     pub fn new(config: EngineConfig) -> Self {
-        let mut backends = all_backends(config.force_mock);
+        Self::with_backends(all_backends(config.force_mock), config)
+    }
+
+    /// [`Engine::new`] over an explicit backend set instead of the registry — the seam
+    /// the panic-firewall tests inject a scripted panicking backend through. The registry
+    /// path is exactly this with `all_backends`.
+    pub(crate) fn with_backends(
+        mut backends: Vec<Box<dyn GpuBackend>>,
+        config: EngineConfig,
+    ) -> Self {
         let mut devices = Vec::new();
         let mut event_engine = EventEngine::new();
         // Normalized PCI address → name of the backend that registered it first.
@@ -243,6 +292,7 @@ impl Engine {
             last_slow_note: HashMap::new(),
             pending_reset,
             sink,
+            consecutive_panics: 0,
         }
     }
 
@@ -381,6 +431,109 @@ impl Engine {
             ts_ms: now_ms(),
             devices: frame_devices,
             events,
+        }
+    }
+
+    /// [`Engine::tick`] behind a panic firewall — the fix for the audit's tick-panic
+    /// frozen-UI hole (docs/research/06-production-platform-deepdive.md §1.3): a panic
+    /// anywhere in a tick (a backend parsing edge case, an arithmetic overflow in a
+    /// decoder) used to kill the collector thread while the TUI kept rendering the last
+    /// `Shared` snapshot forever — stale data masquerading as live, the worst possible
+    /// failure for a product whose thesis is honest recording.
+    ///
+    /// Policy: drop the panicked tick, narrate it as a `CollectorStall` FACT (that kind
+    /// asserts exactly "the recording has a hole"), and keep collecting — a one-off panic
+    /// is the same per-tick weather as `NVML_ERROR_NOT_SUPPORTED` or a blocked probe, and
+    /// losing the whole flight recording to one bad frame would contradict the product.
+    /// [`MAX_CONSECUTIVE_PANICS`] panics in a row mean the fault is deterministic, not
+    /// weather: the outcome turns `fatal` and the caller must stop, loudly. Any clean
+    /// tick resets the count.
+    pub fn tick_guarded(&mut self) -> TickOutcome {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick())) {
+            Ok(frame) => {
+                self.consecutive_panics = 0;
+                TickOutcome::Frame(frame)
+            }
+            Err(payload) => {
+                self.consecutive_panics += 1;
+                let summary = panic_summary(payload.as_ref());
+                let fatal = self.consecutive_panics >= MAX_CONSECUTIVE_PANICS;
+                // The default panic hook already printed the thread/location line at
+                // unwind time; this adds the collector's own framing. Either way the
+                // payload reaches stderr — a swallowed panic message would be its own
+                // honesty bug.
+                eprintln!(
+                    "gpuviewer: collector tick panicked ({}/{MAX_CONSECUTIVE_PANICS} \
+                     consecutive): {summary} (run with RUST_BACKTRACE=1 for a backtrace)",
+                    self.consecutive_panics
+                );
+                let event = self.panic_event(&summary, fatal);
+                // Record the fact while the recorder is still reachable — behind its own
+                // firewall: if the panic originated inside the recorder fold or the sink,
+                // recording the narration would panic again, and the narration must not
+                // take down the narrator. stderr above remains the floor.
+                let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(rec) = &mut self.recorder {
+                        rec.record_events(std::slice::from_ref(&event));
+                    }
+                    if let Some(sink) = &mut self.sink {
+                        sink.fire(&event);
+                    }
+                }));
+                if recorded.is_err() {
+                    eprintln!(
+                        "gpuviewer: recording the panic event panicked too — the event \
+                         reaches the live view only; stderr holds the full trail"
+                    );
+                }
+                TickOutcome::Panicked {
+                    event,
+                    summary,
+                    fatal,
+                }
+            }
+        }
+    }
+
+    /// The `CollectorStall` fact for one panicked tick — reusing the existing kind (it is
+    /// exactly "the recording has a hole") keeps the NDJSON contract untouched. Warning
+    /// while collection will retry; Critical when this panic spent the budget and
+    /// collection stops here.
+    fn panic_event(&self, summary: &str, fatal: bool) -> Event {
+        let anchor = self
+            .devices
+            .first()
+            .map(|(_, id, _)| id.clone())
+            .unwrap_or_else(|| DeviceId("collector".into()));
+        let n = self.consecutive_panics;
+        if fatal {
+            Event {
+                ts_ms: now_ms(),
+                device: anchor,
+                kind: EventKind::CollectorStall,
+                severity: Severity::Critical,
+                confidence: Confidence::Fact,
+                title: format!("collection STOPPED — collector panicked {n} ticks in a row"),
+                evidence: format!(
+                    "panic: {summary}; {n} consecutive tick panics spent the \
+                     {MAX_CONSECUTIVE_PANICS}-tick budget — collection will not resume \
+                     and the recording ends here; run with RUST_BACKTRACE=1 for a backtrace"
+                ),
+            }
+        } else {
+            Event {
+                ts_ms: now_ms(),
+                device: anchor,
+                kind: EventKind::CollectorStall,
+                severity: Severity::Warning,
+                confidence: Confidence::Fact,
+                title: "collector tick panicked — frame dropped, the recording has a hole".into(),
+                evidence: format!(
+                    "panic: {summary}; consecutive panic {n} of {MAX_CONSECUTIVE_PANICS} \
+                     tolerated, collection retries next tick; run with RUST_BACKTRACE=1 \
+                     for a backtrace"
+                ),
+            }
         }
     }
 
@@ -685,6 +838,17 @@ impl Backoff {
     }
 }
 
+/// Why and when the collector died, for the UI. Once set, the live panes can only show
+/// the last folded frame, and they must say so — stale data masquerading as live is the
+/// audit's worst failure shape (the tick-panic frozen-UI hole).
+#[derive(Clone)]
+pub struct CollectorStop {
+    /// Unix-millis instant the collector declared itself dead.
+    pub at_ms: u64,
+    /// One-line panic summary (the full trail is on stderr and in the event evidence).
+    pub reason: String,
+}
+
 /// State shared between the collector thread and the UI.
 pub struct Shared {
     pub infos: Vec<StaticInfo>,
@@ -703,11 +867,16 @@ pub struct Shared {
     /// footer can show "low-power cadence 5s". Published via an atomic so the UI reads it
     /// without taking the (already heavily-held) Shared lock on the collector's hot path.
     pub effective_interval_ms: Arc<AtomicU64>,
-    /// Collector ticks folded into this state so far, bumped once per frame. The timeline
-    /// overview re-queries its cached window when this advances — and only then, keeping
-    /// SQLite off the render path. Stays 0 forever in [`Collector::stationary`] sessions:
+    /// Collector ticks folded into this state so far, bumped once per frame (a panicked
+    /// tick bumps it too — its narration event is new state). The timeline overview
+    /// re-queries its cached window when this advances — and only then, keeping SQLite
+    /// off the render path. Stays 0 forever in [`Collector::stationary`] sessions:
     /// a recording does not grow.
     pub tick_seq: u64,
+    /// `Some` once the collector thread is dead ([`MAX_CONSECUTIVE_PANICS`] consecutive
+    /// tick panics): the UI must state collection STOPPED — with time and cause — and
+    /// mark every live pane stale, never current.
+    pub stopped: Option<CollectorStop>,
 }
 
 pub struct Collector {
@@ -735,6 +904,7 @@ impl Collector {
             interval_ms: interval.as_millis() as u64,
             effective_interval_ms: Arc::clone(&effective_interval_ms),
             tick_seq: 0,
+            stopped: None,
         }));
         let paused = Arc::new(AtomicBool::new(false));
 
@@ -744,23 +914,55 @@ impl Collector {
             let mut cadence = Backoff::new(backoff, interval, n);
             loop {
                 let effective = if !p.load(Ordering::Relaxed) {
-                    let frame = engine.tick();
-                    // Classify before the lock — Backoff carries its own delta baseline,
-                    // so the idle decision never touches (or contends on) Shared.
-                    let effective = cadence.observe(&frame);
-                    let mut sh = s.lock().unwrap();
-                    for (i, fd) in frame.devices.iter().enumerate() {
-                        if let Some(sample) = &fd.sample {
-                            sh.history.push_sample(&fd.id, sample.clone());
-                            sh.latest[i] = Some(sample.clone());
+                    // The guarded tick runs BEFORE the Shared lock is taken (as tick()
+                    // always did), so even a panic that somehow escaped the firewall
+                    // could never poison the mutex under the UI.
+                    match engine.tick_guarded() {
+                        TickOutcome::Frame(frame) => {
+                            // Classify before the lock — Backoff carries its own delta
+                            // baseline, so the idle decision never touches (or contends
+                            // on) Shared.
+                            let effective = cadence.observe(&frame);
+                            let mut sh = s.lock().unwrap();
+                            for (i, fd) in frame.devices.iter().enumerate() {
+                                if let Some(sample) = &fd.sample {
+                                    sh.history.push_sample(&fd.id, sample.clone());
+                                    sh.latest[i] = Some(sample.clone());
+                                }
+                                sh.processes[i] = fd.processes.clone();
+                            }
+                            sh.history.push_events(frame.events);
+                            // Publish the tick AFTER its data is folded in, so a reader
+                            // seeing the new seq always sees the new frame too.
+                            sh.tick_seq += 1;
+                            effective
                         }
-                        sh.processes[i] = fd.processes.clone();
+                        TickOutcome::Panicked {
+                            event,
+                            summary,
+                            fatal,
+                        } => {
+                            let mut sh = s.lock().unwrap();
+                            sh.history.push_events([event]);
+                            sh.tick_seq += 1;
+                            if fatal {
+                                // Dead, and saying so: `stopped` drives the UI's stop
+                                // banner and stale tags, the Critical fact above sits in
+                                // the story feed and the store, and ending the thread
+                                // drops the Engine — whose Drop flushes the recording
+                                // tail, so history is complete up to the stop.
+                                sh.stopped = Some(CollectorStop {
+                                    at_ms: now_ms(),
+                                    reason: summary,
+                                });
+                                return;
+                            }
+                            // A panicked tick observed nothing — same cadence rule as a
+                            // paused one, which also keeps a faulting collector watched
+                            // at the full configured rate rather than backed off.
+                            cadence.skip()
+                        }
                     }
-                    sh.history.push_events(frame.events);
-                    // Publish the tick AFTER its data is folded in, so a reader seeing
-                    // the new seq always sees the new frame too.
-                    sh.tick_seq += 1;
-                    effective
                 } else {
                     cadence.skip()
                 };
@@ -791,6 +993,7 @@ impl Collector {
                 interval_ms: 1000,
                 effective_interval_ms: Arc::new(AtomicU64::new(1000)),
                 tick_seq: 0,
+                stopped: None,
             })),
             paused: Arc::new(AtomicBool::new(false)),
         }
@@ -815,7 +1018,7 @@ pub(crate) fn test_collector(db_path: Option<PathBuf>) -> Collector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpuviewer_core::{ProcessKind, ThrottleReasons};
+    use gpuviewer_core::{BackendError, ProcessKind, ThrottleReasons, Vendor};
 
     fn sample(util: Option<f32>) -> DynamicSample {
         DynamicSample {
@@ -1226,6 +1429,264 @@ mod tests {
             "throttle_start",
             "the hook must see the event kind as the wire token in GPV_EVENT_KIND"
         );
+    }
+
+    // ---- panic firewall (tick_guarded) ----
+
+    /// A backend whose `refresh_dynamic` panics on scripted tick indices — the audit's
+    /// "tick-panic frozen-UI hole" made flesh: the code path least exercised by the
+    /// mock-based suite is a backend decoder edge case blowing up mid-tick.
+    struct PanickyBackend<F: Fn(u32) -> bool + Send> {
+        tick: u32,
+        panics: F,
+    }
+
+    impl<F: Fn(u32) -> bool + Send> GpuBackend for PanickyBackend<F> {
+        fn name(&self) -> &'static str {
+            "panicky"
+        }
+        fn devices(&mut self) -> Vec<DeviceId> {
+            vec![DeviceId("panic:0".into())]
+        }
+        fn static_info(&mut self, dev: &DeviceId) -> Result<StaticInfo, BackendError> {
+            Ok(StaticInfo {
+                id: dev.clone(),
+                vendor: Vendor::Unknown,
+                name: "Panicky GPU".into(),
+                backend: "panicky".into(),
+                mem_total_bytes: Some(8 << 30),
+                power_limit_mw: None,
+                max_sm_clock_mhz: None,
+                temp_slowdown_c: None,
+                driver_version: None,
+                process_hint: None,
+            })
+        }
+        fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {
+            let t = self.tick;
+            self.tick += 1;
+            if (self.panics)(t) {
+                panic!("decoder choked on tick {t}");
+            }
+            Ok(sample(Some(50.0)))
+        }
+        fn refresh_processes(
+            &mut self,
+            _dev: &DeviceId,
+        ) -> Result<Vec<ProcessSample>, BackendError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An engine over a [`PanickyBackend`] with the given panic script, persisting to
+    /// `db` when given (otherwise live-only).
+    fn panicky_engine(
+        db: Option<PathBuf>,
+        panics: impl Fn(u32) -> bool + Send + 'static,
+    ) -> Engine {
+        Engine::with_backends(
+            vec![Box::new(PanickyBackend { tick: 0, panics })],
+            EngineConfig {
+                persist: db.is_some(),
+                db_path: db,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn scratch_db() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "gpuviewer-panic-test-{}-{n}.db",
+            std::process::id()
+        ))
+    }
+
+    fn cleanup_db(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        for ext in ["-wal", "-shm"] {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(ext);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Design (b)'s documented behavior for ONE transient panic: the tick is dropped and
+    /// narrated as a `CollectorStall` FACT carrying the payload, and the very next clean
+    /// tick collects normally — one decoder edge case must not end the flight recording.
+    #[test]
+    fn transient_tick_panic_narrates_and_collection_resumes() {
+        let mut engine = panicky_engine(None, |t| t == 0);
+
+        let TickOutcome::Panicked {
+            event,
+            summary,
+            fatal,
+        } = engine.tick_guarded()
+        else {
+            panic!("the scripted first tick must panic");
+        };
+        assert!(!fatal, "one panic is weather, not death");
+        assert_eq!(event.kind, EventKind::CollectorStall);
+        assert_eq!(event.confidence, Confidence::Fact);
+        assert_eq!(event.severity, Severity::Warning);
+        assert!(
+            summary.contains("decoder choked on tick 0"),
+            "the panic payload must survive into the summary: {summary}"
+        );
+        assert!(
+            event.evidence.contains("decoder choked on tick 0"),
+            "the payload must reach the event evidence: {}",
+            event.evidence
+        );
+        assert!(
+            event.evidence.contains("RUST_BACKTRACE"),
+            "the evidence must carry the backtrace hint: {}",
+            event.evidence
+        );
+
+        let TickOutcome::Frame(frame) = engine.tick_guarded() else {
+            panic!("the next tick is clean and must produce a frame");
+        };
+        assert!(
+            frame.devices[0].sample.is_some(),
+            "collection resumed with real data"
+        );
+    }
+
+    /// The budget counts CONSECUTIVE panics: a clean tick resets it, so an intermittent
+    /// fault keeps collecting indefinitely; only [`MAX_CONSECUTIVE_PANICS`] in a row die.
+    #[test]
+    fn panic_budget_resets_on_a_clean_tick() {
+        // Script: panic, clean, panic, panic, panic — fatal only at the third CONSECUTIVE
+        // panic (tick 4); a total-panic counter would have died at tick 3.
+        let mut engine = panicky_engine(None, |t| t != 1);
+        let fatals: Vec<bool> = (0..5)
+            .map(|_| match engine.tick_guarded() {
+                TickOutcome::Frame(_) => false,
+                TickOutcome::Panicked { fatal, .. } => fatal,
+            })
+            .collect();
+        assert_eq!(
+            fatals,
+            vec![false, false, false, false, true],
+            "fatal exactly when {MAX_CONSECUTIVE_PANICS} panics run consecutively"
+        );
+    }
+
+    /// Spending the budget produces the Critical stop fact, still under the existing
+    /// `CollectorStall` kind — the NDJSON contract (spec/schema/suite) is untouched.
+    #[test]
+    fn deterministic_panic_turns_fatal_with_a_critical_fact() {
+        let mut engine = panicky_engine(None, |_| true);
+        for i in 1..MAX_CONSECUTIVE_PANICS {
+            match engine.tick_guarded() {
+                TickOutcome::Panicked { fatal, .. } => {
+                    assert!(!fatal, "panic {i} is within the budget")
+                }
+                TickOutcome::Frame(_) => panic!("scripted to panic"),
+            }
+        }
+        let TickOutcome::Panicked { event, fatal, .. } = engine.tick_guarded() else {
+            panic!("scripted to panic");
+        };
+        assert!(
+            fatal,
+            "the {MAX_CONSECUTIVE_PANICS}th consecutive panic is fatal"
+        );
+        assert_eq!(event.kind, EventKind::CollectorStall);
+        assert_eq!(event.severity, Severity::Critical);
+        assert_eq!(event.confidence, Confidence::Fact);
+        assert!(
+            event.title.contains("STOPPED"),
+            "the stop fact must say collection stopped: {}",
+            event.title
+        );
+    }
+
+    /// The panic facts reach the persistent event log while the recorder is reachable:
+    /// the hole survives into replay and `report`, not just the live session.
+    #[test]
+    fn panic_events_are_recorded_to_the_store() {
+        let path = scratch_db();
+        let mut engine = panicky_engine(Some(path.clone()), |_| true);
+        for _ in 0..MAX_CONSECUTIVE_PANICS {
+            assert!(matches!(
+                engine.tick_guarded(),
+                TickOutcome::Panicked { .. }
+            ));
+        }
+        drop(engine); // Drop flushes the recording tail.
+
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let events = store.events_between(0, now_ms() + 60_000).unwrap();
+        let stalls: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::CollectorStall)
+            .collect();
+        assert_eq!(
+            stalls.len(),
+            MAX_CONSECUTIVE_PANICS as usize,
+            "every panicked tick must persist its narration"
+        );
+        assert!(
+            stalls.iter().any(|e| e.severity == Severity::Critical),
+            "the stop itself is a Critical fact in the recording"
+        );
+        cleanup_db(&path);
+    }
+
+    /// The end-to-end shape of the fix: through [`Collector::start`]'s real thread, a
+    /// deterministic backend panic must surface as `Shared::stopped` (the UI's stop
+    /// banner) plus `CollectorStall` narration in the story feed — and the process keeps
+    /// running rather than aborting (the old behavior froze the UI with zero signal).
+    #[test]
+    fn collector_thread_survives_panics_and_marks_shared_stopped() {
+        let engine = panicky_engine(None, |_| true);
+        let collector = Collector::start(engine, Duration::from_millis(5), false);
+
+        // Bounded wait for the thread to spend the panic budget and declare death.
+        let mut stopped = None;
+        for _ in 0..400 {
+            if let Some(stop) = collector.shared.lock().unwrap().stopped.clone() {
+                stopped = Some(stop);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stop = stopped.expect("the collector must declare itself dead, never vanish silently");
+        assert!(
+            stop.reason.contains("decoder choked"),
+            "the stop reason carries the panic summary: {}",
+            stop.reason
+        );
+        assert!(stop.at_ms > 0);
+
+        let sh = collector.shared.lock().unwrap();
+        let stalls: Vec<_> = sh
+            .history
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::CollectorStall)
+            .collect();
+        assert_eq!(
+            stalls.len(),
+            MAX_CONSECUTIVE_PANICS as usize,
+            "every panicked tick narrates into the story feed"
+        );
+        assert_eq!(
+            stalls.last().unwrap().severity,
+            Severity::Critical,
+            "the final narration is the Critical stop fact"
+        );
+        assert!(
+            sh.latest[0].is_none(),
+            "no fabricated sample may appear for a device that never answered"
+        );
+        // tick_seq advanced per narration, so an open timeline re-queries and sees them.
+        assert!(sh.tick_seq >= MAX_CONSECUTIVE_PANICS as u64);
     }
 
     #[test]
