@@ -25,13 +25,18 @@ new captures taken per kernel/driver release.
   6.8-era `drm-total-local0`/`drm-resident-local0` memory regions. pid 3100 (ffplay)
   holds two fds (dedupe-by-max coverage) with a busy video engine; pid 5200 (blender)
   is render-only (honestly Unknown kind); pid 6300 (python3) has a busy compute
-  engine; pid 980 (Xorg) sits on a different pdev and must be filtered out.
+  engine; pid 980 (Xorg) sits on a different pdev and must be filtered out. The per-GT
+  `gt/gt0/throttle_reason_*` flags ship quiescent (status=0, every reason 0); throttle
+  tests drive scratch copies to assert the bit→model mapping and the status gate.
 - `intel-xe-kernel6.11/` — models an Arc B580 dGPU (BMG, `8086:e20b`) on the xe driver
   at the kernel 6.11 fdinfo/sysfs ABI (the `drm-cycles-*` keys landed in 6.11):
   `device/tile0/gt0/freq0/{act_freq,cur_freq,rp0_freq}`, hwmon power/energy only (xe
   temp gate is 6.15+, fans 6.16+), and xe-dialect fdinfo: `drm-cycles-*` with
   `drm-total-cycles-*` GT-tick bases (NOT time units) and `drm-total-vram0` memory
-  regions. There is deliberately no VRAM-total sysfs file — xe has none.
+  regions. There is deliberately no VRAM-total sysfs file — xe has none. The
+  `tile0/gt0/freq0/throttle/{status,reason_*}` flags ship quiescent (status=0); the
+  xe-specific filename spelling (`reason_pl1`, not i915's `throttle_reason_pl1`) is what
+  the throttle test exercises — the metric intel_gpu_top still does not surface on xe.
 - `intel-igpu-minimal/` — an iGPU (ADL-P, `8086:46a6`, i915) exposing only the
   enumeration files: no hwmon (the normal iGPU case), no `lmem_*` (shares system RAM,
   which must never be reported as VRAM), no freq files, no `/proc` tree. Every

@@ -66,9 +66,11 @@ fn i915_dynamic_sample_prefers_actual_freq_and_stays_honest() {
     assert_eq!(s.mem_clock_mhz, None);
     assert_eq!(s.encoder_pct, None);
     assert_eq!(s.decoder_pct, None);
+    // The fixture's throttle_reason_status is 0 (quiescent GT): nothing claimed, even
+    // though every reason file is present. status is the gate.
     assert!(
         !s.throttle.any(),
-        "no throttle_reason_* decoder yet — throttle bits must not be faked"
+        "quiescent GT (status=0) must report no throttle"
     );
 }
 
@@ -243,6 +245,7 @@ fn xe_dynamic_sample_reads_tile_gt_freq() {
     assert_eq!(s.temp_c, None);
     assert_eq!(s.fan_pct, None);
     assert_eq!(s.power_mw, None); // first energy sighting has no baseline
+                                  // freq0/throttle/status is 0 in the fixture: quiescent, nothing claimed.
     assert!(!s.throttle.any());
 }
 
@@ -308,6 +311,167 @@ fn xe_util_is_cycles_delta_over_total_cycles_not_wall_time() {
     assert_eq!(py.util_pct, Some(50.0));
     let shell = second.iter().find(|p| p.pid == 2600).unwrap();
     assert_eq!(shell.util_pct, Some(0.0));
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+// ---- throttle_reason decoding (i915 gt/gt0/throttle_reason_*, xe freq0/throttle/*) ----
+//
+// The fixtures ship quiescent (status=0); these scratch copies drive the bit→model
+// mapping and, above all, the rule that `status` is the GATE: a reason file is only
+// honored when status==1.
+
+/// One i915 throttle flag file: `{card}/gt/gt0/throttle_reason_<name>`.
+fn i915_throttle(scratch: &Path, name: &str) -> PathBuf {
+    scratch.join(format!("sys/class/drm/card1/gt/gt0/throttle_reason_{name}"))
+}
+
+/// One xe throttle flag file: `{dev}/tile0/gt0/freq0/throttle/<name>`.
+fn xe_throttle(scratch: &Path, name: &str) -> PathBuf {
+    scratch.join(format!(
+        "sys/class/drm/card0/device/tile0/gt0/freq0/throttle/{name}"
+    ))
+}
+
+#[test]
+fn i915_throttle_thermal_then_thermal_plus_power_cap() {
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-i915-thr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.8"), &scratch);
+
+    // status=1 + thermal=1 → thermal only, NOT power_cap.
+    std::fs::write(i915_throttle(&scratch, "status"), "1\n").unwrap();
+    std::fs::write(i915_throttle(&scratch, "thermal"), "1\n").unwrap();
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    assert!(t.thermal, "thermal=1 must map to throttle.thermal");
+    assert!(!t.power_cap, "no pl* bit set → power_cap must stay false");
+    assert!(!t.hw_slowdown && !t.other);
+
+    // Add pl1=1 → both thermal AND power_cap (pl1|pl2|pl4 → power_cap).
+    std::fs::write(i915_throttle(&scratch, "pl1"), "1\n").unwrap();
+    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    assert!(t.thermal && t.power_cap, "thermal + pl1 → both");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn xe_throttle_pl1_is_power_cap() {
+    // THE xe test — nobody else ships throttle decoding on xe (intel_gpu_top does not).
+    // status=1 + reason_pl1=1 → power_cap, proving the xe filename spelling (reason_pl1,
+    // not throttle_reason_pl1) and the freq0/throttle/ path are both read correctly.
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-xe-thr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-xe-kernel6.11"), &scratch);
+
+    std::fs::write(xe_throttle(&scratch, "status"), "1\n").unwrap();
+    std::fs::write(xe_throttle(&scratch, "reason_pl1"), "1\n").unwrap();
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    assert!(t.power_cap, "reason_pl1=1 must map to throttle.power_cap");
+    assert!(!t.thermal && !t.hw_slowdown && !t.other);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn xe_throttle_ratl_and_vr_map_to_other() {
+    // RATL and the VR alerts have no closer model bucket than `other`; they ARE real
+    // limits and must not be silently dropped.
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-xe-other-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-xe-kernel6.11"), &scratch);
+
+    std::fs::write(xe_throttle(&scratch, "status"), "1\n").unwrap();
+    std::fs::write(xe_throttle(&scratch, "reason_vr_tdc"), "1\n").unwrap();
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    assert!(t.other, "vr_tdc=1 must map to throttle.other");
+    assert!(!t.thermal && !t.power_cap && !t.hw_slowdown);
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn throttle_status_zero_ignores_stale_reason_files() {
+    // status=0 but thermal=1 (a stale latched reason bit): default, nothing claimed —
+    // trusting the reason file here would narrate a throttle that is not happening.
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-i915-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.8"), &scratch);
+
+    // status stays 0 (quiescent fixture default); set a reason file to 1 anyway.
+    std::fs::write(i915_throttle(&scratch, "thermal"), "1\n").unwrap();
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    assert!(
+        !t.any(),
+        "status=0 gates out a stale reason file: {:?}",
+        t.labels()
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn throttle_status_one_with_no_reason_files_is_other_only() {
+    // status=1 but the kernel exposed no reason files at all (or none we recognize):
+    // something is throttling, cause unknown — assert the honest minimum (`other`),
+    // never swallow the signal.
+    let scratch = std::env::temp_dir().join(format!("gpuviewer-xe-cause-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-xe-kernel6.11"), &scratch);
+
+    std::fs::write(xe_throttle(&scratch, "status"), "1\n").unwrap();
+    // Remove every reason file: only `status` remains.
+    for name in [
+        "reason_pl1",
+        "reason_pl2",
+        "reason_pl4",
+        "reason_thermal",
+        "reason_prochot",
+        "reason_ratl",
+        "reason_vr_thermalert",
+        "reason_vr_tdc",
+    ] {
+        std::fs::remove_file(xe_throttle(&scratch, name)).unwrap();
+    }
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    assert_eq!(
+        (t.thermal, t.power_cap, t.hw_slowdown, t.other),
+        (false, false, false, true),
+        "status=1 with no recognized reason → other only"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn throttle_garbage_status_does_not_panic_and_claims_nothing() {
+    // A truncated/garbage status file ("zz") is not "1": treat as absent → default, no
+    // panic. Even with a reason file set to 1, the gate keeps us silent.
+    let scratch =
+        std::env::temp_dir().join(format!("gpuviewer-i915-garbage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_tree(&fixture("intel-i915-kernel6.8"), &scratch);
+
+    std::fs::write(i915_throttle(&scratch, "status"), "zz").unwrap();
+    std::fs::write(i915_throttle(&scratch, "pl2"), "1\n").unwrap();
+    let mut b = IntelBackend::with_root(&scratch).unwrap();
+    let dev = b.devices().remove(0);
+    let t = b.refresh_dynamic(&dev).unwrap().throttle;
+    assert!(
+        !t.any(),
+        "garbage status must claim nothing: {:?}",
+        t.labels()
+    );
 
     let _ = std::fs::remove_dir_all(&scratch);
 }

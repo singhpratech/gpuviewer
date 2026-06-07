@@ -8,3 +8,6 @@ description = "History store for gpuviewer: RAM rings for the live window, SQLit
 
 [dependencies]
 gpuviewer-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true

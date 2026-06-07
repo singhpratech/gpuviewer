@@ -60,10 +60,17 @@ fn rx7900xtx_dynamic_sample_unit_conversions() {
     assert_eq!(s.mem_clock_mhz, Some(1249)); // the '*'-marked pp_dpm_mclk level
     assert_eq!(s.encoder_pct, None);
     assert_eq!(s.decoder_pct, None);
+    // The fixture's gpu_metrics node is a real v1_3 blob with SMU_THROTTLER_PPT0 set in
+    // indep_throttle_status: a genuine power-cap throttle decodes here. The blob also
+    // carries an off-by-8 thermal decoy and a nonzero legacy throttle_status, so a decoder
+    // that read the wrong offset (or fell back to the legacy ASIC-specific word) would set
+    // thermal/other instead of power_cap and fail these assertions.
+    assert!(s.throttle.power_cap, "PPT0 bit decodes to power_cap");
     assert!(
-        !s.throttle.any(),
-        "no gpu_metrics decoder yet — throttle bits must not be faked"
+        !s.throttle.thermal,
+        "no thermal bit set — decoy must be ignored"
     );
+    assert!(!s.throttle.other, "indep is preferred over the legacy word");
 }
 
 #[test]
@@ -185,6 +192,8 @@ fn igpu_minimal_everything_optional_is_none() {
     assert_eq!(s.fan_pct, None);
     assert_eq!(s.sm_clock_mhz, None);
     assert_eq!(s.mem_clock_mhz, None);
+    // No gpu_metrics node on this APU fixture: throttle decodes to the honest default.
+    assert!(!s.throttle.any());
 
     // No proc tree at all: an empty process list, never an error.
     assert!(b.refresh_processes(&devs[0]).unwrap().is_empty());

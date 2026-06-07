@@ -16,6 +16,8 @@ pub mod mock;
 pub mod model;
 #[cfg(all(feature = "nvidia", any(target_os = "linux", target_os = "windows")))]
 pub mod nvidia;
+#[cfg(target_os = "linux")]
+pub mod proc_meta;
 
 pub use backend::{all_backends, BackendError, GpuBackend};
 pub use events::{Confidence, Event, EventEngine, EventKind, Severity};
@@ -23,6 +25,8 @@ pub use model::{
     fmt_bytes, now_ms, DeviceId, DynamicSample, ProcessKind, ProcessSample, StaticInfo,
     ThrottleReasons, Vendor,
 };
+#[cfg(target_os = "linux")]
+pub use proc_meta::{container_of, parse_cgroup, CpuTracker};
 
 #[cfg(test)]
 mod tests {
@@ -398,6 +402,450 @@ mod tests {
         assert!(
             all.iter().all(|e| e.kind != EventKind::IdleGap),
             "no sustained activity before the trough — no stall to narrate"
+        );
+    }
+
+    // ---- hang-suspicion and CPU-spillover tests: synthetic 1 Hz traces, controlled ts_ms ----
+
+    /// A sample whose util may be absent — used to exercise the "util goes None" reset paths.
+    fn opt_sample(ts_ms: u64, util_pct: Option<f32>) -> DynamicSample {
+        DynamicSample {
+            ts_ms,
+            util_pct,
+            mem_used_bytes: Some(8 << 30),
+            power_mw: None,
+            temp_c: None,
+            fan_pct: None,
+            sm_clock_mhz: None,
+            mem_clock_mhz: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            throttle: ThrottleReasons::default(),
+        }
+    }
+
+    /// Build a process holding `mem` bytes, with optional self-util and CPU%.
+    fn proc_with(
+        pid: u32,
+        name: &str,
+        mem: u64,
+        util_pct: Option<f32>,
+        cpu_pct: Option<f32>,
+    ) -> ProcessSample {
+        ProcessSample {
+            pid,
+            name: name.into(),
+            kind: ProcessKind::Compute,
+            mem_bytes: Some(mem),
+            util_pct,
+            cpu_pct,
+            container: None,
+        }
+    }
+
+    /// Drive a 1 Hz trace with an optional util value, holding `procs` constant across it.
+    fn drive_opt(
+        engine: &mut EventEngine,
+        dev: &DeviceId,
+        ts_range: std::ops::RangeInclusive<u64>,
+        util_pct: Option<f32>,
+        procs: &[ProcessSample],
+    ) -> Vec<Event> {
+        let mut out = Vec::new();
+        for ts in ts_range.step_by(1000) {
+            out.extend(engine.observe(dev, &opt_sample(ts, util_pct), procs, Some(16 << 30), None));
+        }
+        out
+    }
+
+    /// A 6 GiB holder whose own util is unreported (the normal hung-kernel case): VRAM held,
+    /// device dead, holder alive for ten unbroken minutes narrates exactly one HangSuspected,
+    /// stamped at the 10-minute mark — not a second early — and hedged with raw evidence.
+    #[test]
+    fn hang_fires_once_exactly_at_ten_minutes() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+        let procs = vec![proc_with(4521, "python", 6 << 30, None, None)];
+
+        // Episode opens at ts=0. At 9m59s (599_000) it has not yet reached HANG_MIN_MS.
+        let before = drive_opt(&mut engine, &dev, 0..=599_000, Some(1.0), &procs);
+        assert!(
+            before.iter().all(|e| e.kind != EventKind::HangSuspected),
+            "must not fire at 9m59s — that is below HANG_MIN_MS"
+        );
+
+        // One more tick lands exactly on 10m: fires once.
+        let at_ten = drive_opt(&mut engine, &dev, 600_000..=600_000, Some(1.0), &procs);
+        let hangs: Vec<&Event> = at_ten
+            .iter()
+            .filter(|e| e.kind == EventKind::HangSuspected)
+            .collect();
+        assert_eq!(hangs.len(), 1, "exactly one HangSuspected at the 10m mark");
+        let e = hangs[0];
+        assert_eq!(e.confidence, Confidence::Likely, "a hang is an inference");
+        assert_eq!(e.severity, Severity::Warning);
+        assert_eq!(e.ts_ms, 600_000, "stamped at the 10-minute mark");
+        assert!(
+            e.title.contains("likely hung")
+                && e.title.contains("python (pid 4521)")
+                && e.title.contains("6.0 GiB"),
+            "title must hedge and name the holder/mem, got: {}",
+            e.title
+        );
+        assert!(
+            e.evidence.contains("0..600000")
+                && e.evidence.contains("pid 4521")
+                && e.evidence.contains("6.0 GiB"),
+            "evidence must carry the raw window and holder, got: {}",
+            e.evidence
+        );
+
+        // A sustained hang narrates once, never again.
+        let after = drive_opt(&mut engine, &dev, 601_000..=900_000, Some(1.0), &procs);
+        assert!(
+            after.iter().all(|e| e.kind != EventKind::HangSuspected),
+            "a single episode must narrate exactly once"
+        );
+    }
+
+    /// Util returning to life before the 10-minute mark resets the episode: no hang.
+    #[test]
+    fn hang_does_not_fire_when_util_recovers_early() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        let procs = vec![proc_with(4521, "python", 6 << 30, None, None)];
+
+        // Nine minutes of apparent death, then the GPU wakes up — episode dropped.
+        let mut all = drive_opt(&mut engine, &dev, 0..=539_000, Some(1.0), &procs);
+        all.extend(drive_opt(
+            &mut engine,
+            &dev,
+            540_000..=545_000,
+            Some(93.0),
+            &procs,
+        ));
+        // Back to idle, but only briefly — nowhere near a fresh 10 minutes.
+        all.extend(drive_opt(
+            &mut engine,
+            &dev,
+            546_000..=560_000,
+            Some(1.0),
+            &procs,
+        ));
+        assert!(
+            all.iter().all(|e| e.kind != EventKind::HangSuspected),
+            "recovery before 10m must reset the episode — no hang"
+        );
+    }
+
+    /// The anchored holder exiting at 5 minutes ends the episode silently; the exit itself
+    /// is still narrated as a plain fact (the two narrations must not collide).
+    #[test]
+    fn hang_does_not_fire_when_holder_exits_and_exit_still_narrates() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        let procs = vec![proc_with(4521, "python", 6 << 30, None, None)];
+
+        let mut all = drive_opt(&mut engine, &dev, 0..=300_000, Some(1.0), &procs);
+        // python exits at 5m; the device stays dead for another 10 minutes holder-less.
+        all.extend(drive_opt(
+            &mut engine,
+            &dev,
+            301_000..=900_000,
+            Some(1.0),
+            &[],
+        ));
+
+        assert!(
+            all.iter().any(|e| e.kind == EventKind::ProcessExited),
+            "the holder's exit must still be narrated as a fact"
+        );
+        assert!(
+            all.iter().all(|e| e.kind != EventKind::HangSuspected),
+            "anchored holder exited — no hang to claim"
+        );
+    }
+
+    /// Util going unobservable mid-window drops the episode: we cannot claim "zero engine
+    /// activity" through a blind spot. A short re-idle afterwards must not reach 10m.
+    #[test]
+    fn hang_does_not_fire_when_util_goes_none_midwindow() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        let procs = vec![proc_with(4521, "python", 6 << 30, None, None)];
+
+        let mut all = drive_opt(&mut engine, &dev, 0..=300_000, Some(1.0), &procs);
+        // Util unobservable for a stretch — no claim possible.
+        all.extend(drive_opt(
+            &mut engine,
+            &dev,
+            301_000..=320_000,
+            None,
+            &procs,
+        ));
+        // Idle resumes, but the window restarted and the test span is far short of 10m.
+        all.extend(drive_opt(
+            &mut engine,
+            &dev,
+            321_000..=360_000,
+            Some(1.0),
+            &procs,
+        ));
+        assert!(
+            all.iter().all(|e| e.kind != EventKind::HangSuspected),
+            "a blind spot mid-window must reset the episode — no hang"
+        );
+    }
+
+    /// A hang is an idle gap that never recovered. When activity finally returns after a
+    /// 12-minute trough that already narrated a hang, the IdleGap must stay silent — one
+    /// incident, one narration.
+    #[test]
+    fn hang_suppresses_the_idle_gap_it_lived_in() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+        let procs = vec![proc_with(4521, "python", 6 << 30, None, None)];
+
+        // 30s+ of real work makes the device idle-gap-eligible, then it drops dead.
+        let mut all = drive(&mut engine, &dev, 0..=40_000, 92.0, &procs);
+        // A 12-minute trough at ~1% — long enough to both open an idle gap and trip a hang.
+        all.extend(drive_opt(
+            &mut engine,
+            &dev,
+            41_000..=761_000,
+            Some(1.0),
+            &procs,
+        ));
+        // Activity returns: the idle gap closes here, and would normally narrate.
+        all.extend(drive(&mut engine, &dev, 762_000..=765_000, 93.0, &procs));
+
+        let hangs = all
+            .iter()
+            .filter(|e| e.kind == EventKind::HangSuspected)
+            .count();
+        let gaps = all.iter().filter(|e| e.kind == EventKind::IdleGap).count();
+        assert_eq!(hangs, 1, "the trough must narrate exactly one hang");
+        assert_eq!(
+            gaps, 0,
+            "the hang already covered this trough — the IdleGap must be suppressed"
+        );
+    }
+
+    /// The textbook spillover: an 11.3 GiB model attaches, the GPU stays near-idle for the
+    /// whole 90s window while the process pegs ~3 cores. Fires once, hedged, with means.
+    #[test]
+    fn spillover_fires_on_textbook_case() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+
+        let mem = 12_133_000_000u64; // ~11.3 GiB
+                                     // First observation establishes the baseline (no procs) so the model reads as NEW.
+        drive_opt(&mut engine, &dev, 0..=0, Some(3.0), &[]);
+        let ollama = vec![proc_with(7777, "ollama", mem, Some(0.0), Some(310.0))];
+        // The 90s window: ts 1000..=91000 is the close (91000 - 1000 = 90000 = window).
+        let out = drive_opt(&mut engine, &dev, 1_000..=91_000, Some(5.0), &ollama);
+
+        let evts: Vec<&Event> = out
+            .iter()
+            .filter(|e| e.kind == EventKind::CpuSpillover)
+            .collect();
+        assert_eq!(evts.len(), 1, "exactly one CpuSpillover at window close");
+        let e = evts[0];
+        assert_eq!(
+            e.confidence,
+            Confidence::Likely,
+            "spillover is an inference"
+        );
+        assert_eq!(e.severity, Severity::Warning);
+        assert!(
+            e.title.contains("likely partial CPU offload")
+                && e.title.contains("ollama (pid 7777)")
+                && e.title.contains("11.3 GiB"),
+            "title must hedge and name the model/mem, got: {}",
+            e.title
+        );
+        assert!(
+            e.evidence.contains("1000..91000")
+                && e.evidence.contains("CPU mean")
+                && e.evidence.contains("util mean"),
+            "evidence must carry the window and both means, got: {}",
+            e.evidence
+        );
+    }
+
+    /// If the GPU shows real use at any point in the window, the model IS using it — the
+    /// spillover premise is refuted and nothing narrates.
+    #[test]
+    fn spillover_cancels_when_gpu_gets_busy() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        let mem = 12 << 30;
+        drive_opt(&mut engine, &dev, 0..=0, Some(3.0), &[]);
+        let ollama = vec![proc_with(7777, "ollama", mem, Some(0.0), Some(310.0))];
+        // Idle most of the window, then a clear burst of GPU use before it closes.
+        let mut out = drive_opt(&mut engine, &dev, 1_000..=60_000, Some(5.0), &ollama);
+        out.extend(drive_opt(
+            &mut engine,
+            &dev,
+            61_000..=91_000,
+            Some(80.0),
+            &ollama,
+        ));
+        assert!(
+            out.iter().all(|e| e.kind != EventKind::CpuSpillover),
+            "a busy GPU refutes the offload claim — no spillover"
+        );
+    }
+
+    /// A process that exits mid-window is cancelled silently; only its exit fact narrates.
+    #[test]
+    fn spillover_cancels_when_process_exits_midwindow() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        let mem = 12 << 30;
+        drive_opt(&mut engine, &dev, 0..=0, Some(3.0), &[]);
+        let ollama = vec![proc_with(7777, "ollama", mem, Some(0.0), Some(310.0))];
+        let mut out = drive_opt(&mut engine, &dev, 1_000..=40_000, Some(5.0), &ollama);
+        // ollama exits well before the 90s window would close.
+        out.extend(drive_opt(
+            &mut engine,
+            &dev,
+            41_000..=91_000,
+            Some(5.0),
+            &[],
+        ));
+        assert!(
+            out.iter().all(|e| e.kind != EventKind::CpuSpillover),
+            "process exited mid-window — spillover must be cancelled silently"
+        );
+        assert!(
+            out.iter().any(|e| e.kind == EventKind::ProcessExited),
+            "the exit itself must still narrate"
+        );
+    }
+
+    /// With no CPU visibility for the whole window we cannot say the process "burns CPU";
+    /// the honesty rule forbids the claim, so it stays silent even with a near-idle GPU.
+    #[test]
+    fn spillover_silent_without_cpu_visibility() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        let mem = 12 << 30;
+        drive_opt(&mut engine, &dev, 0..=0, Some(3.0), &[]);
+        // cpu_pct None throughout — the GPU is idle, but we never saw the CPU.
+        let ollama = vec![proc_with(7777, "ollama", mem, Some(0.0), None)];
+        let out = drive_opt(&mut engine, &dev, 1_000..=91_000, Some(5.0), &ollama);
+        assert!(
+            out.iter().all(|e| e.kind != EventKind::CpuSpillover),
+            "no CPU visibility means no claim — must stay silent"
+        );
+    }
+
+    /// Mostly-blind CPU visibility (only two readings, both hot) clears the CPU *mean* but
+    /// not the sample-count floor: too few samples to mean it, so the claim is withheld.
+    /// This isolates SPILLOVER_MIN_CPU_SAMPLES from the mean-CPU gate.
+    #[test]
+    fn spillover_silent_with_too_few_cpu_samples() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        let mem = 12 << 30;
+        drive_opt(&mut engine, &dev, 0..=0, Some(3.0), &[]);
+        // CPU unseen for almost the whole window, then exactly two hot readings: the mean
+        // of those two (310%) would pass, but two samples is below the floor of three.
+        let blind = vec![proc_with(7777, "ollama", mem, Some(0.0), None)];
+        let hot = vec![proc_with(7777, "ollama", mem, Some(0.0), Some(310.0))];
+        let mut out = drive_opt(&mut engine, &dev, 1_000..=88_000, Some(5.0), &blind);
+        out.extend(drive_opt(
+            &mut engine,
+            &dev,
+            89_000..=90_000,
+            Some(5.0),
+            &hot,
+        ));
+        out.extend(drive_opt(
+            &mut engine,
+            &dev,
+            91_000..=91_000,
+            Some(5.0),
+            &blind,
+        ));
+        assert!(
+            out.iter().all(|e| e.kind != EventKind::CpuSpillover),
+            "two CPU samples is below SPILLOVER_MIN_CPU_SAMPLES — must stay silent"
+        );
+    }
+
+    /// A small (1 GiB) attachment is below SPILLOVER_HOLDER_MIN_BYTES: no window opens, so
+    /// even an idle GPU and a hot CPU never narrate a spillover.
+    #[test]
+    fn spillover_silent_for_small_attachment() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("test".into());
+
+        drive_opt(&mut engine, &dev, 0..=0, Some(3.0), &[]);
+        let small = vec![proc_with(7777, "ollama", 1 << 30, Some(0.0), Some(310.0))];
+        let out = drive_opt(&mut engine, &dev, 1_000..=91_000, Some(5.0), &small);
+        assert!(
+            out.iter().all(|e| e.kind != EventKind::CpuSpillover),
+            "a 1 GiB holder is below the spillover threshold — no assessment opens"
+        );
+    }
+
+    /// Every new inference narration must read as hedged and carry Confidence::Likely —
+    /// a grep-style guard against a fact-tier slip on the riskiest events.
+    #[test]
+    fn hang_and_spillover_titles_are_hedged_inferences() {
+        // Drive a hang to completion.
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("hang".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+        let procs = vec![proc_with(4521, "python", 6 << 30, None, None)];
+        let mut all = drive_opt(&mut engine, &dev, 0..=600_000, Some(1.0), &procs);
+
+        // Drive a spillover to completion on a separate device.
+        let dev2 = DeviceId("spill".into());
+        engine.register_device(dev2.clone(), "GPU1".into());
+        drive_opt(&mut engine, &dev2, 0..=0, Some(3.0), &[]);
+        let ollama = vec![proc_with(7777, "ollama", 12 << 30, Some(0.0), Some(310.0))];
+        all.extend(drive_opt(
+            &mut engine,
+            &dev2,
+            1_000..=91_000,
+            Some(5.0),
+            &ollama,
+        ));
+
+        for e in all
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::HangSuspected | EventKind::CpuSpillover))
+        {
+            assert_eq!(
+                e.confidence,
+                Confidence::Likely,
+                "{:?} must be an inference, not a fact",
+                e.kind
+            );
+            assert!(
+                e.title.to_lowercase().contains("likely"),
+                "{:?} title must hedge with \"likely\": {}",
+                e.kind,
+                e.title
+            );
+        }
+        assert!(
+            all.iter().any(|e| e.kind == EventKind::HangSuspected),
+            "the hang fixture must actually fire a hang"
+        );
+        assert!(
+            all.iter().any(|e| e.kind == EventKind::CpuSpillover),
+            "the spillover fixture must actually fire a spillover"
         );
     }
 }

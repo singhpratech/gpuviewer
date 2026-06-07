@@ -391,6 +391,94 @@ impl IntelDevice {
             Dialect::Xe => read_parse(&self.xe_freq().join("rp0_freq")),
         }
     }
+
+    /// Decode the per-GT throttle ("performance limit") reasons that BOTH drivers publish
+    /// as one-bit-per-file sysfs flags — the metric `intel_gpu_top` still does not surface
+    /// on xe, so this is the displacement story for that hardware. The two dialects expose
+    /// the SAME nine reasons under different paths and different filename spellings
+    /// (verified against the in-tree drivers, June 2026):
+    ///
+    /// - i915: `{card}/gt/gt0/throttle_reason_{status,pl1,pl2,pl4,thermal,prochot,ratl,vr_thermalert,vr_tdc}`,
+    ///   created per-GT in `intel_gt_sysfs_pm.c`.
+    /// - xe: `{dev}/tile0/gt0/freq0/throttle/{status,reason_pl1,reason_pl2,reason_pl4,reason_thermal,reason_prochot,reason_ratl,reason_vr_thermalert,reason_vr_tdc}`,
+    ///   the "throttle" attribute group on the freq0 kobject in `xe_gt_throttle.c`.
+    ///
+    /// Each file contains 0 or 1. tile0/gt0 is the primary render GT, matching the freq
+    /// reads above; a media GT throttling is not the render device's story.
+    ///
+    /// `status` is the GATE, never the union of the reason files: some kernels report a
+    /// stale 1 in a reason file while `status` is 0 (the limit cleared but the latched
+    /// reason bit lingers). Trusting `status` means we only ever narrate a throttle that
+    /// is actually happening now — a confidently-wrong throttle event would kill the
+    /// product's trust thesis. status==0 or an absent/garbage status file → default
+    /// (nothing claimed), REGARDLESS of what the reason files say.
+    fn throttle(&self) -> ThrottleReasons {
+        // Filenames differ per dialect; the meaning of each does not.
+        let (dir, status, pl1, pl2, pl4, thermal, prochot, ratl, vr_thermalert, vr_tdc) =
+            match self.dialect {
+                Dialect::I915 => (
+                    self.card_path.join("gt/gt0"),
+                    "throttle_reason_status",
+                    "throttle_reason_pl1",
+                    "throttle_reason_pl2",
+                    "throttle_reason_pl4",
+                    "throttle_reason_thermal",
+                    "throttle_reason_prochot",
+                    "throttle_reason_ratl",
+                    "throttle_reason_vr_thermalert",
+                    "throttle_reason_vr_tdc",
+                ),
+                Dialect::Xe => (
+                    self.xe_freq().join("throttle"),
+                    "status",
+                    "reason_pl1",
+                    "reason_pl2",
+                    "reason_pl4",
+                    "reason_thermal",
+                    "reason_prochot",
+                    "reason_ratl",
+                    "reason_vr_thermalert",
+                    "reason_vr_tdc",
+                ),
+            };
+
+        // status==0, missing, or garbage → not throttling now: default, full stop. The
+        // reason files are not even consulted (some report stale latched 1s).
+        if !read_throttle_bit(&dir.join(status)) {
+            return ThrottleReasons::default();
+        }
+
+        // status==1: something IS limiting performance. Map each recognized reason file
+        // into the model's vocabulary; unreadable/absent reason files read as not-set.
+        let r = |name: &str| read_throttle_bit(&dir.join(name));
+        let reasons = ThrottleReasons {
+            thermal: r(thermal),
+            power_cap: r(pl1) || r(pl2) || r(pl4),
+            hw_slowdown: r(prochot),
+            // RATL (run-average thermal limit) and the VR alerts have no closer model
+            // bucket than "other"; they ARE real limits, just not ones the UI names.
+            other: r(ratl) || r(vr_thermalert) || r(vr_tdc),
+            sync_boost: false, // an NVIDIA-only concept; no Intel sysfs source.
+        };
+        // status says we're throttling but no reason file we recognize is set (a reason
+        // bit this build doesn't map, or files the kernel didn't expose): assert the
+        // honest minimum — throttling, cause unknown — rather than swallow the signal.
+        if reasons.any() {
+            reasons
+        } else {
+            ThrottleReasons {
+                other: true,
+                ..ThrottleReasons::default()
+            }
+        }
+    }
+}
+
+/// Read a 0/1 throttle flag file: `true` only on an explicit "1". Absent, unreadable, or
+/// non-"1" (including garbage) → `false`, so a broken/old kernel never fabricates a
+/// throttle. Mirrors the "absence is normal" contract used everywhere else here.
+fn read_throttle_bit(path: &Path) -> bool {
+    read_trim(path).as_deref() == Some("1")
 }
 
 /// Enumerate `{root}/sys/class/drm/cardN` dirs whose vendor id is Intel (0x8086).
@@ -532,6 +620,8 @@ impl GpuBackend for IntelBackend {
             .hwmon
             .as_deref()
             .and_then(|h| read_parse(&h.join("energy1_input")));
+        // Decode throttle reasons before any &mut self borrow below releases `d`.
+        let throttle = d.throttle();
 
         // One wall timestamp for the whole frame (per CLAUDE.md).
         let ts = now_ms();
@@ -563,11 +653,12 @@ impl GpuBackend for IntelBackend {
             // numbers live behind the same PMU privilege wall as util.
             encoder_pct: None,
             decoder_pct: None,
-            // Both drivers do publish throttle reasons in sysfs (i915 gt/gt0/
-            // throttle_reason_*, xe freq0/throttle/*), but the bit semantics differ per
-            // driver and need fixture-backed decoders before narration — same bar as
-            // AMD's gpu_metrics. Default = "no throttle signal" is honest until then.
-            throttle: ThrottleReasons::default(),
+            // Per-GT throttle ("performance limit") reasons, decoded per dialect from the
+            // one-bit-per-file sysfs flags (i915 gt/gt0/throttle_reason_*, xe
+            // freq0/throttle/*). `status` is the gate — an absent file or status==0 yields
+            // the default, so no-throttle hardware reports honest silence. This is the
+            // metric intel_gpu_top still does not surface on xe.
+            throttle,
         })
     }
 

@@ -7,10 +7,13 @@
 //!   against committed fixture trees; `init()` is just `with_root("/")`.
 //! - A missing file or unparsable value is `None`, never a failure — an APU without hwmon
 //!   or `pp_dpm_*` tables is a normal device, not a broken one (Intel-iGPU-style absence).
-//! - Throttle bits live in the `gpu_metrics` packed binary struct, which is versioned
-//!   (v1.0–v3.0) with per-version field offsets AND units, and therefore needs per-version
-//!   decoders backed by fixtures. Until that lands, throttle stays
-//!   `ThrottleReasons::default()`: no signal is honest, faked bits are not.
+//! - Throttle bits live in the `gpu_metrics` binary struct, which is versioned (v1.0–v3.0)
+//!   with per-version field offsets AND units, and therefore needs per-version decoders
+//!   backed by fixtures. `decode_gpu_metrics_throttle` parses it directly off the sysfs
+//!   blob (offsets derived from the in-tree kernel header — see that function). A blob that
+//!   is absent, truncated, of an unknown revision, or whose self-declared `structure_size`
+//!   is inconsistent decodes to `ThrottleReasons::default()`: no signal is honest, a
+//!   misread byte narrated as a throttle cause is not.
 //! - Only SMU-backed sysfs is polled (`gpu_busy_percent`, hwmon) — never GRBM registers,
 //!   whose polling breaks GFXOFF (the monitor must not change what it measures).
 //! - Per-process attribution is DRM fdinfo (kernel 5.14+, standardized 5.19+): cumulative
@@ -129,6 +132,358 @@ fn fan_pct_of_max(rpm: f32, max: f32) -> Option<f32> {
         return None;
     }
     Some((rpm / max * 100.0).clamp(0.0, 100.0))
+}
+
+// ---- gpu_metrics throttle decoding ------------------------------------------------------
+//
+// The `gpu_metrics` sysfs node is a memcpy of the SMU firmware metrics table into a kernel
+// C struct that is then exposed verbatim to userspace. The structs (kgd_pp_interface.h) are
+// NOT `__attribute__((packed))`, so the on-disk layout is the firmware's NATURAL-aligned
+// layout: every field sits at an offset that is a multiple of its own size (u16→2, u32→4,
+// u64→8), and the kernel devs ordered members to minimise — but not always eliminate —
+// inter-field padding. All offsets below are derived by walking the member list with that
+// rule; the workings are shown inline so a future header bump can be re-verified by hand.
+//
+// Everything is little-endian (the only architectures amdgpu runs on). Every read is bounds-
+// and structure_size-gated: a short, lying, or unknown-revision blob is absence, never an
+// error and never a misattributed cause.
+
+/// The common header every `gpu_metrics_v*` opens with (kgd_pp_interface.h
+/// `struct metrics_table_header`): `u16 structure_size; u8 format_revision;
+/// u8 content_revision;` — 4 bytes, no trailing padding.
+const HEADER_LEN: usize = 4;
+
+/// Read a little-endian `u32` at `off`, or `None` if it would run past the buffer.
+fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
+    let bytes = buf.get(off..off.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Read a little-endian `u64` at `off`, or `None` if it would run past the buffer.
+fn read_u64_le(buf: &[u8], off: usize) -> Option<u64> {
+    let bytes = buf.get(off..off.checked_add(8)?)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+// ASIC-INDEPENDENT throttler bits (`indep_throttle_status`), from amdgpu_smu.h
+// `SMU_THROTTLER_*_BIT`. These are normalised by the driver across ASICs, so unlike the
+// legacy `throttle_status` they are safe to map to specific causes.
+//
+// Power group (PPT = package power tracking, SPL/FPPT/SPPT = APU power limits):
+const SMU_THROTTLER_PPT0_BIT: u32 = 0;
+const SMU_THROTTLER_PPT1_BIT: u32 = 1;
+const SMU_THROTTLER_PPT2_BIT: u32 = 2;
+const SMU_THROTTLER_PPT3_BIT: u32 = 3;
+const SMU_THROTTLER_SPL_BIT: u32 = 4;
+const SMU_THROTTLER_FPPT_BIT: u32 = 5;
+const SMU_THROTTLER_SPPT_BIT: u32 = 6;
+const SMU_THROTTLER_SPPT_APU_BIT: u32 = 7;
+// Current group (TDC = thermal design current, EDC = electrical design current, APCC):
+const SMU_THROTTLER_TDC_GFX_BIT: u32 = 16;
+const SMU_THROTTLER_TDC_SOC_BIT: u32 = 17;
+const SMU_THROTTLER_TDC_MEM_BIT: u32 = 18;
+const SMU_THROTTLER_TDC_VDD_BIT: u32 = 19;
+const SMU_THROTTLER_TDC_CVIP_BIT: u32 = 20;
+const SMU_THROTTLER_EDC_CPU_BIT: u32 = 21;
+const SMU_THROTTLER_EDC_GFX_BIT: u32 = 22;
+const SMU_THROTTLER_APCC_BIT: u32 = 23;
+// Temperature group:
+const SMU_THROTTLER_TEMP_GPU_BIT: u32 = 32;
+const SMU_THROTTLER_TEMP_CORE_BIT: u32 = 33;
+const SMU_THROTTLER_TEMP_MEM_BIT: u32 = 34;
+const SMU_THROTTLER_TEMP_EDGE_BIT: u32 = 35;
+const SMU_THROTTLER_TEMP_HOTSPOT_BIT: u32 = 36;
+const SMU_THROTTLER_TEMP_SOC_BIT: u32 = 37;
+const SMU_THROTTLER_TEMP_VR_GFX_BIT: u32 = 38;
+const SMU_THROTTLER_TEMP_VR_SOC_BIT: u32 = 39;
+const SMU_THROTTLER_TEMP_VR_MEM0_BIT: u32 = 40;
+const SMU_THROTTLER_TEMP_VR_MEM1_BIT: u32 = 41;
+const SMU_THROTTLER_TEMP_LIQUID0_BIT: u32 = 42;
+const SMU_THROTTLER_TEMP_LIQUID1_BIT: u32 = 43;
+const SMU_THROTTLER_VRHOT0_BIT: u32 = 44;
+const SMU_THROTTLER_VRHOT1_BIT: u32 = 45;
+// PROCHOT (external "processor hot" assertion → hardware-forced slowdown):
+const SMU_THROTTLER_PROCHOT_CPU_BIT: u32 = 46;
+const SMU_THROTTLER_PROCHOT_GFX_BIT: u32 = 47;
+// Other:
+const SMU_THROTTLER_PPM_BIT: u32 = 56;
+const SMU_THROTTLER_FIT_BIT: u32 = 57;
+
+/// Thermal-group `indep_throttle_status` bits: any of these is a temperature limit. VRHOT
+/// (voltage-regulator over-temp) and the liquid-cooling sensors belong here too.
+const INDEP_THERMAL_MASK: u64 = (1 << SMU_THROTTLER_TEMP_GPU_BIT)
+    | (1 << SMU_THROTTLER_TEMP_CORE_BIT)
+    | (1 << SMU_THROTTLER_TEMP_MEM_BIT)
+    | (1 << SMU_THROTTLER_TEMP_EDGE_BIT)
+    | (1 << SMU_THROTTLER_TEMP_HOTSPOT_BIT)
+    | (1 << SMU_THROTTLER_TEMP_SOC_BIT)
+    | (1 << SMU_THROTTLER_TEMP_VR_GFX_BIT)
+    | (1 << SMU_THROTTLER_TEMP_VR_SOC_BIT)
+    | (1 << SMU_THROTTLER_TEMP_VR_MEM0_BIT)
+    | (1 << SMU_THROTTLER_TEMP_VR_MEM1_BIT)
+    | (1 << SMU_THROTTLER_TEMP_LIQUID0_BIT)
+    | (1 << SMU_THROTTLER_TEMP_LIQUID1_BIT)
+    | (1 << SMU_THROTTLER_VRHOT0_BIT)
+    | (1 << SMU_THROTTLER_VRHOT1_BIT);
+
+/// Power/current-group bits: PPT* (power-cap) and the TDC/EDC current limits all mean "you
+/// are being pulled back to stay inside an electrical/power envelope".
+const INDEP_POWER_MASK: u64 = (1 << SMU_THROTTLER_PPT0_BIT)
+    | (1 << SMU_THROTTLER_PPT1_BIT)
+    | (1 << SMU_THROTTLER_PPT2_BIT)
+    | (1 << SMU_THROTTLER_PPT3_BIT)
+    | (1 << SMU_THROTTLER_SPL_BIT)
+    | (1 << SMU_THROTTLER_FPPT_BIT)
+    | (1 << SMU_THROTTLER_SPPT_BIT)
+    | (1 << SMU_THROTTLER_SPPT_APU_BIT)
+    | (1 << SMU_THROTTLER_TDC_GFX_BIT)
+    | (1 << SMU_THROTTLER_TDC_SOC_BIT)
+    | (1 << SMU_THROTTLER_TDC_MEM_BIT)
+    | (1 << SMU_THROTTLER_TDC_VDD_BIT)
+    | (1 << SMU_THROTTLER_TDC_CVIP_BIT)
+    | (1 << SMU_THROTTLER_EDC_CPU_BIT)
+    | (1 << SMU_THROTTLER_EDC_GFX_BIT);
+
+/// PROCHOT is an external slowdown forced on the GPU by the platform — the AMD analogue of
+/// NVML's HW_SLOWDOWN.
+const INDEP_HW_SLOWDOWN_MASK: u64 =
+    (1 << SMU_THROTTLER_PROCHOT_CPU_BIT) | (1 << SMU_THROTTLER_PROCHOT_GFX_BIT);
+
+/// Recognised-but-uncategorised bits (APCC interconnect throttle, PPM, FIT failure-in-time).
+/// Kept explicit so the "unknown future bit" branch in [`map_indep_throttle`] only fires for
+/// genuinely new bits, not for ones we know about but do not split into a column.
+const INDEP_OTHER_MASK: u64 =
+    (1 << SMU_THROTTLER_APCC_BIT) | (1 << SMU_THROTTLER_PPM_BIT) | (1 << SMU_THROTTLER_FIT_BIT);
+
+/// Map an `indep_throttle_status` word to [`ThrottleReasons`]. Tolerant like the NVIDIA
+/// decoder: any bit outside the masks we recognise lands in `other` rather than being
+/// dropped, so a firmware/header that adds a throttler still surfaces "something is
+/// throttling" honestly.
+fn map_indep_throttle(bits: u64) -> ThrottleReasons {
+    let known = INDEP_THERMAL_MASK | INDEP_POWER_MASK | INDEP_HW_SLOWDOWN_MASK | INDEP_OTHER_MASK;
+    ThrottleReasons {
+        thermal: bits & INDEP_THERMAL_MASK != 0,
+        power_cap: bits & INDEP_POWER_MASK != 0,
+        hw_slowdown: bits & INDEP_HW_SLOWDOWN_MASK != 0,
+        // AMD has no cross-GPU sync-boost concept in this status word.
+        sync_boost: false,
+        other: (bits & INDEP_OTHER_MASK != 0) || (bits & !known != 0),
+    }
+}
+
+/// Where the throttle words live in each supported `(format_revision, content_revision)`,
+/// plus the struct's own byte length (for the `structure_size` sanity gate).
+struct ThrottleLayout {
+    /// Offset of `indep_throttle_status` (ASIC-independent u64), when the version carries it.
+    indep: Option<usize>,
+    /// Offset of the legacy ASIC-specific `throttle_status` (u32). Decoded only as a coarse
+    /// "something is throttling" when no `indep` word exists.
+    legacy: Option<usize>,
+    /// `sizeof` the struct (natural-aligned). The blob must be at least this big and its
+    /// self-declared `structure_size` must match, or it is treated as absence.
+    size: usize,
+}
+
+/// Resolve the throttle layout for a `(format, content)` revision, or `None` for revisions
+/// that carry no throttle data we trust. Offsets are walked from the kernel structs in
+/// kgd_pp_interface.h under natural C alignment (see the module note above).
+fn throttle_layout(format: u8, content: u8) -> Option<ThrottleLayout> {
+    match (format, content) {
+        // gpu_metrics_v1_x (dGPU). Shared prefix, naturally aligned with no padding:
+        //   header(4) + 10×u16 temps/activity/power(20)=24 → energy_accumulator u64 @24,
+        //   system_clock_counter u64 @32, then 14×u16 avg+current clocks(28) @40 →
+        //   throttle_status u32 @68. v1.0 reorders the prefix; we map only v1.1+.
+        (1, 1) => Some(ThrottleLayout {
+            indep: None,
+            legacy: Some(68),
+            // … fan_speed/pcie(3×u16)+padding(u16)@72, gfx/mem_activity_acc(2×u32)@80,
+            // temperature_hbm[4] u16 @88 → 96.
+            size: 96,
+        }),
+        (1, 2) => Some(ThrottleLayout {
+            indep: None,
+            legacy: Some(68),
+            // … as v1.1 up to @96, then firmware_timestamp u64 @96 → 104.
+            size: 104,
+        }),
+        (1, 3) => Some(ThrottleLayout {
+            // … v1.2 up to firmware_timestamp@96(→104), voltage_soc/gfx/mem+padding1
+            // (4×u16)@104 → indep_throttle_status u64 @112 → 120.
+            indep: Some(112),
+            legacy: Some(68),
+            size: 120,
+        }),
+        // gpu_metrics_v2_x (APU). v2.0's prefix differs (system_clock_counter first), so it
+        // needs its own offsets; v2.1+ share a prefix where throttle_status lands at @108.
+        (2, 0) => Some(ThrottleLayout {
+            indep: None,
+            // header(4) → pad(4) → system_clock_counter u64 @8; then temps/core/l3
+            // (1+1+8+2 u16)@16=24 → @40, activity/power(6 u16)@40 → @52,
+            // average_core_power[8](16)@52 → @68, 6 avg + 6 current clocks(12 u16)@68 → @92,
+            // current_coreclk[8](16)@92 → @108, current_l3clk[2](4)@108 → @112 →
+            // throttle_status u32 @112.
+            legacy: Some(112),
+            // fan_pwm u16 @116, padding u16 @118 → 120.
+            size: 120,
+        }),
+        (2, 1) => Some(ThrottleLayout {
+            indep: None,
+            // header(4) → temps/core/l3(1+1+8+2 u16)@4=24 → @28, gfx/mm activity(2 u16) →
+            // @32, system_clock_counter u64 @32 → @40, 4 power u16 @40 → @48,
+            // average_core_power[8](16)@48 → @64, 6 avg+6 current clocks(12 u16)@64 → @88,
+            // current_coreclk[8](16)@88 → @104, current_l3clk[2](4)@104 → @108 →
+            // throttle_status u32 @108.
+            legacy: Some(108),
+            // fan_pwm u16 @112, padding[3] u16 @114 → 120.
+            size: 120,
+        }),
+        (2, 2) => Some(ThrottleLayout {
+            // v2.1 prefix → throttle_status@108, fan_pwm@112, padding[3]@114 → @120 →
+            // indep_throttle_status u64 @120 → 128. (The kernel struct carries indep from
+            // v2.2 onward, one content-rev earlier than some docs claim — header wins.)
+            indep: Some(120),
+            legacy: Some(108),
+            size: 128,
+        }),
+        (2, 3) => Some(ThrottleLayout {
+            // v2.2 up to indep@120(→128), then average_temperature_gfx/soc/core[8]/l3[2]
+            // (12 u16)@128 → 152.
+            indep: Some(120),
+            legacy: Some(108),
+            size: 152,
+        }),
+        (2, 4) => Some(ThrottleLayout {
+            // v2.3 up to @152, then average cpu/soc/gfx voltage+current (6 u16)@152 → 164.
+            indep: Some(120),
+            legacy: Some(108),
+            size: 164,
+        }),
+        // gpu_metrics_v3_0 (newer APU) drops the status bitfields for per-cause RESIDENCY
+        // counters; those are decoded separately by offset+name, not as a bitmask.
+        _ => None,
+    }
+}
+
+/// v3_0 throttle-residency counters (kgd_pp_interface.h `gpu_metrics_v3_0`). Each is a u32
+/// accumulator: nonzero means that throttler was active during the firmware's window. A
+/// counter is a fact, so these map to causes by name. Offsets walked under natural
+/// alignment (the struct's two interior pads — before `system_clock_counter` and before
+/// `average_apu_power` — are already accounted for upstream of these fields).
+struct V3ResidencyLayout {
+    prochot: usize,
+    spl: usize,
+    fppt: usize,
+    sppt: usize,
+    thm_core: usize,
+    thm_gfx: usize,
+    thm_soc: usize,
+    size: usize,
+}
+
+/// Resolve the v3_0 residency block, or `None` for any other revision.
+fn v3_residency_layout(format: u8, content: u8) -> Option<V3ResidencyLayout> {
+    if (format, content) != (3, 0) {
+        return None;
+    }
+    // Walk to current_gfx_maxfreq u16 @224 (the field just before the residency block):
+    //   header(4) temps gfx/soc(4)@4 core[16](32)@8 skin(2)@40 gfx_act/vcn(4)@42
+    //   ipu_act[8](16)@46 core_c0[16](32)@62 dram/ipu rd/wr(8)@94 → @102
+    //   pad(2)@102 system_clock_counter u64 @104 → @112
+    //   socket_power u32 @112 ipu_power u16 @116 pad(2)@118
+    //   apu/gfx/dgpu/all_core power(4×u32)@120 → @136
+    //   core_power[16](32)@136 sys_power/stapm/cur_stapm(6)@168 → @174
+    //   8 avg clocks(16)@174 → @190 coreclk[16](32)@190 → @222
+    //   core_maxfreq u16 @222, gfx_maxfreq u16 @224 → residency block @226.
+    Some(V3ResidencyLayout {
+        prochot: 226,
+        spl: 230,
+        fppt: 234,
+        sppt: 238,
+        thm_core: 242,
+        thm_gfx: 246,
+        thm_soc: 250,
+        // time_filter_alphavalue u32 @254 → 258; struct aligns to u64 → 264.
+        size: 264,
+    })
+}
+
+/// Decode AMD throttle status from a raw `gpu_metrics` sysfs blob.
+///
+/// Offsets are derived from the in-tree kernel headers
+/// (`drivers/gpu/drm/amd/include/kgd_pp_interface.h` for the struct layouts and
+/// `drivers/gpu/drm/amd/pm/swsmu/inc/amdgpu_smu.h` for the `SMU_THROTTLER_*_BIT` values).
+/// The structs are naturally aligned, little-endian.
+///
+/// The contract is *honest absence on any doubt*: a buffer too short for the header, a
+/// `structure_size` that disagrees with the version's known length (or is shorter than the
+/// fields we read), an unknown `(format, content)` revision, or an out-of-bounds field all
+/// yield `ThrottleReasons::default()`. We never wrap, never panic, and never narrate a byte
+/// we are not certain of.
+///
+/// Mapping precedence: prefer `indep_throttle_status` (ASIC-independent bits) and split it
+/// into thermal / power_cap / hw_slowdown / other. v3_0 has no status word — its per-cause
+/// residency counters are used instead. For older revisions that expose only the legacy
+/// ASIC-specific `throttle_status`, the per-bit meaning varies by ASIC and is not safe to
+/// map; a nonzero value reliably means "some throttler is active", so it surfaces as `other`
+/// alone rather than as a fabricated specific cause.
+pub fn decode_gpu_metrics_throttle(buf: &[u8]) -> ThrottleReasons {
+    // Common header: structure_size u16 @0, format_revision u8 @2, content_revision u8 @3.
+    if buf.len() < HEADER_LEN {
+        return ThrottleReasons::default();
+    }
+    let structure_size = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    let format = buf[2];
+    let content = buf[3];
+
+    // The blob must hold at least as many bytes as it claims, and the claim must be a real
+    // header (a zeroed/garbage node reads structure_size 0). Both guards reject truncation.
+    if structure_size < HEADER_LEN || buf.len() < structure_size {
+        return ThrottleReasons::default();
+    }
+
+    if let Some(layout) = throttle_layout(format, content) {
+        // structure_size must match the version's known size exactly — a mismatch means we
+        // are not looking at the struct we think we are, so we decode nothing.
+        if structure_size != layout.size {
+            return ThrottleReasons::default();
+        }
+        if let Some(off) = layout.indep {
+            if let Some(bits) = read_u64_le(buf, off) {
+                return map_indep_throttle(bits);
+            }
+            return ThrottleReasons::default();
+        }
+        if let Some(off) = layout.legacy {
+            return match read_u32_le(buf, off) {
+                // Legacy throttle_status is ASIC-specific: nonzero = throttling, cause
+                // unmappable. Honest coarse signal beats both silence and a guessed column.
+                Some(v) if v != 0 => ThrottleReasons {
+                    other: true,
+                    ..Default::default()
+                },
+                _ => ThrottleReasons::default(),
+            };
+        }
+        return ThrottleReasons::default();
+    }
+
+    if let Some(r) = v3_residency_layout(format, content) {
+        if structure_size != r.size {
+            return ThrottleReasons::default();
+        }
+        let any = |off: usize| read_u32_le(buf, off).is_some_and(|v| v != 0);
+        return ThrottleReasons {
+            thermal: any(r.thm_core) || any(r.thm_gfx) || any(r.thm_soc),
+            // SPL/FPPT/SPPT are the APU power limits.
+            power_cap: any(r.spl) || any(r.fppt) || any(r.sppt),
+            hw_slowdown: any(r.prochot),
+            sync_boost: false,
+            other: false,
+        };
+    }
+
+    // Unknown future revision: decode nothing rather than guess offsets.
+    ThrottleReasons::default()
 }
 
 /// The fdinfo keys this backend consumes. Anything missing (older kernel, non-DRM fd)
@@ -452,13 +807,16 @@ impl GpuBackend for AmdBackend {
                 .ok()
                 .as_deref()
                 .and_then(dpm_current_mhz),
-            // VCN (enc/dec) activity lives in gpu_metrics, not plain sysfs — absent until
-            // the per-version decoder lands.
+            // VCN (enc/dec) activity also lives in gpu_metrics, but its per-version offsets
+            // and units are a separate job — absent until that decoder lands.
             encoder_pct: None,
             decoder_pct: None,
-            // Throttle status also lives in the versioned gpu_metrics packed struct.
-            // Default = "no throttle signal", which is honest; faked bits are not.
-            throttle: ThrottleReasons::default(),
+            // Throttle status lives in the versioned `gpu_metrics` binary node. An absent
+            // file (APUs/older kernels without the node) or anything the decoder cannot
+            // trust reads back as the default "no throttle signal" — honest, never faked.
+            throttle: fs::read(p.join("gpu_metrics"))
+                .map(|buf| decode_gpu_metrics_throttle(&buf))
+                .unwrap_or_default(),
         })
     }
 
@@ -603,6 +961,184 @@ mod tests {
             "Uid:\t1000\t1000\t1000\t1000\nCapEff:\t0000000000000000"
         ));
         assert!(!status_grants_full_proc_scan(""));
+    }
+
+    // ---- gpu_metrics throttle decoding -------------------------------------------------
+    //
+    // The blob builders below write every field at the SAME offset the decoder reads, and
+    // deliberately plant a DECOY nonzero value in the field adjacent to each word we care
+    // about. An off-by-N decoder would read the decoy and produce the wrong category, so
+    // these tests fail loudly on an offset slip rather than silently passing.
+
+    /// Build a naturally-aligned `gpu_metrics_v1_3` blob (size 120) with the given
+    /// `indep_throttle_status`. Plants a thermal-bit decoy 8 bytes BEFORE indep (the voltage
+    /// block) and a nonzero legacy throttle_status, so a correct decoder must read indep at
+    /// exactly @112 and must prefer it over the legacy word.
+    fn build_v1_3(indep: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 120];
+        b[0..2].copy_from_slice(&120u16.to_le_bytes()); // structure_size
+        b[2] = 1; // format_revision
+        b[3] = 3; // content_revision
+        b[68..72].copy_from_slice(&0x0000_0080u32.to_le_bytes()); // legacy decoy (nonzero)
+        b[104..112].copy_from_slice(&(1u64 << 32).to_le_bytes()); // off-by-8 thermal decoy
+        b[112..120].copy_from_slice(&indep.to_le_bytes()); // the real word
+        b
+    }
+
+    /// Build a `gpu_metrics_v2_3` blob (size 152, APU) with the given indep word. indep lives
+    /// at @120; the off-by-8 decoy goes at @112 (fan_pwm/padding region) and a legacy decoy
+    /// at @108.
+    fn build_v2_3(indep: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 152];
+        b[0..2].copy_from_slice(&152u16.to_le_bytes());
+        b[2] = 2;
+        b[3] = 3;
+        b[108..112].copy_from_slice(&0x0000_0080u32.to_le_bytes()); // legacy decoy
+        b[112..120].copy_from_slice(&(1u64 << 32).to_le_bytes()); // off-by-8 thermal decoy
+        b[120..128].copy_from_slice(&indep.to_le_bytes());
+        b
+    }
+
+    /// Build a legacy-only `gpu_metrics_v2_1` blob (size 120, no indep word): throttle_status
+    /// at @108, with a nonzero decoy in the adjacent fan_pwm/padding bytes.
+    fn build_v2_1(throttle_status: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 120];
+        b[0..2].copy_from_slice(&120u16.to_le_bytes());
+        b[2] = 2;
+        b[3] = 1;
+        b[112..114].copy_from_slice(&0xBEEFu16.to_le_bytes()); // fan_pwm decoy (adjacent)
+        b[108..112].copy_from_slice(&throttle_status.to_le_bytes());
+        b
+    }
+
+    /// Build a `gpu_metrics_v3_0` blob (size 264) with the named residency counters set.
+    fn build_v3_0(prochot: u32, spl: u32, thm_gfx: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 264];
+        b[0..2].copy_from_slice(&264u16.to_le_bytes());
+        b[2] = 3;
+        b[3] = 0;
+        // decoy in current_gfx_maxfreq (@224), just before the residency block:
+        b[224..226].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        b[226..230].copy_from_slice(&prochot.to_le_bytes());
+        b[230..234].copy_from_slice(&spl.to_le_bytes());
+        b[242..246].copy_from_slice(&thm_gfx.to_le_bytes()); // throttle_residency_thm_gfx
+        b
+    }
+
+    #[test]
+    fn indep_thermal_bit_decodes_to_thermal_only() {
+        // TEMP_HOTSPOT (bit 36) is purely thermal.
+        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_TEMP_HOTSPOT_BIT));
+        assert!(t.thermal);
+        assert!(!t.power_cap && !t.hw_slowdown && !t.sync_boost && !t.other);
+    }
+
+    #[test]
+    fn indep_ppt_bit_decodes_to_power_cap_only() {
+        // PPT0 (bit 0) is a package-power limit; the legacy/off-by-8 decoys must be ignored.
+        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_PPT0_BIT));
+        assert!(t.power_cap);
+        assert!(!t.thermal && !t.hw_slowdown && !t.sync_boost && !t.other);
+    }
+
+    #[test]
+    fn indep_prochot_bit_decodes_to_hw_slowdown() {
+        let t = decode_gpu_metrics_throttle(&build_v1_3(1 << SMU_THROTTLER_PROCHOT_GFX_BIT));
+        assert!(t.hw_slowdown);
+        assert!(!t.thermal && !t.power_cap && !t.sync_boost && !t.other);
+    }
+
+    #[test]
+    fn indep_combined_bits_decode_to_multiple_reasons() {
+        // Thermal + power + prochot + an unknown future bit (bit 60) at once.
+        let bits = (1 << SMU_THROTTLER_TEMP_MEM_BIT)
+            | (1 << SMU_THROTTLER_TDC_GFX_BIT)
+            | (1 << SMU_THROTTLER_PROCHOT_CPU_BIT)
+            | (1u64 << 60);
+        let t = decode_gpu_metrics_throttle(&build_v2_3(bits));
+        assert!(t.thermal && t.power_cap && t.hw_slowdown);
+        // The unrecognised bit lands in `other` (tolerant decoding), not dropped.
+        assert!(t.other);
+        assert!(!t.sync_boost);
+    }
+
+    #[test]
+    fn legacy_only_nonzero_is_coarse_other_never_a_guessed_cause() {
+        // v2_1 has no indep word: a nonzero ASIC-specific throttle_status is real, but its
+        // per-bit meaning is unknowable cross-ASIC, so it surfaces as `other` alone.
+        let t = decode_gpu_metrics_throttle(&build_v2_1(0x0000_00FF));
+        assert!(t.other);
+        assert!(!t.thermal && !t.power_cap && !t.hw_slowdown && !t.sync_boost);
+        // Zero legacy status = not throttling.
+        assert_eq!(
+            decode_gpu_metrics_throttle(&build_v2_1(0)),
+            ThrottleReasons::default()
+        );
+    }
+
+    #[test]
+    fn v3_residency_counters_map_by_name() {
+        // prochot residency → hw_slowdown, spl (power limit) → power_cap.
+        let t = decode_gpu_metrics_throttle(&build_v3_0(5, 9, 0));
+        assert!(t.hw_slowdown && t.power_cap);
+        assert!(!t.thermal && !t.other);
+        // thm_gfx residency → thermal.
+        let t = decode_gpu_metrics_throttle(&build_v3_0(0, 0, 3));
+        assert!(t.thermal);
+        assert!(!t.hw_slowdown && !t.power_cap);
+        // All-zero residency = not throttling.
+        assert_eq!(
+            decode_gpu_metrics_throttle(&build_v3_0(0, 0, 0)),
+            ThrottleReasons::default()
+        );
+    }
+
+    #[test]
+    fn unknown_revision_decodes_to_default() {
+        // A well-formed header with a future (format=9, content=9) revision: no offsets we
+        // trust → default, never a guess at byte positions.
+        let mut b = build_v1_3(1 << SMU_THROTTLER_PPT0_BIT);
+        b[2] = 9;
+        b[3] = 9;
+        assert_eq!(
+            decode_gpu_metrics_throttle(&b),
+            ThrottleReasons::default(),
+            "unknown revision must decode nothing"
+        );
+    }
+
+    #[test]
+    fn truncated_blob_decodes_to_default_without_panic() {
+        // The corrupt/short-sysfs honesty case: every prefix length must yield default,
+        // never a panic and never a half-read word.
+        let full = build_v1_3(1 << SMU_THROTTLER_PPT0_BIT);
+        for len in 0..full.len() {
+            assert_eq!(
+                decode_gpu_metrics_throttle(&full[..len]),
+                ThrottleReasons::default(),
+                "a {len}-byte prefix of a v1_3 blob must decode to default"
+            );
+        }
+        // An empty buffer is the extreme of the same case.
+        assert_eq!(decode_gpu_metrics_throttle(&[]), ThrottleReasons::default());
+    }
+
+    #[test]
+    fn lying_structure_size_decodes_to_default() {
+        // structure_size claims a smaller struct than the version's real length: we are not
+        // looking at the struct we think we are, so decode nothing even though a PPT bit is
+        // physically present at @112.
+        let mut b = build_v1_3(1 << SMU_THROTTLER_PPT0_BIT);
+        b[0..2].copy_from_slice(&100u16.to_le_bytes()); // real v1_3 is 120
+        assert_eq!(
+            decode_gpu_metrics_throttle(&b),
+            ThrottleReasons::default(),
+            "a structure_size that disagrees with the version size is not trusted"
+        );
+        // The mirror case: structure_size larger than the buffer (claims bytes we lack).
+        let mut b = build_v1_3(1 << SMU_THROTTLER_PPT0_BIT);
+        b[0..2].copy_from_slice(&200u16.to_le_bytes());
+        assert_eq!(decode_gpu_metrics_throttle(&b), ThrottleReasons::default());
     }
 
     #[test]
