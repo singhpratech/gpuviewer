@@ -1,7 +1,7 @@
 # Production & Platform Deep-Dive — v0.1.0 Audited
 
 **Date: 2026-06-07.** Builds on `01-market-landscape.md` (market matrix), `04-synthesis.md`
-(decision record), and `05-competitive-deep-dive.md` (June-2026 competitive evidence). This
+(decision record), and the competitive evidence). This
 document is different in kind: it audits **our own tree**, not the market. Seven
 investigations (production readiness, Linux coverage, the Windows v1.5 path, the macOS v2
 path, the GPU support matrix, demand evidence, timeline design) were run and then
@@ -49,7 +49,7 @@ the gaps, because it is the part the product thesis rests on:
 **Blocker 1 — "always-on" is a process, not a property.** Recording happens only inside a
 live `gpuviewer` process: persistence is wired per-process in `Engine::new`
 (`collector.rs:183-231`). There is no daemon (punted by decision — `04-synthesis.md` §6,
-`05-competitive-deep-dive.md` §7.2), no shipped systemd unit or service file anywhere in
+the competitive evidence.2), no shipped systemd unit or service file anywhere in
 the repo, and the only operational guidance is a one-line README aside ("run
 `gpuviewer --json` under your own systemd user unit", README:247-249). The README headline
 "It was already recording" (README:3) and the comparison row "Always-on recording, no
@@ -182,7 +182,7 @@ Linux coverage is real but sharply tiered, and any public statement must use the
 complete device telemetry (util, VRAM, power + enforced limit, temp + slowdown threshold,
 fan, SM/mem clocks, enc/dec util, driver version — `nvidia.rs:204-251`); exhaustive
 throttle-cause decoding including SW_POWER_CAP and SW_THERMAL, the dominant consumer causes
-that rivals skip (gpud ships HW bits only — `05-competitive-deep-dive.md` §2/§3.1);
+that rivals skip (gpud ships HW bits only — the competitive evidence.1);
 per-process PIDs + VRAM with C/G merge, per-PID sm-util via watermark (explicitly demoted
 to "populate a column, never headline numbers", `nvidia.rs:296-309`), CPU% and container
 identity from `/proc`. Validated on the RTX 4090 Laptop dev machine. NVML-only: nouveau/NVK
@@ -272,7 +272,7 @@ real Arc silicon.
   `libnvidia-ml.so.1` ships, so the integrated GPU would likely enumerate as a real but
   mostly-unavailable NVML device. Neither path is tested on Tegra. The only documentation
   is the §6 punt ("Exotic vendors … opportunistic, post-v2"); README never says Jetson is
-  out of scope. nv-monitor owns this segment (`05-competitive-deep-dive.md` §2).
+  out of scope. nv-monitor owns this segment.
 - **Virtualized GPUs — unhandled and untested everywhere.** virtio-gpu (vendor 0x1af4)
   matches no backend → mock fallback. Full passthrough should look native but is
   unverified. SR-IOV VFs (NVIDIA vGPU guest NVML, amdgpu/i915 VFs) would enumerate through
@@ -317,7 +317,7 @@ Windows WDDM** — the Windows kernel owns VRAM and GeForce cannot switch to TCC
 (`02-vendor-apis.md:22-25`; matrix row "❌ WDDM (use PDH)"). The researched mandatory fix
 is dual-sourcing PDH **"GPU Process Memory"** counters (Task Manager's own source) and/or
 `D3DKMTQueryStatistics` via the official `windows` crate. Zero PDH/D3DKMT code exists in
-the repo today. `05-competitive-deep-dive.md` §3.2-6 notes honest NVML+D3DKMT
+the repo today. the competitive evidence.2-6 notes honest NVML+D3DKMT
 dual-sourcing of per-process VRAM is "unshipped by anyone" — it is both the blocker and
 the differentiator. Without it, three of the six narration families are structurally dead
 on Windows (IdleGap, HangSuspected, CpuSpillover — their honesty gates require per-PID
@@ -349,7 +349,7 @@ AMD/Intel-dGPU hardware validation even on Linux.
 
 **Everything in this subsection is dated pre-WWDC26 (June 8–12 — the keynote is
 tomorrow).** The repo's own gate requires re-verifying macOS per-process APIs after the
-keynote before any v2 scope commitment (`05-competitive-deep-dive.md:120-121,342`); a
+keynote before any v2 scope commitment ; a
 per-process GPU API announcement would erase a differentiator, further private-API
 breakage would add cost.
 
@@ -416,7 +416,7 @@ the market context stands: device-level macOS monitoring is explicitly "NOT a re
 (macmon/mactop v2/Stats are active and sudoless); the defensible v2 residual is the
 platform-neutral spine — history + narrated events + replay + the wired-limit/model-fit
 story — and it is a race (a SQLite+events release from macmon or mactop occupies the slot;
-tripwires in `05-competitive-deep-dive.md` §6).
+tripwires in the competitive evidence).
 
 ---
 
@@ -453,7 +453,7 @@ One table, honestly worded. "Validated" means executed on that hardware by us; v
 
 ### 4.1 The strongest signals
 
-All re-verified June 2026 (`05-competitive-deep-dive.md` §§1,3,4; `01-market-landscape.md`):
+All re-verified June 2026:
 
 1. **The wedge request, verbatim, declined by the best tool in the space:** nvitop #217
    (closed-wontfix 2026-05-19) — a user asks "did util drop off 5 minutes ago when the
