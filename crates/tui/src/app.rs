@@ -92,6 +92,19 @@ pub enum Mode {
     Timeline,
 }
 
+/// Why a replay/timeline key did nothing. The footer prints a different sentence per
+/// variant: "replay needs persistence" is only true when recording is actually off, and
+/// asserting it for an unreadable database would tell the user a flag was set that they
+/// never passed — the confidently-wrong narration the trust thesis rules out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayBlock {
+    /// No database path at all — `--no-persist`, or a session that never had one.
+    NoPersistence,
+    /// A database path exists but would not open read-only (corrupt, quarantined,
+    /// permissions). Recording itself may be running perfectly.
+    Unreadable,
+}
+
 /// How the live/replay charts paint the square wave: a braille step outline (the
 /// shipped default) or the filled half-block silhouette. Both walk the same
 /// hold-then-step points with the same gap-breaking — strictly a paint choice, cycled
@@ -162,9 +175,12 @@ pub struct App {
     /// The selected story-feed row, shared by both modes: in Live it indexes the
     /// newest-first feed, in Replay the window's chronological event list.
     pub story_selected: Option<usize>,
-    /// True after a replay key was pressed with no history store available — the footer
-    /// explains why nothing happened instead of silently swallowing the key.
-    pub replay_hint: bool,
+    /// Set after a replay/timeline key was pressed with no usable history store — the
+    /// footer explains why nothing happened instead of silently swallowing the key.
+    /// Carries the CAUSE, because the two causes need different sentences: blaming
+    /// `--no-persist` when the user never passed it is exactly the confidently-wrong
+    /// narration the honesty contract forbids.
+    pub replay_hint: Option<ReplayBlock>,
     /// How the live/replay charts are painted; 's' cycles it.
     pub chart_style: ChartStyle,
     /// Timeline cursor in unix millis; meaningful only in `Mode::Timeline`.
@@ -201,7 +217,7 @@ impl App {
             mode: Mode::Live,
             cursor_ms: 0,
             story_selected: None,
-            replay_hint: false,
+            replay_hint: None,
             chart_style: ChartStyle::Braille,
             timeline_cursor_ms: 0,
             timeline_zoom: TIMELINE_DEFAULT_ZOOM,
@@ -480,7 +496,7 @@ impl App {
             .or_else(|| self.recorded_range().map(|(_, latest)| latest))
             .unwrap_or_else(now_ms);
         self.mode = Mode::Replay;
-        self.replay_hint = false;
+        self.replay_hint = None;
         self.story_selected = None;
         self.seek(anchor);
         // When entering on an event, keep the selection anchored to it in the new window.
@@ -502,25 +518,33 @@ impl App {
         }
         let anchor = (self.mode == Mode::Replay).then_some(self.cursor_ms);
         self.mode = Mode::Timeline;
-        self.replay_hint = false;
+        self.replay_hint = None;
         self.story_selected = None;
         self.timeline_refresh(anchor);
     }
 
     /// Open the lazy read-only store connection on first use. `false` (with the footer
-    /// hint set) when persistence is off or the database is unreadable.
+    /// hint set) when persistence is off or the database is unreadable — the two are
+    /// recorded separately so the footer can name the real cause.
     fn ensure_store(&mut self) -> bool {
         if self.store.is_some() {
             return true;
         }
         let db_path = self.collector.shared.lock().unwrap().db_path.clone();
-        match db_path.and_then(|p| SqliteStore::open_readonly(p).ok()) {
-            Some(s) => {
+        let Some(path) = db_path else {
+            // No path at all: recording is genuinely off.
+            self.replay_hint = Some(ReplayBlock::NoPersistence);
+            return false;
+        };
+        match SqliteStore::open_readonly(path) {
+            Ok(s) => {
                 self.store = Some(s);
                 true
             }
-            None => {
-                self.replay_hint = true;
+            // A path exists but will not open — corrupt, mid-quarantine, or unreadable.
+            // Recording may be perfectly enabled, so the footer must not blame a flag.
+            Err(_) => {
+                self.replay_hint = Some(ReplayBlock::Unreadable);
                 false
             }
         }
@@ -741,7 +765,7 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
     use ratatui::Terminal;
 
-    use super::{App, ChartStyle, KeyOutcome, Mode, TIMELINE_ZOOMS};
+    use super::{App, ChartStyle, KeyOutcome, Mode, ReplayBlock, TIMELINE_ZOOMS};
     use crate::collector::test_collector;
 
     /// Base timestamp of the seeded recording: aligned to BOTH the 10s and 1m buckets so
@@ -1109,7 +1133,7 @@ mod tests {
         let mut app = App::new(test_collector(None));
         app.handle_key(KeyCode::Char('r'));
         assert_eq!(app.mode, Mode::Live, "no store: replay must not engage");
-        assert!(app.replay_hint);
+        assert_eq!(app.replay_hint, Some(ReplayBlock::NoPersistence));
         let screen = draw(&app);
         assert!(
             screen.contains("replay needs persistence"),
@@ -1216,6 +1240,40 @@ mod tests {
         cleanup(&path);
     }
 
+    /// A db path that exists but will not open is NOT the same as persistence being off.
+    /// The old footer asserted "--no-persist is set" for both, telling the user a flag was
+    /// set that they never passed — the exact confidently-wrong narration the honesty
+    /// contract rules out. Each cause gets its own sentence.
+    #[test]
+    fn unreadable_db_blames_the_db_not_the_flag() {
+        // A path that is not there — the file was deleted or quarantined out from under a
+        // running session. A read-only open refuses to create it, so this is the real
+        // Err branch. (Junk CONTENT would not do: SQLite parses lazily and opens fine.)
+        let path = scratch_path();
+        cleanup(&path);
+
+        let mut app = App::new(test_collector(Some(path.clone())));
+        app.handle_key(KeyCode::Char('r'));
+
+        assert_eq!(
+            app.mode,
+            Mode::Live,
+            "unreadable store: replay must not engage"
+        );
+        assert_eq!(app.replay_hint, Some(ReplayBlock::Unreadable));
+
+        let screen = draw(&app);
+        assert!(
+            screen.contains("history db unreadable"),
+            "footer must name the real cause:\n{screen}"
+        );
+        assert!(
+            !screen.contains("--no-persist"),
+            "footer must not assert a flag the user never passed:\n{screen}"
+        );
+        cleanup(&path);
+    }
+
     /// 't' with no store behaves like 'r': stays live and surfaces the footer hint.
     #[test]
     fn timeline_without_store_shows_footer_hint() {
@@ -1226,7 +1284,7 @@ mod tests {
             Mode::Live,
             "no store: the overview must not engage"
         );
-        assert!(app.replay_hint);
+        assert_eq!(app.replay_hint, Some(ReplayBlock::NoPersistence));
     }
 
     /// In the file viewer the timeline window ends at the END of the file's newest
