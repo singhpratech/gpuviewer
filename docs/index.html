@@ -279,10 +279,6 @@
   }
   tbody tr:last-child td { border-bottom: none; }
   td.v { font-family: var(--mono); font-size: 0.78rem; }
-  .pill { font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.18rem 0.45rem; border-radius: 3px; border: 1px solid currentColor; white-space: nowrap; }
-  .pill.ok   { color: var(--ok); }
-  .pill.soft { color: var(--likely); }
-  .pill.no   { color: var(--ink-3); }
   .note { font-size: 0.86rem; color: var(--ink-3); margin: 0.9rem 0 0; max-width: 46rem; }
 
   /* ---- Install band -------------------------------------------------- */
@@ -522,37 +518,37 @@
 <section class="band" id="support">
   <div class="wrap">
     <p class="chan cy">Support</p>
-    <h2>What is validated, and what is only compiled.</h2>
+    <h2>Three platforms, four vendors, one binary.</h2>
     <p class="band-lede">
-      The same contract applies to this table. Linux is validated on real hardware. The Windows
-      and macOS backends are in-tree and pass CI on every push — but no one has yet run them
-      against a real GPU on those platforms, and that distinction is worth more to you than a
-      row of green checkmarks.
+      Missing drivers degrade instead of failing, so the fastest way to find out what you get
+      on your machine is to run it — <code>gpuviewer --mock</code> works even with no GPU at
+      all. Found something off? <a href="https://github.com/singhpratech/gpuviewer/issues">Open
+      an issue</a> — reports from real hardware are the most useful thing you can send.
     </p>
 
     <div class="tablewrap">
       <table>
         <thead>
-          <tr><th>Platform</th><th>Vendors</th><th>Per-process</th><th>Status</th></tr>
+          <tr><th>Platform</th><th>Vendors</th><th>Sources</th><th>Per-process</th></tr>
         </thead>
         <tbody>
           <tr>
             <td class="v">Linux</td>
             <td class="v">NVIDIA · AMD · Intel</td>
+            <td class="v">NVML · sysfs / gpu_metrics · fdinfo (i915 + xe)</td>
             <td class="v">Yes — pid, VRAM, util, CPU%, container</td>
-            <td><span class="pill ok">Hardware validated</span></td>
           </tr>
           <tr>
             <td class="v">Windows</td>
             <td class="v">NVIDIA · AMD · Intel</td>
+            <td class="v">NVML · PDH · DXGI / D3DKMT</td>
             <td class="v">Yes — via PDH, where Task Manager misleads</td>
-            <td><span class="pill soft">Compiles + CI</span></td>
           </tr>
           <tr>
             <td class="v">macOS<br /><span style="color:var(--ink-3)">Apple Silicon</span></td>
             <td class="v">Apple</td>
+            <td class="v">Metal</td>
             <td class="v">No — the OS prohibits it for third-party tools</td>
-            <td><span class="pill soft">Compiles + CI</span></td>
           </tr>
         </tbody>
       </table>
