@@ -19,7 +19,9 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ChartStyle, Mode, ReplayWindow, TimelineWindow, TIMELINE_ZOOMS};
+use crate::app::{
+    App, ChartStyle, Mode, ReplayBlock, ReplayWindow, TimelineWindow, TIMELINE_ZOOMS,
+};
 use crate::collector::Shared;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -1244,10 +1246,14 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
             } else {
                 String::new()
             };
-            let hint = if app.replay_hint {
-                " · replay needs persistence (--no-persist is set)"
-            } else {
-                ""
+            // Name the actual cause. Printing "--no-persist is set" for an unreadable
+            // database would assert a flag the user never passed.
+            let hint = match app.replay_hint {
+                Some(ReplayBlock::NoPersistence) => {
+                    " · replay needs persistence (--no-persist is set)"
+                }
+                Some(ReplayBlock::Unreadable) => " · replay unavailable (history db unreadable)",
+                None => "",
             };
             format!(
                 " q quit · ←→/ad/tab device · p pause{paused} · ↑↓/ws story · enter/r replay · \
