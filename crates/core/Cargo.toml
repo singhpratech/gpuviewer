@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/gpuviewer-core"
+keywords = ["gpu", "nvidia", "amd", "telemetry", "monitoring"]
+categories = ["hardware-support", "api-bindings"]
 repository.workspace = true
 description = "Telemetry core for gpuviewer: vendor backends, data model, event derivation"
 

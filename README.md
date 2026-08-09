@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/icon/gpuviewer.svg" width="112" alt="gpuviewer icon — a dark GPU-chip plate carrying a cyan utilization waveform that peaks and drops, crossed by an orange flight-recorder playhead" />
+  <img src="https://raw.githubusercontent.com/singhpratech/gpuviewer/main/docs/assets/icon/gpuviewer.svg" width="112" alt="gpuviewer icon — a dark GPU-chip plate carrying a cyan utilization waveform that peaks and drops, crossed by an orange flight-recorder playhead" />
 </p>
 
 <h1 align="center">gpuviewer</h1>
@@ -7,7 +7,7 @@
 <p align="center"><em>— the GPU flight recorder —</em></p>
 
 <p align="center">
-  <img src="docs/assets/replay.svg" width="880" alt="gpuviewer replay view: braille charts, process table, throttling gauges, and the narrated story feed, scrolled back to a throttle onset" />
+  <img src="https://raw.githubusercontent.com/singhpratech/gpuviewer/main/docs/assets/replay.svg" width="880" alt="gpuviewer replay view: braille charts, process table, throttling gauges, and the narrated story feed, scrolled back to a throttle onset" />
 </p>
 <p align="center"><sub><em>The built-in demo (<code>gpuviewer demo</code>, simulated data and labeled as such)
 opens already scrolled back to the night's last throttle onset — the first thing you see is the answer, not a gauge.</em></sub></p>
@@ -19,9 +19,9 @@ narrated event log **just by being open**, so the next morning you scroll back t
 it happened and read the story in plain English.
 
 <p align="center">
-  <a href="https://crates.io/crates/gpuviewer-tui"><img alt="crates.io" src="https://img.shields.io/crates/v/gpuviewer-tui?logo=rust&label=crates.io&color=FF8A3D" /></a>
+  <a href="https://crates.io/crates/gpuviewer-tui"><img alt="crates.io" src="https://img.shields.io/crates/v/gpuviewer-tui?logo=rust&label=crates.io&color=brightgreen" /></a>
   <a href="https://docs.rs/gpuviewer-core"><img alt="docs.rs" src="https://img.shields.io/docsrs/gpuviewer-core?logo=docsdotrs&label=docs.rs" /></a>
-  <a href="https://github.com/singhpratech/gpuviewer/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/singhpratech/gpuviewer?label=release&color=7FD4FF" /></a>
+  <a href="https://github.com/singhpratech/gpuviewer/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/singhpratech/gpuviewer?label=release&color=brightgreen" /></a>
   <a href="https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" /></a>
   <a href="#architecture"><img alt="MSRV" src="https://img.shields.io/badge/rust-1.95+-f74c00?logo=rust&logoColor=white" /></a>
@@ -85,7 +85,7 @@ into replay at that exact column, `Esc` back to live. The cursor line always sho
 nearest recorded event.
 
 <p align="center">
-  <img src="docs/assets/timeline.svg" width="920" alt="gpuviewer timeline view: hours of utilization and VRAM history as solid strips with an event lane and time cursor">
+  <img src="https://raw.githubusercontent.com/singhpratech/gpuviewer/main/docs/assets/timeline.svg" width="920" alt="gpuviewer timeline view: hours of utilization and VRAM history as solid strips with an event lane and time cursor">
 </p>
 <p align="center"><sub><em>The timeline zooms from 1h to 7d (<code>+</code>/<code>-</code>). Each column is the recorded peak —
 and time that wasn't recorded stays <strong>blank</strong>, never painted as zero. The footer says exactly how much is real: "12h (8h recorded)".</em></sub></p>
@@ -150,7 +150,7 @@ cargo build --release                # or straight from a clone
 Packaged builds (Linux `tar.gz`/`.deb`/`.rpm`/AppImage, Windows `zip`, macOS `tar.gz` —
 with checksums and build-provenance attestations) are produced per release tag. Every
 install path, platform note (Windows SmartScreen, macOS quarantine), and verification step
-lives in [`docs/packaging/installing.md`](docs/packaging/installing.md).
+lives in [`docs/packaging/installing.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md).
 
 ## Quick start
 
@@ -170,7 +170,7 @@ your real history.
 no daemon. If you want the recording running from login instead, run the headless stream
 under a systemd user unit; a ready-made example with mild, GPU-safe hardening (and a
 comment explaining every directive) ships at
-[`docs/packaging/gpuviewer.service`](docs/packaging/gpuviewer.service) —
+[`docs/packaging/gpuviewer.service`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/gpuviewer.service) —
 `systemctl --user enable --now gpuviewer.service`. The per-database instance lock makes
 this safe alongside the interactive TUI: while the unit holds the recording, a TUI you
 open by hand runs live-only (and says so), and `report`/replay/`view` read the same
@@ -184,7 +184,7 @@ gpuviewer --json --once              # one frame + its events to stdout, then ex
 ```
 
 The stream contract — frames *and* events in one timestamped stream, JSON Schema, written
-compatibility promise — is [`docs/spec/ndjson-v1.md`](docs/spec/ndjson-v1.md). Events can
+compatibility promise — is [`docs/spec/ndjson-v1.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/spec/ndjson-v1.md). Events can
 also drive your own plumbing: `--on-event 'CMD'` runs a command per event with
 `GPV_EVENT_*` in the environment (rate-capped), e.g.
 `--on-event 'curl -s -d "$GPV_EVENT_TITLE" ntfy.sh/mytopic'`.
@@ -270,10 +270,10 @@ a confidently-wrong number would kill the whole premise:
 
 This project was built research-first, and the research is in the repo:
 
-1. **Study the field before writing code.** [`docs/research/`](docs/research/) holds the
+1. **Study the field before writing code.** [`docs/research/`](https://github.com/singhpratech/gpuviewer/blob/main/docs/research/) holds the
    June-2026 evidence — the market gap, every competitor's actual capabilities (with issue
    numbers), the vendor API minefield, and the stack decision record
-   ([`04-synthesis.md`](docs/research/04-synthesis.md)). The architecture wasn't guessed;
+   ([`04-synthesis.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/research/04-synthesis.md)). The architecture wasn't guessed;
    it was argued in writing.
 2. **Learn from other people's scars.** No vendor SDK is hard-linked because soname churn
    broke btop on AMD twice. NVML is loaded by its versioned name (`libnvidia-ml.so.1`)
@@ -292,7 +292,7 @@ This project was built research-first, and the research is in the repo:
 
 ## Status
 
-**v0.1.0.** Install paths: [`docs/packaging/installing.md`](docs/packaging/installing.md).
+**v0.1.0.** Install paths: [`docs/packaging/installing.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md).
 
 | Platform | Backends |
 |---|---|
@@ -433,7 +433,7 @@ lock on `<db>.lock`); a second gpuviewer opened by hand runs live-only and says 
 Deliberately not chasing: fan/OC control (LACT owns it), a daemon/client split ("always-on"
 means by virtue of normal use — for boot-time recording, run `gpuviewer --json` under your
 own systemd user unit; an example ships at
-[`docs/packaging/gpuviewer.service`](docs/packaging/gpuviewer.service)), cluster views, and
+[`docs/packaging/gpuviewer.service`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/gpuviewer.service)), cluster views, and
 eBPF causal tracing (we hand off to profilers: "idle gap at 02:14:31 — if recurring,
 capture a trace").
 
@@ -441,8 +441,8 @@ capture a trace").
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/singhpratech/gpuviewer/blob/main/LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](https://github.com/singhpratech/gpuviewer/blob/main/LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
 at your option.
 
