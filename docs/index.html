@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>gpuviewer — the GPU flight recorder</title>
+<meta name="description" content="A cross-vendor GPU monitor that records persistent per-process history and a narrated event log just by being open. Your run stalled at 02:14 and you were asleep — scroll back and read why." />
+<meta name="color-scheme" content="dark" />
+<meta property="og:title" content="gpuviewer — the GPU flight recorder" />
+<meta property="og:description" content="Every other GPU monitor shows you a beautiful live gauge of a moment that no longer exists. gpuviewer was already recording. Scroll back to 02:14 — it'll tell you why." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://singhpratech.github.io/gpuviewer/" />
+<meta property="og:image" content="https://singhpratech.github.io/gpuviewer/assets/icon/png/512x512/gpuviewer.png" />
+<meta property="og:image:width" content="512" />
+<meta property="og:image:height" content="512" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="gpuviewer — the GPU flight recorder" />
+<meta name="twitter:description" content="Every other GPU monitor shows you a live gauge of a moment that no longer exists. gpuviewer was already recording. Scroll back to 02:14." />
+<meta name="twitter:image" content="https://singhpratech.github.io/gpuviewer/assets/icon/png/512x512/gpuviewer.png" />
+<link rel="icon" type="image/png" sizes="32x32" href="./assets/icon/png/32x32/gpuviewer.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="./assets/icon/png/16x16/gpuviewer.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="./assets/icon/png/256x256/gpuviewer.png" />
+<style>
+  /* ------------------------------------------------------------------
+     Palette is lifted straight off the product icon (docs/assets/icon):
+     recorder plate, cyan telemetry trace, orange playhead. Three colors,
+     no more — the mark's own 16px discipline applied to a web page.
+     ------------------------------------------------------------------ */
+  :root {
+    --void:    #070A0F;   /* page ground — below the plate */
+    --plate:   #10151D;   /* the recorder plate itself */
+    --plate-2: #151C26;   /* raised panel */
+    --rule:    #1E2733;
+    --rule-2:  #2A3644;
+
+    --trace:   #7FD4FF;   /* telemetry cyan */
+    --trace-d: #3E7E9E;
+    --play:    #FF8A3D;   /* recorder orange — the signature */
+    --play-d:  #B85E22;
+
+    --ink:     #DCE4EF;
+    --ink-2:   #93A1B4;
+    --ink-3:   #5D6B7D;
+
+    --fact:    #7FD4FF;
+    --likely:  #FFC46B;
+    --ok:      #6FD08C;
+
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, "DejaVu Sans Mono", Consolas, monospace;
+    --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html {
+    background: var(--void);
+    scroll-behavior: smooth;
+    scroll-padding-top: 4.5rem;
+    -webkit-text-size-adjust: 100%;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+  }
+  body {
+    margin: 0;
+    background: var(--void);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 1.02rem;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--play); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+  a:hover { color: #FFA467; }
+  :focus-visible { outline: 2px solid var(--play); outline-offset: 3px; border-radius: 3px; }
+  img, svg { max-width: 100%; }
+  h1, h2, h3 { text-wrap: balance; }
+
+  .wrap { max-width: 68rem; margin: 0 auto; padding: 0 1.4rem; }
+  .narrow { max-width: 46rem; }
+
+  /* ---- Utility type: the instrument-panel voice --------------------- */
+  .chan {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 0.75rem;
+  }
+  .chan.on { color: var(--play); }
+  .chan.cy { color: var(--trace-d); }
+
+  code, .mono { font-family: var(--mono); }
+  code { font-size: 0.87em; color: var(--trace); }
+
+  /* ---- Top bar ------------------------------------------------------ */
+  .topbar {
+    position: sticky; top: 0; z-index: 60;
+    background: color-mix(in srgb, var(--void) 88%, transparent);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--rule);
+  }
+  .topbar .inner { display: flex; align-items: center; gap: 1rem; min-height: 3.5rem; }
+  .tb-brand {
+    display: inline-flex; align-items: center; gap: 0.55rem;
+    font-family: var(--mono); font-weight: 600; font-size: 0.95rem;
+    letter-spacing: -0.01em; color: var(--ink); text-decoration: none; flex: 0 0 auto;
+  }
+  .tb-brand img { width: 24px; height: 24px; display: block; }
+  .topbar nav {
+    display: flex; gap: 1.3rem; margin-left: auto; align-items: center;
+    font-family: var(--mono); font-size: 0.76rem; letter-spacing: 0.04em;
+    overflow-x: auto; white-space: nowrap; scrollbar-width: none;
+  }
+  .topbar nav::-webkit-scrollbar { display: none; }
+  .topbar nav a { color: var(--ink-2); text-decoration: none; flex: 0 0 auto; padding: 0.2rem 0; }
+  .topbar nav a:hover { color: var(--play); }
+
+  /* ---- Hero --------------------------------------------------------- */
+  .hero { padding: 3.4rem 0 3rem; border-bottom: 1px solid var(--rule); }
+  .hero h1 {
+    font-family: var(--mono);
+    font-size: clamp(2rem, 5.6vw, 3.5rem);
+    line-height: 1.04;
+    letter-spacing: -0.035em;
+    font-weight: 600;
+    margin: 0 0 1.1rem;
+    max-width: 17ch;
+  }
+  .hero h1 .dim { color: var(--ink-3); }
+  .hero h1 .hot { color: var(--play); }
+  .lede { font-size: clamp(1.04rem, 2vw, 1.22rem); color: var(--ink-2); max-width: 44rem; margin: 0 0 2rem; }
+  .lede strong { color: var(--ink); font-weight: 600; }
+
+  /* ================================================================
+     SIGNATURE: the recorder strip.
+     Eight hours of a night that already happened. Drag the orange
+     playhead; the card below reads back what was recorded there.
+     ================================================================ */
+  .recorder {
+    background: var(--plate);
+    border: 1px solid var(--rule-2);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 30px 70px -45px #000, inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+  .rec-head {
+    display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap;
+    padding: 0.7rem 1rem; border-bottom: 1px solid var(--rule);
+    font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .rec-head .live { display: inline-flex; align-items: center; gap: 0.42rem; color: var(--play); }
+  .rec-head .live .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--play);
+    animation: blip 2.4s ease-out infinite;
+  }
+  @keyframes blip {
+    0%   { box-shadow: 0 0 0 0 rgba(255,138,61,0.55); }
+    70%  { box-shadow: 0 0 0 8px rgba(255,138,61,0); }
+    100% { box-shadow: 0 0 0 0 rgba(255,138,61,0); }
+  }
+  .rec-head .spacer { margin-left: auto; }
+
+  .rec-strip { position: relative; padding: 0.4rem 0 0; cursor: ew-resize; touch-action: pan-y; }
+  .rec-strip svg { display: block; width: 100%; height: auto; }
+  .rec-axis {
+    display: flex; justify-content: space-between;
+    padding: 0.15rem 1rem 0.7rem;
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.08em; color: var(--ink-3);
+  }
+  .rec-hint {
+    padding: 0 1rem 0.9rem; font-family: var(--mono); font-size: 0.66rem;
+    letter-spacing: 0.06em; color: var(--ink-3);
+  }
+  .rec-hint kbd {
+    font-family: var(--mono); font-size: 0.95em; color: var(--ink-2);
+    border: 1px solid var(--rule-2); border-bottom-width: 2px; border-radius: 4px;
+    padding: 0.05em 0.36em; background: var(--plate-2);
+  }
+
+  /* the read-back card */
+  .readout { border-top: 1px solid var(--rule); background: var(--plate-2); padding: 1.05rem 1rem 1.15rem; }
+  .readout-top { display: flex; align-items: baseline; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .stamp { font-family: var(--mono); font-size: 1.5rem; font-weight: 600; letter-spacing: -0.02em; color: var(--play); }
+  .tag {
+    font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.14em; text-transform: uppercase;
+    padding: 0.2rem 0.5rem; border-radius: 3px; border: 1px solid currentColor;
+  }
+  .tag.fact   { color: var(--fact); }
+  .tag.likely { color: var(--likely); }
+  .kindname { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em; color: var(--ink-3); text-transform: uppercase; }
+  .readout .title { font-size: 1.06rem; color: var(--ink); margin: 0 0 0.45rem; font-weight: 600; }
+  .readout .evidence {
+    font-family: var(--mono); font-size: 0.79rem; line-height: 1.65; color: var(--ink-2);
+    margin: 0; padding-left: 0.8rem; border-left: 2px solid var(--rule-2);
+  }
+
+  /* ---- Install line ------------------------------------------------- */
+  .cta-row { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: stretch; margin: 2rem 0 0; }
+  .cmd {
+    display: flex; align-items: center; gap: 0.7rem;
+    background: var(--plate); border: 1px solid var(--rule-2); border-radius: 7px;
+    padding: 0.6rem 0.75rem 0.6rem 0.9rem; font-family: var(--mono); font-size: 0.8rem;
+    color: var(--ink); overflow-x: auto; flex: 1 1 24rem; min-width: 0;
+  }
+  .cmd .prompt { color: var(--play); flex: 0 0 auto; }
+  .cmd .txt { white-space: nowrap; }
+  .copy {
+    margin-left: auto; flex: 0 0 auto; background: transparent; border: 1px solid var(--rule-2);
+    color: var(--ink-2); font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.1em;
+    text-transform: uppercase; padding: 0.35rem 0.6rem; border-radius: 4px; cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .copy:hover { color: var(--play); border-color: var(--play); }
+  .copy.done { color: var(--ok); border-color: var(--ok); }
+  .btn {
+    display: inline-flex; align-items: center; gap: 0.5rem; justify-content: center;
+    font-family: var(--mono); font-size: 0.78rem; letter-spacing: 0.04em;
+    padding: 0.72rem 1.05rem; border-radius: 7px; text-decoration: none;
+    border: 1px solid var(--rule-2); color: var(--ink); background: var(--plate);
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .btn:hover { border-color: var(--play); color: var(--play); }
+  .btn-primary { background: var(--play); border-color: var(--play); color: #180B02; font-weight: 600; }
+  .btn-primary:hover { background: #FFA467; border-color: #FFA467; color: #180B02; }
+
+  /* ---- Bands -------------------------------------------------------- */
+  section.band { padding: 4.2rem 0; border-bottom: 1px solid var(--rule); }
+  section.band.plate { background: linear-gradient(180deg, var(--plate) 0%, var(--void) 100%); }
+  h2 { font-family: var(--mono); font-size: clamp(1.4rem, 3vw, 2rem); letter-spacing: -0.025em; font-weight: 600; line-height: 1.15; margin: 0 0 0.9rem; }
+  .band-lede { color: var(--ink-2); max-width: 46rem; margin: 0 0 2.4rem; font-size: 1.05rem; }
+
+  /* the thesis pull-quote */
+  .thesis {
+    font-family: var(--mono); font-size: clamp(1.25rem, 3.4vw, 2rem);
+    line-height: 1.36; letter-spacing: -0.025em; max-width: 24ch; margin: 0; font-weight: 500;
+    color: var(--ink-2);
+  }
+  .thesis b { color: var(--ink); font-weight: 600; }
+  .thesis .hot { color: var(--play); font-weight: 600; }
+
+  /* ---- Altitudes: a real typed triad, so it gets a real structure ---- */
+  .altitudes { display: grid; gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 9px; overflow: hidden; }
+  @media (min-width: 56rem) { .altitudes { grid-template-columns: repeat(3, 1fr); } }
+  .alt { background: var(--plate); padding: 1.5rem 1.3rem; min-width: 0; }
+  .alt .key {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 1.9rem; height: 1.9rem; padding: 0 0.5rem; margin-bottom: 0.85rem;
+    font-family: var(--mono); font-size: 0.8rem; font-weight: 600;
+    border: 1px solid var(--rule-2); border-bottom-width: 2px; border-radius: 5px;
+    background: var(--plate-2); color: var(--play);
+  }
+  .alt h3 { font-family: var(--mono); font-size: 1.02rem; margin: 0 0 0.4rem; letter-spacing: -0.01em; }
+  .alt .q { color: var(--trace); font-size: 0.93rem; margin: 0 0 0.55rem; font-style: italic; }
+  .alt p.d { margin: 0; color: var(--ink-2); font-size: 0.93rem; }
+
+  /* ---- Shots -------------------------------------------------------- */
+  figure.shot { margin: 2.6rem 0 0; }
+  figure.shot img { display: block; width: 100%; border: 1px solid var(--rule-2); border-radius: 9px; }
+  figure.shot figcaption { font-size: 0.84rem; color: var(--ink-3); margin-top: 0.7rem; max-width: 46rem; }
+
+  /* ---- Honesty rules ------------------------------------------------ */
+  .rules { display: grid; gap: 1.5rem 2.2rem; }
+  @media (min-width: 50rem) { .rules { grid-template-columns: 1fr 1fr; } }
+  .rule-item { border-left: 2px solid var(--rule-2); padding-left: 1rem; min-width: 0; }
+  .rule-item.hot { border-left-color: var(--play); }
+  .rule-item h4 { font-family: var(--mono); font-size: 0.88rem; margin: 0 0 0.35rem; color: var(--ink); letter-spacing: -0.01em; }
+  .rule-item p { margin: 0; font-size: 0.93rem; color: var(--ink-2); }
+
+  /* ---- Matrix ------------------------------------------------------- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 9px; }
+  table { border-collapse: collapse; width: 100%; min-width: 40rem; font-size: 0.88rem; background: var(--plate); }
+  th, td { text-align: left; padding: 0.72rem 0.9rem; border-bottom: 1px solid var(--rule); }
+  thead th {
+    font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-3); background: var(--plate-2); border-bottom-color: var(--rule-2);
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.v { font-family: var(--mono); font-size: 0.78rem; }
+  .pill { font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.18rem 0.45rem; border-radius: 3px; border: 1px solid currentColor; white-space: nowrap; }
+  .pill.ok   { color: var(--ok); }
+  .pill.soft { color: var(--likely); }
+  .pill.no   { color: var(--ink-3); }
+  .note { font-size: 0.86rem; color: var(--ink-3); margin: 0.9rem 0 0; max-width: 46rem; }
+
+  /* ---- Install band -------------------------------------------------- */
+  .installs { display: grid; gap: 1.1rem; }
+  @media (min-width: 50rem) { .installs { grid-template-columns: 1fr 1fr; } }
+  /* min-width:0 — grid items default to min-width:auto, so a long <pre> would
+     otherwise blow the whole page's horizontal scroll instead of scrolling itself. */
+  .inst { background: var(--plate); border: 1px solid var(--rule); border-radius: 9px; padding: 1.1rem 1.15rem; min-width: 0; }
+  .inst h4 { font-family: var(--mono); font-size: 0.76rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); margin: 0 0 0.7rem; }
+  pre {
+    margin: 0; overflow-x: auto; font-family: var(--mono); font-size: 0.79rem; line-height: 1.75;
+    color: var(--ink); background: var(--void); border: 1px solid var(--rule); border-radius: 6px; padding: 0.75rem 0.85rem;
+  }
+  pre .c { color: var(--ink-3); }
+  pre .p { color: var(--play); }
+
+  /* ---- Footer -------------------------------------------------------- */
+  footer { padding: 2.6rem 0 3.4rem; color: var(--ink-3); font-size: 0.85rem; }
+  footer .frow { display: flex; gap: 1.4rem; flex-wrap: wrap; align-items: center; }
+  footer a { color: var(--ink-2); text-decoration: none; }
+  footer a:hover { color: var(--play); }
+  footer .sig { margin-left: auto; font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="wrap inner">
+    <a class="tb-brand" href="#top">
+      <img src="./assets/icon/gpuviewer.svg" alt="" width="24" height="24" />
+      gpuviewer
+    </a>
+    <nav>
+      <a href="#recorder">The recording</a>
+      <a href="#altitudes">Three altitudes</a>
+      <a href="#honesty">Honesty</a>
+      <a href="#support">Support</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/singhpratech/gpuviewer">GitHub&nbsp;↗</a>
+    </nav>
+  </div>
+</div>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <p class="chan on">The GPU flight recorder</p>
+    <h1>It was already <span class="hot">recording</span>.</h1>
+    <p class="lede">
+      Your training run flatlined at 02:14. You were asleep. Every other GPU monitor would
+      show you a beautiful live gauge — <strong>of a moment that no longer exists</strong>.
+      gpuviewer keeps per-process history and a narrated event log just by being open, so the
+      next morning you scroll back and read what happened, in plain English.
+    </p>
+
+    <!-- ============ SIGNATURE ELEMENT ============ -->
+    <div class="recorder" id="recorder">
+      <div class="rec-head">
+        <span class="live"><span class="dot"></span> Recording</span>
+        <span>GPU0 · RTX 4090</span>
+        <span class="spacer"></span>
+        <span id="rec-span">8h recorded</span>
+      </div>
+
+      <div class="rec-strip" id="strip" role="slider" tabindex="0"
+           aria-label="Scrub the recorded night"
+           aria-valuemin="0" aria-valuemax="480" aria-valuenow="254" aria-valuetext="02:14">
+        <svg id="tape" viewBox="0 0 960 190" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"  stop-color="#7FD4FF" stop-opacity="0.22" />
+              <stop offset="100%" stop-color="#7FD4FF" stop-opacity="0.01" />
+            </linearGradient>
+          </defs>
+          <!-- gridlines -->
+          <g stroke="#1E2733" stroke-width="1">
+            <line x1="0" y1="40"  x2="960" y2="40"  />
+            <line x1="0" y1="80"  x2="960" y2="80"  />
+            <line x1="0" y1="120" x2="960" y2="120" />
+          </g>
+          <path id="area"  fill="url(#fill)" d="" />
+          <path id="trace" fill="none" stroke="#7FD4FF" stroke-width="1.6"
+                stroke-linejoin="round" stroke-linecap="round" d="" />
+          <!-- event lane -->
+          <line x1="0" y1="152" x2="960" y2="152" stroke="#1E2733" stroke-width="1" />
+          <g id="marks"></g>
+          <!-- playhead -->
+          <g id="head">
+            <line x1="0" y1="6" x2="0" y2="168" stroke="#FF8A3D" stroke-width="1.6" />
+            <path d="M0,6 L0,20 L13,13 Z" fill="#FF8A3D" />
+          </g>
+        </svg>
+        <div class="rec-axis">
+          <span>22:00</span><span>00:00</span><span>02:00</span><span>04:00</span><span>06:00</span>
+        </div>
+      </div>
+      <p class="rec-hint">Drag the playhead, click an event tick, or use <kbd>←</kbd> <kbd>→</kbd></p>
+
+      <div class="readout" aria-live="polite">
+        <div class="readout-top">
+          <span class="stamp" id="r-stamp">02:14</span>
+          <span class="tag fact" id="r-tag">Fact</span>
+          <span class="kindname" id="r-kind">throttle_start</span>
+        </div>
+        <p class="title" id="r-title">GPU0 throttling — thermal</p>
+        <p class="evidence" id="r-ev">clocks 2610 → 1725 MHz · temp 84 °C (slowdown 83 °C) · NVML clocks-event bitmask: SW_THERMAL_SLOWDOWN</p>
+      </div>
+    </div>
+
+    <div class="cta-row">
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <span class="txt" id="inst">curl -fsSL https://raw.githubusercontent.com/singhpratech/gpuviewer/main/install.sh | sh</span>
+        <button class="copy" id="copy" type="button" aria-label="Copy install command">Copy</button>
+      </div>
+      <a class="btn btn-primary" href="#install">Install</a>
+      <a class="btn" href="https://github.com/singhpratech/gpuviewer">Source</a>
+    </div>
+  </div>
+</header>
+
+<section class="band plate">
+  <div class="wrap">
+    <p class="chan">Why it exists</p>
+    <p class="thesis">
+      A gauge tells you the present.<br />
+      The present is <b>lying</b> about<br />
+      <span class="hot">the night.</span>
+    </p>
+    <div class="narrow" style="margin-top:2rem">
+      <p style="color:var(--ink-2)">
+        Every GPU tool on your box samples right now and throws it away. That is fine when you
+        are watching. It is useless at 09:00 when the run is dead, the process is gone, and the
+        only evidence left is a loss curve that stops. gpuviewer's job is to still have the
+        evidence — downsampled 10s and 1m rollups plus an append-only event log in a local
+        SQLite file, written by the same binary you were already running. No daemon to install.
+        No recording you had to remember to start.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="altitudes">
+  <div class="wrap">
+    <p class="chan cy">One recording, three altitudes</p>
+    <h2>Zoom out to find it. Zoom in to read it.</h2>
+    <p class="band-lede">
+      The same recording answers three different questions. Single keys move between them —
+      spot the anomaly on the timeline, <code>Enter</code> to drill into replay at that exact
+      column, <code>Esc</code> back to live.
+    </p>
+
+    <div class="altitudes">
+      <div class="alt">
+        <span class="key">t</span>
+        <h3>Timeline</h3>
+        <p class="q">“What did the whole night look like?”</p>
+        <p class="d">Hours of history as solid strips with an event lane underneath. Zooms 1h → 7d.
+        Each column is the recorded peak — and time that was never recorded stays blank, never
+        painted as zero.</p>
+      </div>
+      <div class="alt">
+        <span class="key">r</span>
+        <h3>Replay</h3>
+        <p class="q">“What exactly happened at 02:14?”</p>
+        <p class="d">Full charts, process table, gauges and story feed at any recorded moment.
+        Seeks anchor to events, so you land on the onset rather than near it.</p>
+      </div>
+      <div class="alt">
+        <span class="key">live</span>
+        <h3>Live</h3>
+        <p class="q">“What is it doing right now?”</p>
+        <p class="d">The ordinary monitor view — and it is recording the other two while you
+        watch. Idle cadence backs off automatically so polling does not keep the GPU awake.</p>
+      </div>
+    </div>
+
+    <figure class="shot">
+      <img src="./assets/replay.svg" alt="gpuviewer replay view: braille charts, a process table, throttle gauges and the narrated story feed, scrolled back to a throttle onset" />
+      <figcaption>The built-in demo (<code>gpuviewer demo</code>, simulated data and labeled as
+      such) opens already scrolled back to the night's last throttle onset — the first thing you
+      see is the answer, not a gauge.</figcaption>
+    </figure>
+
+    <figure class="shot">
+      <img src="./assets/timeline.svg" alt="gpuviewer timeline view: hours of utilization and VRAM history as solid strips with an event lane and a time cursor" />
+      <figcaption>The footer states exactly how much of the window is real: “12h (8h recorded)”.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="band plate" id="honesty">
+  <div class="wrap">
+    <p class="chan on">The honesty contract</p>
+    <h2>A confidently wrong narration would kill the whole idea.</h2>
+    <p class="band-lede">
+      Anything that reads a story out of telemetry can invent one. These are the rules the code
+      actually enforces, not aspirations — they are why you can trust the 02:14 answer.
+    </p>
+
+    <div class="rules">
+      <div class="rule-item hot">
+        <h4>Facts and inferences are different objects</h4>
+        <p>A throttle bit that was set is a <em>fact</em>. “Your dataloader is starving the GPU”
+        is an <em>inference</em> — it is labeled <strong>likely</strong>, always, and expands to
+        the raw evidence it was derived from.</p>
+      </div>
+      <div class="rule-item hot">
+        <h4>Unobservable is not zero</h4>
+        <p>A metric the driver will not answer renders as unavailable, never as 0. An open
+        throttle episode whose bitmask goes unreadable is dropped silently rather than closed
+        with a fabricated “recovered”.</p>
+      </div>
+      <div class="rule-item">
+        <h4>Unrecorded time stays blank</h4>
+        <p>Charts never bridge a gap longer than 15 s. Time when gpuviewer was not running is a
+        hole in the strip, and the footer tells you how much of the window is real.</p>
+      </div>
+      <div class="rule-item">
+        <h4>Utilization is duty-cycle, and says so</h4>
+        <p>NVML “utilization” means at least one kernel was resident — not that the GPU was
+        saturated. It is labeled as duty-cycle rather than presented as capacity.</p>
+      </div>
+      <div class="rule-item">
+        <h4>An incomplete process list admits it</h4>
+        <p>Reading other users' processes needs elevated privileges. Unprivileged, you get a
+        “your processes only” hint instead of a list that quietly pretends to be complete.</p>
+      </div>
+      <div class="rule-item">
+        <h4>The recorder narrates its own failures</h4>
+        <p>Collector stalls, lost and returned devices, and session start/stop marks are events
+        too — so a gap in the story is explained by the recorder, not left for you to guess at.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="support">
+  <div class="wrap">
+    <p class="chan cy">Support</p>
+    <h2>What is validated, and what is only compiled.</h2>
+    <p class="band-lede">
+      The same contract applies to this table. Linux is validated on real hardware. The Windows
+      and macOS backends are in-tree and pass CI on every push — but no one has yet run them
+      against a real GPU on those platforms, and that distinction is worth more to you than a
+      row of green checkmarks.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Platform</th><th>Vendors</th><th>Per-process</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="v">Linux</td>
+            <td class="v">NVIDIA · AMD · Intel</td>
+            <td class="v">Yes — pid, VRAM, util, CPU%, container</td>
+            <td><span class="pill ok">Hardware validated</span></td>
+          </tr>
+          <tr>
+            <td class="v">Windows</td>
+            <td class="v">NVIDIA · AMD · Intel</td>
+            <td class="v">Yes — via PDH, where Task Manager misleads</td>
+            <td><span class="pill soft">Compiles + CI</span></td>
+          </tr>
+          <tr>
+            <td class="v">macOS<br /><span style="color:var(--ink-3)">Apple Silicon</span></td>
+            <td class="v">Apple</td>
+            <td class="v">No — the OS prohibits it for third-party tools</td>
+            <td><span class="pill soft">Compiles + CI</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      On macOS the missing process table is an operating-system restriction, not a gap in the
+      app — gpuviewer says so in the UI and blames the OS rather than going quiet. Device-level
+      memory there is Metal's unified-memory working-set budget, which is not the same thing as
+      discrete VRAM, and it is labeled that way.
+    </p>
+  </div>
+</section>
+
+<section class="band plate" id="install">
+  <div class="wrap">
+    <p class="chan on">Install</p>
+    <h2>One unprivileged binary.</h2>
+    <p class="band-lede">
+      No daemon, no root, no kernel module. The installers verify a SHA-256 checksum before
+      anything lands on disk. Prebuilt binaries are not code-signed — the release notes carry
+      the Gatekeeper and SmartScreen steps.
+    </p>
+
+    <div class="installs">
+      <div class="inst">
+        <h4>Linux &amp; macOS</h4>
+<pre><span class="p">$</span> curl -fsSL https://raw.githubusercontent.com/\
+singhpratech/gpuviewer/main/install.sh | sh</pre>
+      </div>
+      <div class="inst">
+        <h4>Windows (PowerShell)</h4>
+<pre><span class="p">&gt;</span> irm https://raw.githubusercontent.com/singhpratech/\
+gpuviewer/main/install.ps1 | iex</pre>
+      </div>
+      <div class="inst">
+        <h4>From source</h4>
+<pre><span class="p">$</span> cargo install --git https://github.com/singhpratech/gpuviewer \
+    gpuviewer-tui
+<span class="c"># needs Rust 1.95+</span></pre>
+      </div>
+      <div class="inst">
+        <h4>Try it with no GPU</h4>
+<pre><span class="p">$</span> gpuviewer demo     <span class="c"># 8h of simulated history,</span>
+                     <span class="c"># opens scrolled back</span>
+<span class="p">$</span> gpuviewer --mock   <span class="c"># simulated live GPUs</span></pre>
+      </div>
+    </div>
+
+    <div style="margin-top:2.4rem">
+      <p class="chan">Then, the next morning</p>
+<pre><span class="p">$</span> gpuviewer report --since 12h          <span class="c"># plain-text digest of the night</span>
+<span class="p">$</span> gpuviewer export --since 12h out.gpvr <span class="c"># a shareable incident slice</span>
+<span class="p">$</span> gpuviewer view out.gpvr               <span class="c"># replay it anywhere — no GPU needed</span>
+<span class="p">$</span> gpuviewer --json                      <span class="c"># NDJSON stream for scripting</span></pre>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap frow">
+    <a href="https://github.com/singhpratech/gpuviewer">GitHub</a>
+    <a href="https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md">Install docs</a>
+    <a href="https://github.com/singhpratech/gpuviewer/blob/main/docs/spec/ndjson-v1.md">NDJSON spec</a>
+    <a href="https://github.com/singhpratech/gpuviewer/releases">Releases</a>
+    <span class="sig">MIT or Apache-2.0</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- The recorded night ------------------------------------------------
+  // 22:00 -> 06:00, in minutes from the start of the window.
+  var SPAN = 480;
+
+  var EVENTS = [
+    { t:   4, kind: 'recording_started', conf: 'fact',   title: 'Recording started — gpuviewer 0.1.0',
+      ev: 'interval 1.0s · backends: nvml (1 device) · db ~/.local/share/gpuviewer/history.db' },
+    { t: 218, kind: 'process_attached',  conf: 'fact',   title: 'python (pid 4521) attached — 19.2 GiB',
+      ev: 'compute context on GPU0 · first seen 01:38:07 · 19.2 GiB of 24.0 GiB' },
+    { t: 254, kind: 'throttle_start',    conf: 'fact',   title: 'GPU0 throttling — thermal',
+      ev: 'clocks 2610 → 1725 MHz · temp 84 °C (slowdown 83 °C) · NVML clocks-event bitmask: SW_THERMAL_SLOWDOWN' },
+    { t: 291, kind: 'throttle_end',      conf: 'fact',   title: 'Throttling ended — clocks recovered',
+      ev: 'held 37m02s · clocks back to 2540 MHz (97% of pre-throttle) · temp 79 °C' },
+    { t: 302, kind: 'vram_pressure',     conf: 'likely', title: 'VRAM likely to run out in ~26 min',
+      ev: '21.4 GiB of 24.0 GiB (89%) climbing 41 MiB/min over the last 3m · largest holder python (pid 4521), 19.2 GiB · trend, not a reservation — an allocator flush would reset it' },
+    { t: 401, kind: 'idle_gap',          conf: 'likely', title: 'GPU likely starved for 4m12s — dataloader stall',
+      ev: 'util fell below 10% for 4m12s after 46m above 50% · python (pid 4521) held 19.2 GiB throughout and its CPU stayed at 780% of one core · consistent with input-pipeline starvation, not a finished job' },
+    { t: 432, kind: 'process_exited',    conf: 'fact',   title: 'python (pid 4521) exited — freed 19.2 GiB',
+      ev: 'ran 3h14m · VRAM 21.4 → 0.6 GiB · no further compute contexts on GPU0' }
+  ];
+
+  var strip  = document.getElementById('strip');
+  var svg    = document.getElementById('tape');
+  var head   = document.getElementById('head');
+  var marks  = document.getElementById('marks');
+  var pTrace = document.getElementById('trace');
+  var pArea  = document.getElementById('area');
+  var W = 960, TOP = 8, BOT = 140;
+
+  // ---- Trace: a night that actually happened -----------------------------
+  // Deterministic — the same night on every load, because it is a recording.
+  function seeded(i) { var x = Math.sin(i * 12.9898) * 43758.5453; return x - Math.floor(x); }
+
+  function utilAt(m) {
+    var u;
+    if (m < 8)              u = 4 + seeded(m) * 5;            // idle before the run
+    else if (m < 218)       u = 88 + seeded(m) * 9;           // warm-up job
+    else if (m < 254)       u = 94 + seeded(m) * 5;           // the big run, healthy
+    else if (m < 291)       u = 71 + seeded(m) * 7;           // throttled: work continues, slower
+    else if (m < 397)       u = 93 + seeded(m) * 6;           // recovered
+    else if (m < 409)       u = 3 + seeded(m) * 6;            // the stall
+    else if (m < 432)       u = 91 + seeded(m) * 7;           // back
+    else                    u = 2 + seeded(m) * 3;            // process gone
+    return Math.max(0, Math.min(100, u));
+  }
+
+  var d = '', a = '';
+  for (var m = 0; m <= SPAN; m += 2) {
+    var x = (m / SPAN) * W;
+    var y = BOT - (utilAt(m) / 100) * (BOT - TOP);
+    d += (m === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+  }
+  pTrace.setAttribute('d', d.trim());
+  pArea.setAttribute('d', 'M0,' + BOT + ' ' + d.trim().slice(1) + ' L' + W + ',' + BOT + ' Z');
+
+  // ---- Event ticks -------------------------------------------------------
+  var NS = 'http://www.w3.org/2000/svg';
+  EVENTS.forEach(function (e, i) {
+    var x = (e.t / SPAN) * W;
+    var g = document.createElementNS(NS, 'g');
+    g.setAttribute('class', 'mk');
+    g.style.cursor = 'pointer';
+
+    var hit = document.createElementNS(NS, 'rect');
+    hit.setAttribute('x', x - 7); hit.setAttribute('y', 142);
+    hit.setAttribute('width', 14); hit.setAttribute('height', 22);
+    hit.setAttribute('fill', 'transparent');
+
+    var tick = document.createElementNS(NS, 'line');
+    tick.setAttribute('x1', x); tick.setAttribute('y1', 145);
+    tick.setAttribute('x2', x); tick.setAttribute('y2', 160);
+    tick.setAttribute('stroke', e.conf === 'fact' ? '#7FD4FF' : '#FFC46B');
+    tick.setAttribute('stroke-width', '2.5');
+
+    g.appendChild(tick); g.appendChild(hit);
+    g.addEventListener('click', function (ev) { ev.stopPropagation(); goTo(e.t); });
+    marks.appendChild(g);
+  });
+
+  // ---- Read-back ---------------------------------------------------------
+  var elStamp = document.getElementById('r-stamp'),
+      elTag   = document.getElementById('r-tag'),
+      elKind  = document.getElementById('r-kind'),
+      elTitle = document.getElementById('r-title'),
+      elEv    = document.getElementById('r-ev');
+
+  function clock(m) {
+    var total = (22 * 60 + m) % (24 * 60);
+    var h = Math.floor(total / 60), mm = total % 60;
+    return (h < 10 ? '0' : '') + h + ':' + (mm < 10 ? '0' : '') + mm;
+  }
+
+  var at = 254; // opens on the throttle onset — the answer, not a gauge
+
+  function render() {
+    var x = (at / SPAN) * W;
+    head.setAttribute('transform', 'translate(' + x + ',0)');
+    elStamp.textContent = clock(at);
+
+    // the most recent event at or before the playhead
+    var cur = null;
+    for (var i = 0; i < EVENTS.length; i++) if (EVENTS[i].t <= at) cur = EVENTS[i];
+
+    strip.setAttribute('aria-valuenow', at);
+    strip.setAttribute('aria-valuetext', clock(at) + (cur ? ' — ' + cur.title : ' — nothing recorded yet'));
+
+    if (!cur) {
+      elTag.className = 'tag fact'; elTag.textContent = 'Fact';
+      elKind.textContent = '—';
+      elTitle.textContent = 'Nothing recorded yet at this point';
+      elEv.textContent = 'The window opens at 22:00; the recorder started at 22:04.';
+      return;
+    }
+    elTag.className = 'tag ' + cur.conf;
+    elTag.textContent = cur.conf === 'fact' ? 'Fact' : 'Likely';
+    elKind.textContent = cur.kind;
+    elTitle.textContent = cur.title;
+    elEv.textContent = cur.ev;
+  }
+
+  function goTo(m) { at = Math.max(0, Math.min(SPAN, Math.round(m))); render(); }
+
+  function fromEvent(clientX) {
+    var r = svg.getBoundingClientRect();
+    goTo(((clientX - r.left) / r.width) * SPAN);
+  }
+
+  var dragging = false;
+  strip.addEventListener('pointerdown', function (e) {
+    dragging = true; strip.setPointerCapture(e.pointerId); fromEvent(e.clientX);
+  });
+  strip.addEventListener('pointermove', function (e) { if (dragging) fromEvent(e.clientX); });
+  strip.addEventListener('pointerup',   function () { dragging = false; });
+  strip.addEventListener('pointercancel', function () { dragging = false; });
+
+  strip.addEventListener('keydown', function (e) {
+    var step = e.shiftKey ? 30 : 5, done = true;
+    if      (e.key === 'ArrowLeft')  goTo(at - step);
+    else if (e.key === 'ArrowRight') goTo(at + step);
+    else if (e.key === 'Home')       goTo(0);
+    else if (e.key === 'End')        goTo(SPAN);
+    else done = false;
+    if (done) e.preventDefault();
+  });
+
+  render();
+
+  // ---- Copy the install line --------------------------------------------
+  var btn = document.getElementById('copy');
+  btn.addEventListener('click', function () {
+    var text = document.getElementById('inst').textContent;
+    var ok = function () {
+      btn.textContent = 'Copied'; btn.classList.add('done');
+      setTimeout(function () { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(ok, function () {});
+    }
+  });
+})();
+</script>
+
+</body>
+</html>
