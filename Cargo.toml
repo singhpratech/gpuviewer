@@ -12,8 +12,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/singhpratech/gpuviewer"
 
 [workspace.dependencies]
-gpuviewer-core = { path = "crates/core" }
-gpuviewer-history = { path = "crates/history" }
+# `version` alongside `path`: inside the workspace cargo uses the path, but crates.io
+# requires a version requirement on every dependency and strips the path on publish.
+# Without it `cargo publish` refuses the manifest. Bump these with the workspace version.
+gpuviewer-core = { version = "0.1.0", path = "crates/core" }
+gpuviewer-history = { version = "0.1.0", path = "crates/history" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
