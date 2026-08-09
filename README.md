@@ -1,48 +1,76 @@
-<div align="center">
+<p align="center">
+  <img src="docs/assets/icon/gpuviewer.svg" width="112" alt="gpuviewer icon — a dark GPU-chip plate carrying a cyan utilization waveform that peaks and drops, crossed by an orange flight-recorder playhead" />
+</p>
 
-<img src="docs/assets/icon/gpuviewer.svg" width="128" alt="gpuviewer icon — a dark GPU-chip plate carrying a cyan utilization waveform that peaks and drops, crossed by an orange flight-recorder playhead">
+<h1 align="center">gpuviewer</h1>
 
-# gpuviewer
-
-### — the GPU flight recorder —
-
-**It was already recording. Scroll back to 02:14 — it'll tell you why.**
-
-[![CI](https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Platform](https://img.shields.io/badge/platform-Linux%20·%20Windows%20·%20macOS-success)](#status)
-[![Vendors](https://img.shields.io/badge/GPUs-NVIDIA%20·%20AMD%20·%20Intel%20·%20Apple-76b900)](#status)
-[![Rust](https://img.shields.io/badge/built%20with-Rust-f74c00?logo=rust&logoColor=white)](#architecture)
-[![MSRV](https://img.shields.io/badge/rust-1.95+-f74c00?logo=rust&logoColor=white)](#architecture)
-
-**[singhpratech.github.io/gpuviewer](https://singhpratech.github.io/gpuviewer/)** — scrub
-an example night in your browser
-
-[Install](#install) · [Quick start](#quick-start) · [How it compares](#how-it-compares) ·
-[Honesty contract](#the-honesty-contract) · [Status](#status) ·
-[Architecture](#architecture) · [Keybinds](#keybinds)
-
-</div>
-
----
-
-Your training run stalled at 02:14. You were asleep. Every other monitor would have shown
-you a beautiful live gauge — of a moment that no longer exists.
-
-**gpuviewer** is a cross-vendor GPU monitor — Linux, Windows and macOS Apple Silicon;
-NVIDIA, AMD, Intel and Apple ([status](#status)) — that records persistent,
-per-process history and a narrated event log **just by being open** — no daemon to install,
-no recording you had to remember to start. The next morning you scroll back to the moment
-it happened and read the story: the throttle onset with clock deltas, the VRAM climb with
-an ETA, the process that exited and what it freed. Facts are asserted plainly; inferences
-are always labeled **"likely"** and expand to the raw evidence behind them. One
-unprivileged binary.
+<p align="center"><em>— the GPU flight recorder —</em></p>
 
 <p align="center">
-  <img src="docs/assets/replay.svg" width="920" alt="gpuviewer replay view: braille charts, process table, throttling gauges, and the narrated story feed, scrolled back to a throttle onset">
+  <img src="docs/assets/replay.svg" width="880" alt="gpuviewer replay view: braille charts, process table, throttling gauges, and the narrated story feed, scrolled back to a throttle onset" />
 </p>
-<p align="center"><sub><em>The built-in demo (<code>gpuviewer demo</code>, simulated data, labeled as such) opens
-already scrolled back to the night's last throttle onset — the first thing you see is the answer, not a gauge.</em></sub></p>
+<p align="center"><sub><em>The built-in demo (<code>gpuviewer demo</code>, simulated data and labeled as such)
+opens already scrolled back to the night's last throttle onset — the first thing you see is the answer, not a gauge.</em></sub></p>
+
+**It was already recording. Scroll back to 02:14 — it'll tell you why.** Your training run
+flatlined while you slept. Every other GPU monitor would show you a beautiful live gauge —
+*of a moment that no longer exists.* `gpuviewer` keeps persistent per-process history and a
+narrated event log **just by being open**, so the next morning you scroll back to the moment
+it happened and read the story in plain English.
+
+<p align="center">
+  <a href="https://crates.io/crates/gpuviewer-tui"><img alt="crates.io" src="https://img.shields.io/crates/v/gpuviewer-tui?logo=rust&label=crates.io&color=FF8A3D" /></a>
+  <a href="https://docs.rs/gpuviewer-core"><img alt="docs.rs" src="https://img.shields.io/docsrs/gpuviewer-core?logo=docsdotrs&label=docs.rs" /></a>
+  <a href="https://github.com/singhpratech/gpuviewer/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/singhpratech/gpuviewer?label=release&color=7FD4FF" /></a>
+  <a href="https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/singhpratech/gpuviewer/actions/workflows/ci.yml/badge.svg" /></a>
+  <a href="#license"><img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" /></a>
+  <a href="#architecture"><img alt="MSRV" src="https://img.shields.io/badge/rust-1.95+-f74c00?logo=rust&logoColor=white" /></a>
+</p>
+
+<p align="center">
+  <a href="https://singhpratech.github.io/gpuviewer/"><strong>Scrub an example night in your browser →</strong></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-compares">How it compares</a> ·
+  <a href="#the-honesty-contract">Honesty contract</a> ·
+  <a href="#status">Status</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#keybinds">Keybinds</a>
+</p>
+
+> **Status — `v0.1.0` is out.** Prebuilt binaries for Linux (`tar.gz` / `.deb` / `.rpm` /
+> AppImage), Windows (`zip`) and macOS Apple Silicon (`tar.gz`), each with checksums and
+> build-provenance attestations. Linux covers NVIDIA, AMD and Intel; Windows covers all
+> three through NVML and the WDDM performance counters; macOS covers Apple Silicon at the
+> device level. [Install](#install) · [Releases](https://github.com/singhpratech/gpuviewer/releases)
+
+## How gpuviewer is different
+
+GPU monitoring is a **well-served space** — and this section is here to be honest about
+that. `nvtop`, `nvitop`, `btop`, `all-smi` and `qmassa` are all good at showing you *right
+now*, and several are more mature than this. What almost none of them do is **remember**:
+close the terminal and the evidence is gone, so the incident you actually care about is the
+one nobody was watching.
+
+- 🎞️ **Always-on recording, no setup** — history and events are written by virtue of the
+  binary being open. No daemon to install, no `record` subcommand you had to run *before*
+  the incident. *(all-smi and qmassa ship real replay — of recordings you started in
+  advance.)*
+- 🕰️ **Scroll-back replay** — jump to any recorded moment and get the full picture back:
+  charts, process table, gauges, story feed. `Enter` on any event lands you exactly there.
+- 🗣️ **Narrated causes, not thresholds** — throttle onset with clock deltas, VRAM climb with
+  an ETA, the process that exited and what it freed — in sentences, with the raw evidence
+  attached. *(Alert rules tell you a number crossed a line; they don't tell you why.)*
+- ⚖️ **Facts and inferences are different things** — every event carries
+  `confidence: fact | likely`. Observed state transitions are asserted plainly; anything
+  derived says "likely" *in the sentence* and expands to the numbers behind it.
+- 🔍 **Per-process across all three Linux vendors** — NVIDIA, AMD, and Intel in both the
+  i915 and xe dialects, with CPU% and container identity where the kernel exposes them.
+- 📦 **One unprivileged binary** — no root, no kernel module, no daemon, no Python
+  environment. It degrades instead of failing when a driver won't answer.
 
 ## Three altitudes on one recording
 
@@ -111,7 +139,13 @@ irm https://raw.githubusercontent.com/singhpratech/gpuviewer/main/install.ps1 | 
 
 The scripts verify the download's SHA256 against the release's checksum file before
 installing, drop a single binary in your user bin dir, and never need root/admin.
-`cargo build --release` works too, and always has.
+
+From crates.io, or from source:
+
+```sh
+cargo install gpuviewer-tui          # the `gpuviewer` binary
+cargo build --release                # or straight from a clone
+```
 
 Packaged builds (Linux `tar.gz`/`.deb`/`.rpm`/AppImage, Windows `zip`, macOS `tar.gz` —
 with checksums and build-provenance attestations) are produced per release tag. Every
@@ -121,7 +155,6 @@ lives in [`docs/packaging/installing.md`](docs/packaging/installing.md).
 ## Quick start
 
 ```sh
-cargo build --release                # binary at target/release/gpuviewer
 gpuviewer                            # live TUI — already recording
 gpuviewer demo                       # 8h simulated incident, opens at the throttle onset
 gpuviewer report --since 12h         # the digest above, from your real history
