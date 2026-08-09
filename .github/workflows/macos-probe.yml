@@ -1,0 +1,47 @@
+# Ground-truth probe for the macOS backend (cross-platform design §4.5/§5.5).
+#
+# Dumps the runner's IOAccelerator / AGXAccelerator inventory and the IOReport channel
+# list, so the Apple backend's CI assertions rest on citation rather than inference. Its
+# output commits verbatim as crates/core/tests/fixtures/ioreport/channels-<chip>-<os>.txt.
+#
+# It lives in its OWN workflow rather than as an `if: workflow_dispatch` job inside ci.yml
+# on purpose: a conditional job still reports as a SKIPPED check on every push, which reads
+# like something is wrong with a run that is in fact completely green. Manual-only work
+# belongs behind a manual-only trigger, not behind an `if` in a workflow that runs on push.
+#
+# First run: 2026-08-09 (Actions run 31321190309) — see the addendum of the same date in
+# docs/design/cross-platform.md for what it established.
+name: macOS probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-probe:
+    # Pinned to macos-15 for the same reason ci.yml pins it: macos-latest re-points to
+    # macos-26 from 2026-06-15, and a fixture is only meaningful with a named OS image.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      # Informational dumps: `|| true` because an absent class is a RESULT (AGXAccelerator
+      # is legitimately missing on the paravirt guest), not a failure to report.
+      - name: IOAccelerator inventory (Tier B PerformanceStatistics ground truth)
+        run: ioreg -r -c IOAccelerator -d 2 || true
+
+      - name: AGXAccelerator inventory (expected absent on paravirt runners)
+        run: ioreg -r -c AGXAccelerator -d 2 || true
+
+      # NOT best-effort. The example exists and has run; if the probe stops building or
+      # libIOReport stops loading, that is exactly the signal this job exists to surface —
+      # swallowing it with `|| true` would turn the one job that establishes ground truth
+      # into a job that always passes and proves nothing.
+      - name: IOReport channel enumeration (fixture format)
+        run: cargo run -p gpuviewer-core --example macos_probe

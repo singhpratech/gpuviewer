@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Manual trigger for the one-off macos-probe job (cross-platform design §4.5).
+  # Manual re-runs of the matrix. (The one-off macOS ground-truth probe used to ride
+  # here behind an `if:`, but a conditional job reports as a SKIPPED check on every
+  # push — it lives in its own workflow now: .github/workflows/macos-probe.yml.)
   workflow_dispatch:
 
 permissions:
@@ -72,16 +74,3 @@ jobs:
           check_floor amd_fixtures 19
           check_floor intel_fixtures 23
           check_floor nvml_stub_loader 2
-
-  # One-off ground-truth probe (design §4.5): dump the paravirt runner's IOAccelerator /
-  # AGXAccelerator inventory so the macOS backend's CI assertions are built on citation,
-  # not inference. Manual trigger only; every step is best-effort (the example does not
-  # exist until the macos-apple workstream lands it).
-  macos-probe:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - run: ioreg -r -c IOAccelerator -d 2 || true
-      - run: ioreg -r -c AGXAccelerator -d 2 || true
-      - run: cargo run -p gpuviewer-core --example macos_probe || true

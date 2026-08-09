@@ -842,3 +842,57 @@ Deferred from that change (recorded so it is not mistaken for done): `source_cav
 not yet persisted in the history store, so `report` and `.gpvr` replays of *recordings*
 cannot reprint it — the live TUI (all three views) renders it from the live backends.
 Persisting it is a small schema addition that belongs with the Tier B/C unfreeze.
+
+---
+
+## Addendum (2026-08-09): §4.5 ground truth captured — the guest is NOT bare
+
+The `macos-probe` job (§5.5) was dispatched for the first time on 2026-08-09 (Actions run
+31321190309, runner image `macos-15`, Apple Virtualization.framework guest). §4.5 flagged
+its own expectations as "**inference, not citation**"; they are now citation. The verbatim
+channel inventory is committed as
+`crates/core/tests/fixtures/ioreport/channels-paravirt-macos15.txt` — the first real
+capture in a fixture directory that was otherwise entirely synthetic — and is pinned by
+`apple::tests::real_paravirt_capture_exposes_no_tier_c_gpu_channels`.
+
+**Confirmed as §4.5 predicted:**
+
+- `AGXAccelerator` is absent. `ioreg -r -c AGXAccelerator -d 2` returns nothing.
+- Tier C is unreachable: of 116 enumerated channels, **none** matches the `GPU Energy`
+  (Energy Model) selector and **none** matches the `GPUPH` (`GPU Stats` /
+  `GPU Performance States`) selector. Power and DVFS-residency clocks are therefore
+  legitimately `None` on this runner — that is correct behavior, not degradation.
+- `libIOReport` dlopens and all twelve bound symbols resolve, so the Tier C plumbing can
+  be exercised on CI even though it will find nothing.
+
+**NOT predicted — this corrects a planned assertion:**
+
+§4.5 said to assert "graceful-None … for Tier B/C". That is wrong for Tier B. The guest's
+GPU is `AppleParavirtDevice` (`MetalPluginName = AppleParavirtGPUMetalIOGPUFamily`,
+matched on `paravirtualizedgraphics,gpu`), and its `IOAccelerator` node carries a live
+`PerformanceStatistics` dict:
+
+```
+"Alloc system memory"           = 28278784
+"In use system memory"          = 35195904
+"In use system memory (driver)" = 0
+"recoveryCount" = 0, "lastRecoveryTime" = 0
+```
+
+`In use system memory` is exactly the §1 Tier B memory source, and it reads a real value
+here. Per §4.5's own instruction — *"If the guest unexpectedly exposes channels, tighten
+the assertions to match reality rather than asserting None"* — the Tier B memory assertion
+must expect **Some**, not None. The node's `IOReportLegend` publishes the channel IDs for
+the group (`Alloc system memory`=1, `In use system memory`=2, `GPU Restart Count`=3,
+`In use system memory (driver)`=4, `Last GPU Restart`=5) under group `Internal Statistics`.
+
+`Device Utilization %` is **not** among the PerformanceStatistics keys on this guest, so
+utilization correctly falls through to Tier C, which is absent → `None`. The §1 matrix's
+utilization row stands.
+
+**Still open.** This closes action item 3 of the §4.6 gate (record the outcome) and gives
+item 2 a baseline to diff against. Items 1 and 2 — scan the WWDC26 session list, smoke-test
+IOReport/IOAccelerator on the macOS 27 beta — remain **undone and overdue** (the keynote
+was 2026-06-08). The Tier B/C design freeze stays blocked on them; nothing above unblocks
+it, because a paravirt guest cannot tell us whether Apple locked the interface down on real
+macOS 27 hardware.

@@ -734,6 +734,50 @@ mod tests {
         assert_eq!(energy_unit(&gpu_nj[0].unit), Some(EnergyUnit::Nanojoules));
     }
 
+    /// The one REAL capture in the fixture set (macos-15 CI guest, design §4.5). Its job
+    /// is to keep the Tier C selectors honest against a machine nobody hand-wrote: on the
+    /// paravirt GPU neither selector matches anything, so None is the CORRECT reading
+    /// there, not a parser bug. If a future runner image starts exposing these channels
+    /// this test fails loudly — which is the signal to tighten the CI assertions to match
+    /// reality rather than keep asserting None (§4.5's explicit instruction).
+    #[test]
+    fn real_paravirt_capture_exposes_no_tier_c_gpu_channels() {
+        let chans = parse_channels(&fixture("channels-paravirt-macos15.txt"));
+        assert_eq!(chans.len(), 116, "verbatim capture: 116 channels");
+
+        let energy: Vec<&str> = chans
+            .iter()
+            .filter(|c| is_gpu_energy_channel(c))
+            .map(|c| c.channel.as_str())
+            .collect();
+        assert!(
+            energy.is_empty(),
+            "paravirt guest exposes no GPU energy channel, got {energy:?}"
+        );
+
+        let ph: Vec<&str> = chans
+            .iter()
+            .filter(|c| is_gpu_perf_states_channel(c))
+            .map(|c| c.channel.as_str())
+            .collect();
+        assert!(
+            ph.is_empty(),
+            "paravirt guest exposes no GPUPH residency channel, got {ph:?}"
+        );
+
+        // Tier B is a different story and must not be lumped in with Tier C: the
+        // Internal Statistics group IS present, and it is where macOS memory comes from.
+        let internal: Vec<&str> = chans
+            .iter()
+            .filter(|c| c.group == "Internal Statistics")
+            .map(|c| c.channel.as_str())
+            .collect();
+        assert!(
+            internal.contains(&"In use system memory"),
+            "Tier B memory channel is present on the guest, got {internal:?}"
+        );
+    }
+
     #[test]
     fn gpuph_channel_requires_exact_group_and_subgroup() {
         let chans = parse_channels(&fixture("channels-m2.txt"));

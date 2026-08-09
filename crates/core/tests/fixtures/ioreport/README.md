@@ -1,8 +1,9 @@
 # IOReport / Apple-telemetry fixtures
 
-**These fixtures are SYNTHETIC** — hand-written for deterministic tests of the pure
-parsing/maths layer in `crates/core/src/apple.rs` (`apple::parse`), not captured from real
-hardware. They deliberately include decoy entries that a wrong code path would match
+**All but one of these fixtures are SYNTHETIC** — hand-written for deterministic tests of
+the pure parsing/maths layer in `crates/core/src/apple.rs` (`apple::parse`), not captured
+from real hardware. The exception is `channels-paravirt-macos15.txt`, a verbatim capture
+from the CI runner (see below). They deliberately include decoy entries that a wrong code path would match
 (`CPU Energy`, `GPU SRAM Energy`, a `GPUPH` under the wrong subgroup, `Device Utilization
 at cur p-state`). Per the repo's fixture policy, replace/augment them with real captures
 per chip and macOS release once hardware passes through the manual pre-release checklist.
@@ -51,3 +52,11 @@ captures are part of the Tier B/C unfreeze (design §4.6), after the WWDC26 re-c
   every observed chip ships (must be dropped, not read as 0 MHz).
 - `voltage-states9-khz-synthetic.hex` — synthetic kHz + already-MHz rows exercising the
   magnitude-based unit normalization branches.
+- `channels-paravirt-macos15.txt` — **REAL**, not synthetic: the verbatim 116-channel
+  inventory of the macos-15 Actions runner (Apple Virtualization.framework guest),
+  captured by the `macos-probe` job on 2026-08-09. It carries no planted decoys — it is
+  whatever the machine reported. Neither Tier C GPU selector matches it (no `GPU Energy`,
+  no `GPUPH`), which is what makes `None` the correct reading on CI rather than a parser
+  bug; the `Internal Statistics` group that Tier B memory reads from IS present. If a
+  future runner image starts exposing GPU channels, its test fails and the CI assertions
+  get tightened to match reality (design §4.5). Recapture rather than hand-edit.
