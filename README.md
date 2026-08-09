@@ -13,6 +13,14 @@
 [![Platform](https://img.shields.io/badge/platform-Linux%20·%20Windows%20·%20macOS-success)](#status)
 [![Vendors](https://img.shields.io/badge/GPUs-NVIDIA%20·%20AMD%20·%20Intel%20·%20Apple-76b900)](#status)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-f74c00?logo=rust&logoColor=white)](#architecture)
+[![MSRV](https://img.shields.io/badge/rust-1.95+-f74c00?logo=rust&logoColor=white)](#architecture)
+
+**[singhpratech.github.io/gpuviewer](https://singhpratech.github.io/gpuviewer/)** — scrub
+an example night in your browser
+
+[Install](#install) · [Quick start](#quick-start) · [How it compares](#how-it-compares) ·
+[Honesty contract](#the-honesty-contract) · [Status](#status) ·
+[Architecture](#architecture) · [Keybinds](#keybinds)
 
 </div>
 
@@ -362,10 +370,19 @@ mirror `Home`/`End`.
 | long tail | 1m rollups | 30 days |
 | event log | every event | 30 days |
 
-History lives at `$XDG_DATA_HOME/gpuviewer/history.db`
-(`~/.local/share/gpuviewer/history.db`); `--db` overrides it, `--no-persist` disables
-recording (which the replay view and `report` need). `--mock` records to `history-mock.db`
-and `demo` to `history-demo.db` — your real history is never polluted by simulations.
+History lives in your user data directory, resolved per-OS:
+
+| | default `history.db` location |
+|---|---|
+| Linux | `$XDG_DATA_HOME/gpuviewer` → `~/.local/share/gpuviewer` |
+| macOS | `~/Library/Application Support/gpuviewer` |
+| Windows | `%LOCALAPPDATA%\gpuviewer` |
+
+`--db` overrides it, `--no-persist` disables recording (which the replay view and `report`
+need). `--mock` records to `history-mock.db` and `demo` to `history-demo.db` — your real
+history is never polluted by simulations, and recording the wrong flavour into a database
+is refused before a single row lands. One recorder owns a database at a time (an exclusive
+lock on `<db>.lock`); a second gpuviewer opened by hand runs live-only and says so.
 
 ### Roadmap
 
