@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>gpuviewer — the GPU flight recorder</title>
 <meta name="description" content="A cross-vendor GPU monitor that records persistent per-process history and a narrated event log just by being open. Your run stalled at 02:14 and you were asleep — scroll back and read why." />
-<meta name="color-scheme" content="dark" />
+<meta name="color-scheme" content="dark light" />
 <meta property="og:title" content="gpuviewer — the GPU flight recorder" />
 <meta property="og:description" content="Every other GPU monitor shows you a beautiful live gauge of a moment that no longer exists. gpuviewer was already recording. Scroll back to 02:14 — it'll tell you why." />
 <meta property="og:type" content="website" />
@@ -17,6 +17,17 @@
 <meta name="twitter:title" content="gpuviewer — the GPU flight recorder" />
 <meta name="twitter:description" content="Every other GPU monitor shows you a live gauge of a moment that no longer exists. gpuviewer was already recording. Scroll back to 02:14." />
 <meta name="twitter:image" content="https://singhpratech.github.io/gpuviewer/assets/icon/png/512x512/gpuviewer.png" />
+<script>
+  // Applied before first paint so a stored choice never flashes the other theme.
+  // Light is the DEFAULT: absent a stored choice this page is light regardless of the
+  // OS setting, so the landing state is the same for everyone.
+  (function () {
+    try {
+      var t = localStorage.getItem('gpuviewer-theme');
+      if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  })();
+</script>
 <link rel="icon" type="image/png" sizes="32x32" href="./assets/icon/png/32x32/gpuviewer.png" />
 <link rel="icon" type="image/png" sizes="16x16" href="./assets/icon/png/16x16/gpuviewer.png" />
 <link rel="apple-touch-icon" sizes="180x180" href="./assets/icon/png/256x256/gpuviewer.png" />
@@ -26,6 +37,17 @@
      recorder plate, cyan telemetry trace, orange playhead. Three colors,
      no more — the mark's own 16px discipline applied to a web page.
      ------------------------------------------------------------------ */
+  /* ------------------------------------------------------------------
+     Two themes off one icon. The mark is a dark plate carrying a cyan
+     telemetry trace and an orange playhead; the light theme keeps the same
+     three roles — ground, trace, playhead — and re-picks the values so they
+     hold their contrast on paper instead of on a screen at night.
+
+     DARK IS THE DEFAULT: bare :root is dark, and `prefers-color-scheme` is
+     deliberately NOT consulted, so every visitor lands on the same page and
+     the instrument reads the way the icon does. Light is opt-in via the
+     toggle, and the choice persists.
+     ------------------------------------------------------------------ */
   :root {
     --void:    #070A0F;   /* page ground — below the plate */
     --plate:   #10151D;   /* the recorder plate itself */
@@ -34,9 +56,11 @@
     --rule-2:  #2A3644;
 
     --trace:   #7FD4FF;   /* telemetry cyan */
-    --trace-d: #3E7E9E;
+    --trace-d: #5FA8CC;
     --play:    #FF8A3D;   /* recorder orange — the signature */
     --play-d:  #B85E22;
+    --play-hi: #FFA467;
+    --on-play: #180B02;
 
     --ink:     #DCE4EF;
     --ink-2:   #93A1B4;
@@ -46,8 +70,43 @@
     --likely:  #FFC46B;
     --ok:      #6FD08C;
 
+    --shadow:  0 30px 70px -45px #000;
+    --veil:    rgba(7,10,15,0.88);
+    --code-bg: #070A0F;
+    --trace-fill-top: 0.22;
+    --trace-fill-bot: 0.01;
+
     --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, "DejaVu Sans Mono", Consolas, monospace;
     --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  :root[data-theme="light"] {
+    --void:    #FBFAF7;
+    --plate:   #FFFFFF;
+    --plate-2: #F4F1EB;
+    --rule:    #E5E0D6;
+    --rule-2:  #CFC7B9;
+
+    --trace:   #10627F;   /* darkened to hold contrast on white */
+    --trace-d: #3E7E9E;
+    --play:    #C2540D;
+    --play-d:  #9A4308;
+    --play-hi: #A8480B;
+    --on-play: #FFFFFF;
+
+    --ink:     #1A1D22;
+    --ink-2:   #4F5661;
+    --ink-3:   #7A828F;
+
+    --fact:    #10627F;
+    --likely:  #8A5A00;
+    --ok:      #24663A;
+
+    --shadow:  0 18px 40px -32px rgba(20,20,25,0.55);
+    --veil:    rgba(255,255,255,0.86);
+    --code-bg: #F4F1EB;
+    --trace-fill-top: 0.16;
+    --trace-fill-bot: 0.02;
   }
 
   * { box-sizing: border-box; }
@@ -71,7 +130,7 @@
     -webkit-font-smoothing: antialiased;
   }
   a { color: var(--play); text-underline-offset: 3px; text-decoration-thickness: 1px; }
-  a:hover { color: #FFA467; }
+  a:hover { color: var(--play-hi); }
   :focus-visible { outline: 2px solid var(--play); outline-offset: 3px; border-radius: 3px; }
   img, svg { max-width: 100%; }
   h1, h2, h3 { text-wrap: balance; }
@@ -97,7 +156,7 @@
   /* ---- Top bar ------------------------------------------------------ */
   .topbar {
     position: sticky; top: 0; z-index: 60;
-    background: color-mix(in srgb, var(--void) 88%, transparent);
+    background: var(--veil);
     backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--rule);
   }
@@ -143,7 +202,7 @@
     border: 1px solid var(--rule-2);
     border-radius: 10px;
     overflow: hidden;
-    box-shadow: 0 30px 70px -45px #000, inset 0 1px 0 rgba(255,255,255,0.03);
+    box-shadow: var(--shadow);
   }
   .rec-head {
     display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap;
@@ -157,9 +216,9 @@
     animation: blip 2.4s ease-out infinite;
   }
   @keyframes blip {
-    0%   { box-shadow: 0 0 0 0 rgba(255,138,61,0.55); }
-    70%  { box-shadow: 0 0 0 8px rgba(255,138,61,0); }
-    100% { box-shadow: 0 0 0 0 rgba(255,138,61,0); }
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--play) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 8px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
   }
   .rec-head .spacer { margin-left: auto; }
 
@@ -223,8 +282,8 @@
     transition: border-color 0.15s, color 0.15s;
   }
   .btn:hover { border-color: var(--play); color: var(--play); }
-  .btn-primary { background: var(--play); border-color: var(--play); color: #180B02; font-weight: 600; }
-  .btn-primary:hover { background: #FFA467; border-color: #FFA467; color: #180B02; }
+  .btn-primary { background: var(--play); border-color: var(--play); color: var(--on-play); font-weight: 600; }
+  .btn-primary:hover { background: var(--play-hi); border-color: var(--play-hi); color: var(--on-play); }
 
   /* ---- Bands -------------------------------------------------------- */
   section.band { padding: 4.2rem 0; border-bottom: 1px solid var(--rule); }
@@ -290,7 +349,7 @@
   .inst h4 { font-family: var(--mono); font-size: 0.76rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); margin: 0 0 0.7rem; }
   pre {
     margin: 0; overflow-x: auto; font-family: var(--mono); font-size: 0.79rem; line-height: 1.75;
-    color: var(--ink); background: var(--void); border: 1px solid var(--rule); border-radius: 6px; padding: 0.75rem 0.85rem;
+    color: var(--ink); background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px; padding: 0.75rem 0.85rem;
   }
   pre .c { color: var(--ink-3); }
   pre .p { color: var(--play); }
@@ -300,7 +359,29 @@
   footer .frow { display: flex; gap: 1.4rem; flex-wrap: wrap; align-items: center; }
   footer a { color: var(--ink-2); text-decoration: none; }
   footer a:hover { color: var(--play); }
+  footer .copyline { margin-top: 0.9rem; padding-top: 0.9rem; border-top: 1px solid var(--rule); gap: 0.6rem; font-size: 0.8rem; }
   footer .sig { margin-left: auto; font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; }
+
+  /* The recorder SVG is themed from CSS, not from presentation attributes, so one
+     palette drives the page and the instrument together. */
+  #tape .grid   { stroke: var(--rule); }
+  #tape #trace  { stroke: var(--trace); }
+  #tape #head line { stroke: var(--play); }
+  #tape #head path { fill: var(--play); }
+  #tape .mk-fact   { stroke: var(--fact); }
+  #tape .mk-likely { stroke: var(--likely); }
+  #fill .top { stop-color: var(--trace); stop-opacity: var(--trace-fill-top); }
+  #fill .bot { stop-color: var(--trace); stop-opacity: var(--trace-fill-bot); }
+
+  /* Theme toggle */
+  .themeb {
+    flex: 0 0 auto; margin-left: 0.4rem; background: transparent;
+    border: 1px solid var(--rule-2); color: var(--ink-2); border-radius: 5px;
+    font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.06em;
+    padding: 0.3rem 0.55rem; cursor: pointer; line-height: 1;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .themeb:hover { color: var(--play); border-color: var(--play); }
 </style>
 </head>
 <body>
@@ -318,6 +399,9 @@
       <a href="#support">Support</a>
       <a href="#install">Install</a>
       <a href="https://github.com/singhpratech/gpuviewer">GitHub&nbsp;↗</a>
+      <button class="themeb" id="themeb" type="button" aria-pressed="false">
+        <span id="themeb-label">Dark</span>
+      </button>
     </nav>
   </div>
 </div>
@@ -348,26 +432,26 @@
         <svg id="tape" viewBox="0 0 960 190" preserveAspectRatio="none" aria-hidden="true">
           <defs>
             <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%"  stop-color="#7FD4FF" stop-opacity="0.22" />
-              <stop offset="100%" stop-color="#7FD4FF" stop-opacity="0.01" />
+              <stop class="top" offset="0%" />
+              <stop class="bot" offset="100%" />
             </linearGradient>
           </defs>
           <!-- gridlines -->
-          <g stroke="#1E2733" stroke-width="1">
+          <g class="grid" stroke-width="1">
             <line x1="0" y1="40"  x2="960" y2="40"  />
             <line x1="0" y1="80"  x2="960" y2="80"  />
             <line x1="0" y1="120" x2="960" y2="120" />
           </g>
           <path id="area"  fill="url(#fill)" d="" />
-          <path id="trace" fill="none" stroke="#7FD4FF" stroke-width="1.6"
+          <path id="trace" fill="none" stroke-width="1.6"
                 stroke-linejoin="round" stroke-linecap="round" d="" />
           <!-- event lane -->
-          <line x1="0" y1="152" x2="960" y2="152" stroke="#1E2733" stroke-width="1" />
+          <line class="grid" x1="0" y1="152" x2="960" y2="152" stroke-width="1" />
           <g id="marks"></g>
           <!-- playhead -->
           <g id="head">
-            <line x1="0" y1="6" x2="0" y2="168" stroke="#FF8A3D" stroke-width="1.6" />
-            <path d="M0,6 L0,20 L13,13 Z" fill="#FF8A3D" />
+            <line x1="0" y1="6" x2="0" y2="168" stroke-width="1.6" />
+            <path d="M0,6 L0,20 L13,13 Z" />
           </g>
         </svg>
         <div class="rec-axis">
@@ -615,6 +699,10 @@ gpuviewer/main/install.ps1 | iex</pre>
     <a href="https://github.com/singhpratech/gpuviewer/releases">Releases</a>
     <span class="sig">MIT or Apache-2.0</span>
   </div>
+  <div class="wrap frow copyline">
+    <span>&copy; Prateek Singh</span>
+    <a href="https://theaivibe.org/about">theaivibe.org/about</a>
+  </div>
 </footer>
 
 <script>
@@ -692,7 +780,7 @@ gpuviewer/main/install.ps1 | iex</pre>
     var tick = document.createElementNS(NS, 'line');
     tick.setAttribute('x1', x); tick.setAttribute('y1', 145);
     tick.setAttribute('x2', x); tick.setAttribute('y2', 160);
-    tick.setAttribute('stroke', e.conf === 'fact' ? '#7FD4FF' : '#FFC46B');
+    tick.setAttribute('class', e.conf === 'fact' ? 'mk-fact' : 'mk-likely');
     tick.setAttribute('stroke-width', '2.5');
 
     g.appendChild(tick); g.appendChild(hit);
@@ -767,6 +855,30 @@ gpuviewer/main/install.ps1 | iex</pre>
   });
 
   render();
+
+  // ---- Theme toggle ------------------------------------------------------
+  // Dark is the default and the OS preference is deliberately not read, so every
+  // visitor lands on the same page; light is a choice, and choices persist.
+  var root = document.documentElement;
+  var tb = document.getElementById('themeb');
+  var tbl = document.getElementById('themeb-label');
+
+  function applyTheme(t) {
+    if (t === 'light') root.dataset.theme = 'light';
+    else root.dataset.theme = 'dark';
+    var dark = t !== 'light';
+    tbl.textContent = dark ? 'Light' : 'Dark';
+    tb.setAttribute('aria-pressed', dark ? 'true' : 'false');
+    tb.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+  }
+
+  applyTheme(root.dataset.theme === 'light' ? 'light' : 'dark');
+
+  tb.addEventListener('click', function () {
+    var next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    try { localStorage.setItem('gpuviewer-theme', next); } catch (e) {}
+  });
 
   // ---- Copy the install line --------------------------------------------
   var btn = document.getElementById('copy');
