@@ -4,16 +4,29 @@
   "title": "gpuviewer NDJSON contract v1",
   "description": "One gpuviewer --json stdout line: a frame or an event. See ndjson-v1.md for semantics. Per the compatibility promise, additive fields may appear in any release, so no object here forbids additional properties; consumers must ignore unknown fields, unknown \"type\" values, and unknown \"kind\" values.",
   "oneOf": [
-    { "$ref": "#/$defs/frameLine" },
-    { "$ref": "#/$defs/eventLine" }
+    {
+      "$ref": "#/$defs/frameLine"
+    },
+    {
+      "$ref": "#/$defs/eventLine"
+    }
   ],
   "$defs": {
     "frameLine": {
       "type": "object",
-      "required": ["v", "type", "ts_ms", "devices"],
+      "required": [
+        "v",
+        "type",
+        "ts_ms",
+        "devices"
+      ],
       "properties": {
-        "v": { "const": 1 },
-        "type": { "const": "frame" },
+        "v": {
+          "const": 1
+        },
+        "type": {
+          "const": "frame"
+        },
         "ts_ms": {
           "type": "integer",
           "minimum": 0,
@@ -21,71 +34,187 @@
         },
         "devices": {
           "type": "array",
-          "items": { "$ref": "#/$defs/device" }
+          "items": {
+            "$ref": "#/$defs/device"
+          }
         }
       }
     },
     "device": {
       "type": "object",
-      "required": ["id", "name", "mem_total_bytes", "sample", "processes"],
+      "required": [
+        "id",
+        "name",
+        "mem_total_bytes",
+        "sample",
+        "processes"
+      ],
       "properties": {
         "id": {
           "type": "string",
           "description": "Stable device identity (PCI address, or a prefixed key for non-PCI devices)."
         },
-        "name": { "type": "string" },
-        "mem_total_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "name": {
+          "type": "string"
+        },
+        "mem_total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
         "sample": {
-          "oneOf": [{ "$ref": "#/$defs/sample" }, { "type": "null" }],
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sample"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "description": "null when the device failed to answer this tick."
         },
         "processes": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/process" }
+          "description": "Processes attached this tick. null = the probe failed (unknown); [] = read and empty.",
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/process"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
     "sample": {
       "type": "object",
-      "required": ["ts_ms", "util_pct", "util_engine", "mem_used_bytes", "power_mw", "temp_c", "fan_pct", "sm_clock_mhz", "mem_clock_mhz", "encoder_pct", "decoder_pct", "throttle"],
+      "required": [
+        "ts_ms",
+        "util_pct",
+        "util_engine",
+        "mem_used_bytes",
+        "power_mw",
+        "temp_c",
+        "fan_pct",
+        "sm_clock_mhz",
+        "mem_clock_mhz",
+        "encoder_pct",
+        "decoder_pct",
+        "throttle"
+      ],
       "properties": {
-        "ts_ms": { "type": "integer", "minimum": 0 },
+        "ts_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
         "util_pct": {
-          "type": ["number", "null"],
-          "description": "Duty-cycle (time >=1 kernel resident), NOT saturation. Nominally 0-100, but engine-derived sources (Windows WDDM PDH with PDH_FMT_NOCAP100, per-engine busy% summed across pids) can honestly exceed 100 — no maximum is enforced; >100 is real data, not corruption."
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Duty-cycle (time >=1 kernel resident), NOT saturation. Nominally 0-100, but engine-derived sources (Windows WDDM PDH with PDH_FMT_NOCAP100, per-engine busy% summed across pids) can honestly exceed 100 \u2014 no maximum is enforced; >100 is real data, not corruption."
         },
         "util_engine": {
-          "type": ["string", "null"],
-          "description": "Engine whose busy% util_pct reports when utilization is an engine headline (Windows WDDM busiest engine); null where utilization is device-wide. Open set — never an enum."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Engine whose busy% util_pct reports when utilization is an engine headline (Windows WDDM busiest engine); null where utilization is device-wide. Open set \u2014 never an enum."
         },
-        "mem_used_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "power_mw": { "type": ["integer", "null"], "minimum": 0 },
-        "temp_c": { "type": ["number", "null"] },
-        "fan_pct": { "type": ["number", "null"] },
-        "sm_clock_mhz": { "type": ["integer", "null"], "minimum": 0 },
-        "mem_clock_mhz": { "type": ["integer", "null"], "minimum": 0 },
+        "mem_used_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "power_mw": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "temp_c": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "fan_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sm_clock_mhz": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "mem_clock_mhz": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
         "encoder_pct": {
-          "type": ["number", "null"],
-          "description": "Video encoder utilization. Nominally 0-100; engine-derived sources can exceed 100 (see util_pct) — no maximum is enforced."
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Video encoder utilization. Nominally 0-100; engine-derived sources can exceed 100 (see util_pct) \u2014 no maximum is enforced."
         },
         "decoder_pct": {
-          "type": ["number", "null"],
-          "description": "Video decoder utilization. Nominally 0-100; engine-derived sources can exceed 100 (see util_pct) — no maximum is enforced."
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Video decoder utilization. Nominally 0-100; engine-derived sources can exceed 100 (see util_pct) \u2014 no maximum is enforced."
         },
         "throttle": {
-          "oneOf": [{ "$ref": "#/$defs/throttle" }, { "type": "null" }],
-          "description": "null = this source cannot observe throttling (blind spot, e.g. WDDM counters/macOS) — NOT 'not throttling'; an all-false object is an observed quiet."
+          "oneOf": [
+            {
+              "$ref": "#/$defs/throttle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "null = this source cannot observe throttling (blind spot, e.g. WDDM counters/macOS) \u2014 NOT 'not throttling'; an all-false object is an observed quiet."
         }
       }
     },
     "throttle": {
       "type": "object",
-      "required": ["thermal", "power_cap", "hw_slowdown", "sync_boost", "other"],
+      "required": [
+        "thermal",
+        "power_cap",
+        "hw_slowdown",
+        "sync_boost",
+        "other"
+      ],
       "properties": {
-        "thermal": { "type": "boolean" },
-        "power_cap": { "type": "boolean" },
-        "hw_slowdown": { "type": "boolean" },
-        "sync_boost": { "type": "boolean" },
+        "thermal": {
+          "type": "boolean"
+        },
+        "power_cap": {
+          "type": "boolean"
+        },
+        "hw_slowdown": {
+          "type": "boolean"
+        },
+        "sync_boost": {
+          "type": "boolean"
+        },
         "other": {
           "type": "boolean",
           "description": "Unknown future driver throttle bits land here, never dropped."
@@ -94,33 +223,85 @@
     },
     "process": {
       "type": "object",
-      "required": ["pid", "name", "kind", "mem_bytes", "util_pct", "cpu_pct", "container"],
+      "required": [
+        "pid",
+        "name",
+        "kind",
+        "mem_bytes",
+        "util_pct",
+        "cpu_pct",
+        "container"
+      ],
       "properties": {
-        "pid": { "type": "integer", "minimum": 0 },
-        "name": { "type": "string" },
-        "kind": { "enum": ["compute", "graphics", "both", "unknown"] },
-        "mem_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "pid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "compute",
+            "graphics",
+            "both",
+            "unknown"
+          ]
+        },
+        "mem_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
         "util_pct": {
-          "type": ["number", "null"],
-          "description": "Per-process GPU utilization. Nominally 0-100; engine-derived sources can exceed 100 (see the sample util_pct description) — no maximum is enforced."
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Per-process GPU utilization. Nominally 0-100; engine-derived sources can exceed 100 (see the sample util_pct description) \u2014 no maximum is enforced."
         },
         "cpu_pct": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "description": "Percent of one core; 100.0 = one full core, can exceed 100 on multithreaded processes."
         },
         "container": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "Container identity (e.g. docker:1a2b3c4d5e6f); null for host processes or when unknown."
         }
       }
     },
     "eventLine": {
       "type": "object",
-      "required": ["v", "type", "ts_ms", "device", "kind", "severity", "confidence", "title", "evidence"],
+      "required": [
+        "v",
+        "type",
+        "ts_ms",
+        "device",
+        "kind",
+        "severity",
+        "confidence",
+        "title",
+        "evidence"
+      ],
       "properties": {
-        "v": { "const": 1 },
-        "type": { "const": "event" },
-        "ts_ms": { "type": "integer", "minimum": 0 },
+        "v": {
+          "const": 1
+        },
+        "type": {
+          "const": "event"
+        },
+        "ts_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
         "device": {
           "type": "string",
           "description": "Matches a frame device id."
@@ -140,17 +321,31 @@
             "device_lost",
             "device_returned",
             "recording_started",
-            "recording_stopped"
+            "recording_stopped",
+            "recording_degraded"
           ],
           "description": "All listed kinds are emitted today. Consumers must ignore kinds not in this list (new ones arrive additively per the compatibility promise)."
         },
-        "severity": { "enum": ["info", "warning", "critical"] },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "critical"
+          ]
+        },
         "confidence": {
-          "enum": ["fact", "likely"],
+          "enum": [
+            "fact",
+            "likely"
+          ],
           "description": "fact = observed state transition; likely = inference, hedged with \"likely\" in the title."
         },
-        "title": { "type": "string" },
-        "evidence": { "type": "string" }
+        "title": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        }
       }
     }
   }

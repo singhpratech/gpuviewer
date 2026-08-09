@@ -11,7 +11,7 @@ use gpuviewer_core::{
     all_backends, normalize_pci_id, now_ms, Confidence, DeviceId, DynamicSample, Event,
     EventEngine, EventKind, GpuBackend, ProcessSample, Severity, StaticInfo,
 };
-use gpuviewer_history::{DataSource, HistoryStore, Recorder, SqliteStore};
+use gpuviewer_history::{DataSource, HistoryStore, Recorder, SqliteStore, WriteTransition};
 use serde::Serialize;
 
 /// One collection tick's output for one device.
@@ -24,7 +24,10 @@ pub struct FrameDevice {
     /// (the spec and the per-device `source_caveat` carry that label).
     pub mem_total_bytes: Option<u64>,
     pub sample: Option<DynamicSample>,
-    pub processes: Vec<ProcessSample>,
+    /// `None` when the process probe FAILED this tick — not the same as `Some(vec![])`,
+    /// which asserts the device genuinely had nothing attached. Consumers must render or
+    /// serialize the two differently; an empty list stands for an observed emptiness.
+    pub processes: Option<Vec<ProcessSample>>,
 }
 
 /// One collection tick across all devices. Internal shape only: `--json` serializes the
@@ -227,6 +230,40 @@ fn device_returned_event(
 /// matching stop: that session died without flushing (crash, kill, power loss), and the
 /// asymmetry is itself flight-recorder information — narrated here because the dead
 /// session, by definition, could not narrate it.
+/// Narrate a persistence edge as a fact. The recorder deliberately never propagates a
+/// write error (a full disk must not take the live view down), but the silence that used
+/// to accompany that was a promise the product could not keep: "scroll back to 02:14"
+/// fails badly if the last hour was never written and nothing said so.
+fn recording_degraded_event(ts_ms: u64, anchor: DeviceId, t: &WriteTransition) -> Event {
+    let (severity, title, evidence) = match t {
+        WriteTransition::Degraded { error } => (
+            Severity::Critical,
+            "recording degraded — history writes are failing".to_string(),
+            format!(
+                "the live view keeps running, but nothing is reaching the history \
+                 database, so this period will NOT be replayable; first error: {error}"
+            ),
+        ),
+        WriteTransition::Recovered { lost } => (
+            Severity::Warning,
+            format!("recording resumed — {lost} write(s) were lost"),
+            format!(
+                "history writes are succeeding again; the {lost} write(s) that failed are \
+                 gone and that span stays blank in replay rather than being backfilled"
+            ),
+        ),
+    };
+    Event {
+        ts_ms,
+        device: anchor,
+        kind: EventKind::RecordingDegraded,
+        severity,
+        confidence: Confidence::Fact,
+        title,
+        evidence,
+    }
+}
+
 fn recording_started_event(
     ts_ms: u64,
     anchor: DeviceId,
@@ -617,7 +654,10 @@ impl Engine {
                 Err(e) => (None, Some(e.to_string())),
             };
             let probe_dur = probe_start.elapsed();
-            let processes = backend.refresh_processes(id).unwrap_or_default();
+            // `None` = the process probe FAILED, which is not "no processes". Collapsing
+            // the two (this was `.unwrap_or_default()`) let a single failed probe narrate
+            // fact-grade process exits for everything the device was holding.
+            let processes = backend.refresh_processes(id).ok();
 
             // Device-lost / returned edges — the audit's silently-vanishing-device hole:
             // a device that stops answering (driver reset, NVML dying, eGPU unplug, xe
@@ -684,14 +724,17 @@ impl Engine {
                 events.extend(self.event_engine.observe(
                     id,
                     s,
-                    &processes,
+                    processes.as_deref(),
                     info.mem_total_bytes,
                     info.temp_slowdown_c,
                 ));
                 // Fold this frame into the persistent rollups (best-effort: a disk error
                 // never reaches here — the Recorder swallows it and the live view runs on).
+                // An unobservable process list records the device sample but no process
+                // rows: writing an empty set would persist "nothing was running" as if
+                // observed, and replay would read it back as fact.
                 if let Some(rec) = &mut self.recorder {
-                    rec.observe(id, s, &processes);
+                    rec.observe(id, s, processes.as_deref().unwrap_or(&[]));
                 }
             }
             frame_devices.push(FrameDevice {
@@ -701,6 +744,19 @@ impl Engine {
                 sample,
                 processes,
             });
+        }
+
+        // Persistence edges: the recorder swallowed any write error above, so ask it
+        // whether its ability to record just changed and narrate the edge. Done before
+        // the events are persisted below, so the degraded fact is itself in the batch —
+        // if THAT write also fails, the event still reaches the live story feed and
+        // `--on-event`, which is the point.
+        if let Some(rec) = &mut self.recorder {
+            if let Some(t) = rec.take_write_transition() {
+                if let Some((_, anchor, _)) = self.devices.first() {
+                    events.push(recording_degraded_event(now_ms(), anchor.clone(), &t));
+                }
+            }
         }
 
         // Persist and side-channel the events derived this tick.
@@ -1220,7 +1276,13 @@ impl Backoff {
         let mut all_idle = true;
         for (i, fd) in frame.devices.iter().enumerate() {
             let prev = self.prev.get(i).and_then(Option::as_ref);
-            if !device_is_idle(prev, fd.sample.as_ref(), &fd.processes) {
+            // Unobservable processes fall back to an empty slice for the IDLE decision
+            // only: device_is_idle reads process util as one activity signal among
+            // several, and an absent list must not by itself vote "busy" (which would
+            // pin a genuinely idle GPU at full poll rate) nor "idle" on its own — the
+            // device-level signals still decide. Nothing here is narrated or persisted.
+            let procs = fd.processes.as_deref().unwrap_or(&[]);
+            if !device_is_idle(prev, fd.sample.as_ref(), procs) {
                 all_idle = false;
             }
             if let (Some(slot), Some(s)) = (self.prev.get_mut(i), &fd.sample) {
@@ -1378,7 +1440,14 @@ impl Collector {
                                     // the same lie as a frozen chart. The kept list is
                                     // the device's last good data, which the per-device
                                     // stale affordances label once the device is lost.
-                                    sh.processes[i] = fd.processes.clone();
+                                    //
+                                    // The `if let` extends that guard to the narrower
+                                    // case the outer check misses: refresh_dynamic
+                                    // succeeding while refresh_processes alone fails.
+                                    // Same lie, same rule — keep the last good list.
+                                    if let Some(procs) = &fd.processes {
+                                        sh.processes[i] = procs.clone();
+                                    }
                                 }
                             }
                             // Device-lost edges ride in the frame's own events; fold
@@ -1584,7 +1653,9 @@ mod tests {
                     name: format!("dev{i}"),
                     mem_total_bytes: None,
                     sample,
-                    processes,
+                    // Backoff fixtures always script an OBSERVED list (possibly empty);
+                    // the unobservable case has its own test.
+                    processes: Some(processes),
                 })
                 .collect(),
             events: Vec::new(),

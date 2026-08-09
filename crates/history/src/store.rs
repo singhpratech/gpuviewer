@@ -48,7 +48,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 /// stamped HIGHER than this constant was written by a NEWER gpuviewer, and every write
 /// open refuses it with the file untouched ([`StoreError::SchemaTooNew`]) — this build
 /// must never migrate, prune, or down-stamp a shape it has never seen.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Retention windows. Public because the UI tells the user how far back history reaches
 /// ("10s detail for 48h, 1m for 30 days").
@@ -147,6 +147,18 @@ pub struct SampleRollup {
     pub throttle_thermal_n: u32,
     pub throttle_power_n: u32,
     pub throttle_hw_n: u32,
+    /// Frames in this bucket where the throttle bitmask was READABLE AT ALL, whatever it
+    /// said. Without this, `throttle_n == 0` is ambiguous — it means both "observed, and
+    /// the GPU was not throttling" and "never observable here" (wddm/apple by design,
+    /// NVML on a per-metric NOT_SUPPORTED) — and a replay reader flagging on `> 0` alone
+    /// silently renders a blind spot as an observed all-clear. That is the `None` ->
+    /// `Some(false)` conflation `DynamicSample::throttle` forbids, arriving through the
+    /// store instead of through the backend.
+    ///
+    /// Rows written before schema v3 default to 0, which reads as "unknown" — correct,
+    /// since those rows genuinely never recorded the distinction. `throttle_n > 0` on such
+    /// a row remains a fact and still renders as throttling.
+    pub throttle_observed_n: u32,
 }
 
 /// A downsampled per-process bucket. Keyed by (device, bucket, pid); a process spanning
@@ -190,10 +202,24 @@ pub struct ExportCounts {
 const SAMPLE_COLS: &str = "device_id, bucket_ms, n, util_min, util_avg, util_max, mem_avg, \
      mem_max, power_avg_mw, power_max_mw, temp_avg_c, temp_max_c, fan_max_pct, sm_clock_min, \
      sm_clock_avg, sm_clock_max, throttle_n, throttle_thermal_n, throttle_power_n, \
-     throttle_hw_n";
+     throttle_hw_n, throttle_observed_n";
 const PROC_COLS: &str =
     "device_id, bucket_ms, pid, name, kind, mem_max, util_avg, cpu_avg, container";
 const EVENT_COLS: &str = "ts_ms, device_id, kind, severity, confidence, title, evidence";
+
+/// `?1,?2,…,?N` for the N columns in one of the `*_COLS` lists above.
+///
+/// Derived rather than written out. The shared column constants exist so read, write and
+/// export cannot drift — but a hand-written VALUES clause reintroduces exactly that drift
+/// one level down, and it fails at RUNTIME ("20 values for 21 columns") rather than at
+/// compile time. Generating it means adding a column is a one-line change again.
+fn placeholders(cols: &str) -> String {
+    let n = cols.split(',').count();
+    (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Persistence failures. Per-metric absence is never one of these (it is `NULL` in the row);
 /// an error here means the database itself is unusable.
@@ -605,6 +631,7 @@ impl SqliteStore {
         // Migrations run after the base tables exist and before the version stamps, so a
         // database is only ever stamped with a shape it actually has.
         self.migrate_event_dedupe()?;
+        self.migrate_throttle_observed()?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         let now = now_ms_wall();
@@ -663,6 +690,44 @@ impl SqliteStore {
              CREATE UNIQUE INDEX idx_events_dedupe ON events (ts_ms, device_id, kind, title);
              COMMIT;",
         )?;
+        Ok(())
+    }
+
+    /// Schema v2 -> v3: add `throttle_observed_n` to both rollup tables.
+    ///
+    /// Before v3 a bucket could not say whether the throttle bitmask was readable, so
+    /// `throttle_n == 0` meant both "not throttling" and "could not see" — and replay
+    /// rendered the second as the first. The column separates them.
+    ///
+    /// Gated on the column's presence rather than `user_version`, matching
+    /// [`Self::migrate_event_dedupe`]: idempotent, self-healing if a stamp ever exists
+    /// without the column, and a cheap PRAGMA on every later open.
+    ///
+    /// ADD COLUMN is used deliberately instead of a table rebuild: it cannot fail on
+    /// existing data (unlike a CREATE UNIQUE), it is O(1) in SQLite regardless of row
+    /// count, and it preserves every existing row. `DEFAULT 0` leaves historical rows
+    /// reading as "observability unknown", which is the honest answer for buckets folded
+    /// by a binary that never tracked it — NOT "never throttled".
+    fn migrate_throttle_observed(&self) -> Result<(), StoreError> {
+        for table in ["samples_10s", "samples_1m"] {
+            let have: Option<i64> = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM pragma_table_info('{table}') \
+                         WHERE name = 'throttle_observed_n'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if have.is_none() {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} \
+                     ADD COLUMN throttle_observed_n INTEGER NOT NULL DEFAULT 0"
+                ))?;
+            }
+        }
         Ok(())
     }
 
@@ -739,8 +804,9 @@ impl SqliteStore {
         }
         let sql = format!(
             "INSERT OR REPLACE INTO {} ({SAMPLE_COLS}) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-            tier.samples_table()
+             VALUES ({})",
+            tier.samples_table(),
+            placeholders(SAMPLE_COLS)
         );
         let tx = self.conn.transaction()?;
         {
@@ -767,6 +833,7 @@ impl SqliteStore {
                     r.throttle_thermal_n as i64,
                     r.throttle_power_n as i64,
                     r.throttle_hw_n as i64,
+                    r.throttle_observed_n as i64,
                 ])?;
             }
         }
@@ -784,7 +851,8 @@ impl SqliteStore {
         {
             let mut stmt = tx.prepare_cached(&format!(
                 "INSERT OR REPLACE INTO processes_10s ({PROC_COLS}) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+                 VALUES ({})",
+                placeholders(PROC_COLS)
             ))?;
             for r in rows {
                 stmt.execute(params![
@@ -819,7 +887,8 @@ impl SqliteStore {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(&format!(
-                "INSERT OR IGNORE INTO events ({EVENT_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+                "INSERT OR IGNORE INTO events ({EVENT_COLS}) VALUES ({})",
+                placeholders(EVENT_COLS)
             ))?;
             for e in events {
                 stmt.execute(params![
@@ -1156,6 +1225,7 @@ fn sample_rollup_from_row(row: &rusqlite::Row) -> rusqlite::Result<SampleRollup>
         throttle_thermal_n: row.get::<_, i64>(17)? as u32,
         throttle_power_n: row.get::<_, i64>(18)? as u32,
         throttle_hw_n: row.get::<_, i64>(19)? as u32,
+        throttle_observed_n: row.get::<_, i64>(20)? as u32,
     })
 }
 
@@ -1332,6 +1402,7 @@ CREATE TABLE IF NOT EXISTS samples_10s (
     sm_clock_avg       INTEGER,
     sm_clock_max       INTEGER,
     throttle_n         INTEGER NOT NULL DEFAULT 0,
+    throttle_observed_n INTEGER NOT NULL DEFAULT 0,
     throttle_thermal_n INTEGER NOT NULL DEFAULT 0,
     throttle_power_n   INTEGER NOT NULL DEFAULT 0,
     throttle_hw_n      INTEGER NOT NULL DEFAULT 0,
@@ -1355,6 +1426,7 @@ CREATE TABLE IF NOT EXISTS samples_1m (
     sm_clock_avg       INTEGER,
     sm_clock_max       INTEGER,
     throttle_n         INTEGER NOT NULL DEFAULT 0,
+    throttle_observed_n INTEGER NOT NULL DEFAULT 0,
     throttle_thermal_n INTEGER NOT NULL DEFAULT 0,
     throttle_power_n   INTEGER NOT NULL DEFAULT 0,
     throttle_hw_n      INTEGER NOT NULL DEFAULT 0,
@@ -1459,6 +1531,96 @@ mod tests {
     }
 
     /// Forward-schema honesty (audit G9/P1-14): a database whose `user_version` is
+    /// A v2 database (no `throttle_observed_n`) must migrate in place on open, keep every
+    /// existing row, and read those rows back as observability-UNKNOWN — not as an
+    /// observed all-clear, which is exactly the claim the column exists to stop a reader
+    /// making.
+    ///
+    /// The v2 file is produced by building a real database and DROPPING the column, so
+    /// everything else about it is genuinely this build's schema and the test isolates
+    /// the migration instead of also testing a hand-copied CREATE TABLE.
+    #[test]
+    fn v2_database_migrates_and_old_rows_read_as_unknown() {
+        let scratch = Scratch::new();
+        let dev = DeviceId("gpu0".into());
+
+        {
+            let (mut store, _) =
+                SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+            store
+                .insert_sample_rollups(
+                    Tier::TenSec,
+                    &[SampleRollup {
+                        device_id: dev.clone(),
+                        bucket_ms: 10_000,
+                        n: 5,
+                        util_min: Some(42.0),
+                        util_avg: Some(42.0),
+                        util_max: Some(42.0),
+                        mem_avg: None,
+                        mem_max: None,
+                        power_avg_mw: None,
+                        power_max_mw: None,
+                        temp_avg_c: None,
+                        temp_max_c: None,
+                        fan_max_pct: None,
+                        sm_clock_min: None,
+                        sm_clock_avg: None,
+                        sm_clock_max: None,
+                        throttle_n: 0,
+                        // Written as OBSERVED; the DROP below is what makes it a v2 row,
+                        // so the assertion proves the migration's default, not this value.
+                        throttle_observed_n: 5,
+                        throttle_thermal_n: 0,
+                        throttle_power_n: 0,
+                        throttle_hw_n: 0,
+                    }],
+                )
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&scratch.path).unwrap();
+            for table in ["samples_10s", "samples_1m"] {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} DROP COLUMN throttle_observed_n"
+                ))
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+        }
+
+        let (store, was_reset) =
+            SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+        assert!(
+            !was_reset,
+            "a v2 file is old, not corrupt — it must not be quarantined"
+        );
+        let rows = store
+            .samples_between(&dev, 0, 1_000_000, Tier::TenSec)
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the pre-existing row must survive the migration"
+        );
+        assert_eq!(
+            rows[0].throttle_observed_n, 0,
+            "a v2 row never recorded observability, so it reads as unknown — NOT as an \
+             observed all-clear"
+        );
+
+        // Idempotent: reopening neither re-runs the ALTER nor loses anything.
+        drop(store);
+        let (store, _) = SqliteStore::open_recording(&scratch.path, DataSource::Real).unwrap();
+        assert_eq!(
+            store
+                .samples_between(&dev, 0, 1_000_000, Tier::TenSec)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     /// GREATER than this build's `SCHEMA_VERSION` — written by a newer gpuviewer — is
     /// refused on every write open with the upgrade message, and the refusal is a
     /// provable no-op on the file: byte-identical afterwards (marker row and the bumped

@@ -981,7 +981,8 @@ fn seed_demo(path: &Path, from_ms: u64, to_ms: u64) -> Result<(usize, usize)> {
             tick_events.extend(engine.observe(
                 id,
                 sample,
-                procs,
+                // The mock always observes its own process list.
+                Some(procs.as_slice()),
                 info.and_then(|i| i.mem_total_bytes),
                 info.and_then(|i| i.temp_slowdown_c),
             ));

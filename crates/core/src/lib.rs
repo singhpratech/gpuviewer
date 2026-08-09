@@ -75,7 +75,8 @@ mod tests {
             for (d, info) in devs.iter().zip(&infos) {
                 let s = b.refresh_dynamic(d).unwrap();
                 let p = b.refresh_processes(d).unwrap();
-                for e in engine.observe(d, &s, &p, info.mem_total_bytes, info.temp_slowdown_c) {
+                for e in engine.observe(d, &s, Some(&p), info.mem_total_bytes, info.temp_slowdown_c)
+                {
                     kinds.insert(e.kind);
                 }
             }
@@ -121,10 +122,73 @@ mod tests {
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
         };
-        let events = engine.observe(&dev, &sample, &procs, Some(1 << 30), None);
+        let events = engine.observe(&dev, &sample, Some(&procs), Some(1 << 30), None);
         assert!(
             events.is_empty(),
             "first observation must not narrate preexisting processes"
+        );
+    }
+
+    /// A failed process probe (`None`) must never look like an empty process list.
+    /// `Some(&[])` says "nobody is attached" and correctly narrates the exit; `None` says
+    /// "nobody could look", and narrating a fact-grade exit off that invents an event that
+    /// never happened — the failure this engine exists to prevent.
+    #[test]
+    fn unobservable_process_list_narrates_no_exit() {
+        let mk = |ts_ms: u64| DynamicSample {
+            ts_ms,
+            util_pct: Some(90.0),
+            util_engine: None,
+            mem_used_bytes: Some(20 << 30),
+            power_mw: None,
+            temp_c: None,
+            fan_pct: None,
+            sm_clock_mhz: None,
+            mem_clock_mhz: None,
+            encoder_pct: None,
+            decoder_pct: None,
+            throttle: Some(ThrottleReasons::default()),
+        };
+        let procs = vec![ProcessSample {
+            pid: 4521,
+            name: "python".into(),
+            kind: ProcessKind::Compute,
+            mem_bytes: Some(20 << 30),
+            util_pct: Some(96.0),
+            cpu_pct: None,
+            container: None,
+        }];
+        let dev = DeviceId("test".into());
+
+        // Baseline: an OBSERVED empty list is a real exit and must still narrate.
+        let mut engine = EventEngine::new();
+        engine.register_device(dev.clone(), "GPU0".into());
+        engine.observe(&dev, &mk(1_000), Some(&procs), Some(1 << 35), None);
+        let seen = engine.observe(&dev, &mk(2_000), Some(&[]), Some(1 << 35), None);
+        assert!(
+            seen.iter().any(|e| e.kind == EventKind::ProcessExited),
+            "an observed empty list is a real exit and must narrate it"
+        );
+
+        // The fix: the same transition, unobservable, narrates nothing.
+        let mut engine = EventEngine::new();
+        engine.register_device(dev.clone(), "GPU0".into());
+        engine.observe(&dev, &mk(1_000), Some(&procs), Some(1 << 35), None);
+        let blind = engine.observe(&dev, &mk(2_000), None, Some(1 << 35), None);
+        assert!(
+            !blind.iter().any(|e| e.kind == EventKind::ProcessExited),
+            "a failed probe must not narrate an exit: {blind:?}"
+        );
+
+        // The holder is not forgotten either: when the probe recovers with the same
+        // process still attached, nothing spurious fires in either direction.
+        let back = engine.observe(&dev, &mk(3_000), Some(&procs), Some(1 << 35), None);
+        assert!(
+            !back.iter().any(|e| matches!(
+                e.kind,
+                EventKind::ProcessExited | EventKind::ProcessAttached
+            )),
+            "a process present before and after a blind tick neither left nor arrived: {back:?}"
         );
     }
 
@@ -154,12 +218,24 @@ mod tests {
         let run = |end_clock: u32| -> Event {
             let mut engine = EventEngine::new();
             let dev = DeviceId("test".into());
-            engine.observe(&dev, &sample(1_000, 2400, false), &[], Some(1 << 34), None);
-            engine.observe(&dev, &sample(2_000, 1800, true), &[], Some(1 << 34), None);
+            engine.observe(
+                &dev,
+                &sample(1_000, 2400, false),
+                Some(&[]),
+                Some(1 << 34),
+                None,
+            );
+            engine.observe(
+                &dev,
+                &sample(2_000, 1800, true),
+                Some(&[]),
+                Some(1 << 34),
+                None,
+            );
             let events = engine.observe(
                 &dev,
                 &sample(3_000, end_clock, false),
-                &[],
+                Some(&[]),
                 Some(1 << 34),
                 None,
             );
@@ -222,7 +298,7 @@ mod tests {
         let mut engine = EventEngine::new();
         let dev = DeviceId("blind".into());
         for ts in (1_000..=20_000).step_by(1000) {
-            let events = engine.observe(&dev, &sample(ts, None), &[], Some(1 << 34), None);
+            let events = engine.observe(&dev, &sample(ts, None), Some(&[]), Some(1 << 34), None);
             assert!(
                 events.iter().all(
                     |e| e.kind != EventKind::ThrottleStart && e.kind != EventKind::ThrottleEnd
@@ -235,17 +311,29 @@ mod tests {
         // returns quiet, NO ThrottleEnd fires (the end was never observed).
         let mut engine = EventEngine::new();
         let dev = DeviceId("gap".into());
-        engine.observe(&dev, &sample(1_000, quiet), &[], Some(1 << 34), None);
-        let started = engine.observe(&dev, &sample(2_000, thermal), &[], Some(1 << 34), None);
+        engine.observe(&dev, &sample(1_000, quiet), Some(&[]), Some(1 << 34), None);
+        let started = engine.observe(
+            &dev,
+            &sample(2_000, thermal),
+            Some(&[]),
+            Some(1 << 34),
+            None,
+        );
         assert!(started.iter().any(|e| e.kind == EventKind::ThrottleStart));
-        engine.observe(&dev, &sample(3_000, None), &[], Some(1 << 34), None);
-        let resumed = engine.observe(&dev, &sample(4_000, quiet), &[], Some(1 << 34), None);
+        engine.observe(&dev, &sample(3_000, None), Some(&[]), Some(1 << 34), None);
+        let resumed = engine.observe(&dev, &sample(4_000, quiet), Some(&[]), Some(1 << 34), None);
         assert!(
             resumed.iter().all(|e| e.kind != EventKind::ThrottleEnd),
             "an end never observed must not be narrated after a blind spot"
         );
         // And a throttle observed AFTER the blind spot opens a fresh episode normally.
-        let restarted = engine.observe(&dev, &sample(5_000, thermal), &[], Some(1 << 34), None);
+        let restarted = engine.observe(
+            &dev,
+            &sample(5_000, thermal),
+            Some(&[]),
+            Some(1 << 34),
+            None,
+        );
         assert!(
             restarted.iter().any(|e| e.kind == EventKind::ThrottleStart),
             "observation returning must re-arm the episode tracker"
@@ -278,11 +366,11 @@ mod tests {
         let mut ts = 0u64;
         let mut used = 8 << 30;
         for _ in 0..70 {
-            engine.observe(&dev, &mk(ts, used), &[], Some(total), None);
+            engine.observe(&dev, &mk(ts, used), Some(&[]), Some(total), None);
             ts += 1000;
             used += 64 << 20; // +64 MiB/s
         }
-        engine.observe(&dev, &mk(ts, 4 << 30), &[], Some(total), None);
+        engine.observe(&dev, &mk(ts, 4 << 30), Some(&[]), Some(total), None);
         ts += 1000;
 
         // Immediately at high usage again: window restarted, so the minimum span is not
@@ -290,7 +378,7 @@ mod tests {
         let events = engine.observe(
             &dev,
             &mk(ts, (total as f64 * 0.9) as u64),
-            &[],
+            Some(&[]),
             Some(total),
             None,
         );
@@ -341,7 +429,7 @@ mod tests {
             let mut used = (total as f64 * 0.86) as u64;
             let mut hits = Vec::new();
             for _ in 0..=13 {
-                let events = engine.observe(&dev, &mk(ts, used), &procs, Some(total), None);
+                let events = engine.observe(&dev, &mk(ts, used), Some(&procs), Some(total), None);
                 hits.extend(
                     events
                         .into_iter()
@@ -413,7 +501,7 @@ mod tests {
             out.extend(engine.observe(
                 dev,
                 &idle_sample(ts, util_pct),
-                procs,
+                Some(procs),
                 Some(16 << 30),
                 None,
             ));
@@ -600,7 +688,13 @@ mod tests {
     ) -> Vec<Event> {
         let mut out = Vec::new();
         for ts in ts_range.step_by(1000) {
-            out.extend(engine.observe(dev, &opt_sample(ts, util_pct), procs, Some(16 << 30), None));
+            out.extend(engine.observe(
+                dev,
+                &opt_sample(ts, util_pct),
+                Some(procs),
+                Some(16 << 30),
+                None,
+            ));
         }
         out
     }

@@ -25,6 +25,7 @@ const DOCUMENTED_KINDS: &[&str] = &[
     "device_returned",
     "recording_started",
     "recording_stopped",
+    "recording_degraded",
 ];
 
 const DOCUMENTED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
@@ -93,6 +94,14 @@ fn assert_frame_device(dev: &Value) {
             "throttle.{key} must be a boolean when throttle is observed: {throttle:?}"
         );
     }
+    // Nullable per spec: null = probe failed (unknown), [] = observed empty. The mock
+    // always observes, so this run must produce a real array — but the field being
+    // ABSENT would also satisfy `.as_array()` returning None, so assert non-null first
+    // to keep the two failure modes distinguishable.
+    assert!(
+        !dev["processes"].is_null(),
+        "mock backend observes its process list, so it must not serialize as null: {dev}"
+    );
     let procs = dev["processes"]
         .as_array()
         .unwrap_or_else(|| panic!("processes must be an array: {dev}"));

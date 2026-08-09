@@ -169,7 +169,8 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" util {latest_util}{engine_tag}{stale_tag} ")),
+                .title(format!(" util {latest_util}{engine_tag}{stale_tag} "))
+                .title_bottom(duty_cycle_caveat()),
         )
         .x_axis(Axis::default().bounds([-CHART_WINDOW_S, 0.0]))
         .y_axis(
@@ -267,7 +268,8 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" util {cursor_util} REPLAY ")),
+                .title(format!(" util {cursor_util} REPLAY "))
+                .title_bottom(duty_cycle_caveat()),
         )
         .x_axis(
             Axis::default()
@@ -307,8 +309,11 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
         },
     );
 
-    // Gauge row reads the bucket at the cursor. `throttle_n` counts frames in the bucket
-    // with any throttle bit set — a recorded fact, so flagging on >0 is honest.
+    // Gauge row reads the bucket at the cursor. Three states, not two: `throttle_n > 0`
+    // is an observed throttle (fact); zero WITH observations is an observed all-clear;
+    // zero with NO observations is a blind spot, and must render "n/a" exactly as live
+    // does — flagging on `throttle_n > 0` alone reported every unobservable source as
+    // quiet, which is the one thing replay must never do.
     render_gauges(
         f,
         gauges_a,
@@ -317,11 +322,42 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
             power_limit_mw: info.power_limit_mw,
             temp_c: at.and_then(|r| r.temp_max_c),
             temp_slowdown_c: info.temp_slowdown_c,
-            throttling: at.map(|r| r.throttle_n > 0),
+            throttling: at.and_then(|r| bucket_throttling(r.throttle_n, r.throttle_observed_n)),
             fan_pct: at.and_then(|r| r.fan_max_pct),
             sm_clock_mhz: at.and_then(|r| r.sm_clock_avg),
         },
     );
+}
+
+/// The temp gauge's fill, or `None` when there is nothing to be a fraction OF.
+///
+/// A gauge's fill is a claim about proportion — "this far toward the limit". When the
+/// driver never reported a slowdown threshold there is no limit to be a proportion of,
+/// and filling toward an assumed one (this used to default to 95 °C) puts a number on
+/// screen that no source ever produced. `None` means the caller draws an empty bar and
+/// says why; a two-thirds-full bar against an invented ceiling says something false.
+fn temp_gauge_ratio(temp_c: f32, slowdown_c: Option<f32>) -> Option<f64> {
+    slowdown_c
+        .filter(|s| *s > 0.0)
+        .map(|s| (temp_c as f64 / s as f64).clamp(0.0, 1.0))
+}
+
+/// Replay's throttle reading for one recorded bucket — three states, not two.
+///
+/// `throttle_n` alone cannot answer this: zero means both "observed, and it was not
+/// throttling" and "nothing here could ever see the bitmask" (wddm and apple by design,
+/// NVML on a per-metric NOT_SUPPORTED, and every row written before schema v3). Reading
+/// `throttle_n > 0` as the whole answer reported every blind bucket as an observed
+/// all-clear — the live gauge has always distinguished the two, and replay must match it,
+/// because replay is the mode this product is FOR.
+fn bucket_throttling(throttle_n: u32, throttle_observed_n: u32) -> Option<bool> {
+    match (throttle_n, throttle_observed_n) {
+        // An observed-active frame is a fact regardless of the observed count, so a v2
+        // row that recorded throttling still reads as throttling after migration.
+        (n, _) if n > 0 => Some(true),
+        (_, 0) => None,
+        _ => Some(false),
+    }
 }
 
 /// Consecutive points farther apart than this are not bridged: the trace breaks and the
@@ -435,6 +471,20 @@ struct VramChartCtx<'a> {
 
 /// The VRAM chart, shared by live (raw ring samples) and replay (bucket averages): only
 /// the points and the per-mode context differ.
+/// The mandatory duty-cycle qualifier for the util chart.
+///
+/// Every vendor's "utilization" here means *the fraction of time at least one kernel was
+/// resident* — not how much of the GPU's capacity was used. A device sitting at "100%"
+/// can be nowhere near compute- or bandwidth-bound. The number is honest; presenting it
+/// bare as "util" is what misleads, so the qualifier renders with the chart rather than
+/// living only in the README.
+fn duty_cycle_caveat() -> Line<'static> {
+    Line::styled(
+        " duty-cycle: time ≥1 kernel resident, not saturation ",
+        Style::default().fg(Color::DarkGray).italic(),
+    )
+}
+
 fn render_vram_chart(
     f: &mut Frame,
     area: Rect,
@@ -840,15 +890,26 @@ fn render_gauges(f: &mut Frame, area: Rect, v: &GaugeValues) {
 
     let (t_ratio, t_label, t_color) = match v.temp_c {
         Some(t) => {
-            let max = v.temp_slowdown_c.unwrap_or(95.0) as f64;
+            // A gauge's FILL is a claim about proportion: "this far toward the limit".
+            // Making one up when the limit is unknown (this was `unwrap_or(95.0)`) puts a
+            // number on screen that no source ever reported — a bar reading two-thirds
+            // full against a slowdown point the driver never gave us. When the threshold
+            // is absent the bar makes no proportional claim at all and the label says why,
+            // so an empty bar reads as "no scale" rather than "cold".
+            let scale = temp_gauge_ratio(t, v.temp_slowdown_c);
+            let throttle_note = match v.throttling {
+                Some(true) => " ⚠ THROTTLING",
+                Some(false) => "",
+                // Unobservable ≠ quiet: say so where the flag would appear.
+                None => " · throttle n/a",
+            };
+            let label = match scale {
+                Some(_) => format!("{t:.0}°C{throttle_note}"),
+                None => format!("{t:.0}°C{throttle_note} · scale n/a"),
+            };
             (
-                (t as f64 / max).clamp(0.0, 1.0),
-                match v.throttling {
-                    Some(true) => format!("{t:.0}°C ⚠ THROTTLING"),
-                    Some(false) => format!("{t:.0}°C"),
-                    // Unobservable ≠ quiet: say so where the flag would appear.
-                    None => format!("{t:.0}°C · throttle n/a"),
-                },
+                scale.unwrap_or(0.0),
+                label,
                 if v.throttling == Some(true) {
                     Color::Red
                 } else {
@@ -1303,6 +1364,7 @@ mod tests {
             sm_clock_avg: None,
             sm_clock_max: None,
             throttle_n: 0,
+            throttle_observed_n: 0,
             throttle_thermal_n: 0,
             throttle_power_n: 0,
             throttle_hw_n: 0,
@@ -1481,6 +1543,77 @@ mod tests {
     /// A source that cannot observe throttling (`throttle: None`, §5.4) must read
     /// "throttle n/a" on the temp gauge — an explicit blind spot, never an implied
     /// "not throttling".
+    /// Replay must read a recorded bucket in the same three states the live gauge does.
+    /// Before `throttle_observed_n` existed, replay flagged on `throttle_n > 0` alone, so
+    /// every bucket from a source that cannot see the bitmask — and every row written by
+    /// an older build — rendered as an observed all-clear. That is the None-as-Some(false)
+    /// conflation the model forbids, arriving through the store.
+    #[test]
+    fn replay_bucket_throttle_has_three_states() {
+        assert_eq!(
+            super::bucket_throttling(0, 0),
+            None,
+            "no observations = unknown, NOT an all-clear"
+        );
+        assert_eq!(
+            super::bucket_throttling(0, 6),
+            Some(false),
+            "six frames looked and none was throttling = a real all-clear"
+        );
+        assert_eq!(
+            super::bucket_throttling(2, 6),
+            Some(true),
+            "an observed-active frame is throttling"
+        );
+        assert_eq!(
+            super::bucket_throttling(2, 0),
+            Some(true),
+            "a v2 row that recorded throttling stays a fact after migration, even though \
+             it never recorded an observed count"
+        );
+    }
+
+    /// A gauge's fill is a claim about proportion. With no reported slowdown threshold
+    /// there is nothing to be a proportion of, so the bar must make no claim at all — it
+    /// used to fill toward a hardcoded 95 °C, putting a ratio on screen no source gave.
+    #[test]
+    fn temp_gauge_makes_no_proportional_claim_without_a_threshold() {
+        assert_eq!(
+            super::temp_gauge_ratio(70.0, None),
+            None,
+            "no threshold reported = no proportional claim"
+        );
+        assert_eq!(
+            super::temp_gauge_ratio(42.0, Some(84.0)),
+            Some(0.5),
+            "a real threshold gives a real fraction"
+        );
+        assert_eq!(
+            super::temp_gauge_ratio(99.0, Some(84.0)),
+            Some(1.0),
+            "over the threshold clamps rather than overflowing the bar"
+        );
+        assert_eq!(
+            super::temp_gauge_ratio(70.0, Some(0.0)),
+            None,
+            "a zero threshold is not a scale — dividing by it would read as infinitely hot"
+        );
+    }
+
+    /// CLAUDE.md's standing rule: utilization is duty-cycle, never presented as capacity.
+    /// The qualifier belongs on the chart, not only in the README.
+    #[test]
+    fn util_chart_carries_the_duty_cycle_qualifier() {
+        let collector = test_collector(None);
+        let shared = Arc::clone(&collector.shared);
+        let app = App::new(collector);
+        let screen = draw(&app, &shared);
+        assert!(
+            screen.contains("duty-cycle"),
+            "the util chart must label what the number actually measures:\n{screen}"
+        );
+    }
+
     #[test]
     fn unobservable_throttle_reads_na_not_quiet() {
         // Stationary collector: no tick thread to overwrite the injected sample.

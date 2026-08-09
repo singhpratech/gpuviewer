@@ -152,6 +152,7 @@ struct SampleAccum {
     throttle_thermal_n: u32,
     throttle_power_n: u32,
     throttle_hw_n: u32,
+    throttle_observed_n: u32,
 }
 
 impl SampleAccum {
@@ -167,6 +168,9 @@ impl SampleAccum {
         // counters are counts of *observed-active* frames, so an unobservable source
         // recording all day still reports zero — a gap, not an asserted "never
         // throttled" tally.
+        // ...and this counter is how a reader tells that gap FROM a zero. Without it the
+        // distinction the comment above draws exists only at write time.
+        self.throttle_observed_n += s.throttle.is_some() as u32;
         if let Some(t) = s.throttle {
             let (any, thermal, power_cap, hw) = store::throttle_flags(&t);
             self.throttle_n += any as u32;
@@ -199,6 +203,7 @@ impl SampleAccum {
             throttle_thermal_n: self.throttle_thermal_n,
             throttle_power_n: self.throttle_power_n,
             throttle_hw_n: self.throttle_hw_n,
+            throttle_observed_n: self.throttle_observed_n,
         })
     }
 
@@ -292,6 +297,25 @@ pub struct Recorder {
     /// the next prune's retention cutoff).
     flushes_since_prune: u64,
     newest_ts_ms: u64,
+    /// Write failures since the last time the caller drained a transition, and the first
+    /// error of the current failing streak. The Recorder still refuses to propagate the
+    /// error (a full disk must not kill the live view), but it no longer forgets it —
+    /// see [`Recorder::take_write_transition`].
+    failing: bool,
+    fails_in_streak: u64,
+    streak_error: Option<String>,
+    pending: Option<WriteTransition>,
+}
+
+/// An edge in the recorder's ability to persist, drained by the collector and narrated as
+/// a fact. Only EDGES are reported: a full disk fails on every single write, and a
+/// per-write event would bury the story it is trying to tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteTransition {
+    /// Writes just started failing. Carries the first error of this streak.
+    Degraded { error: String },
+    /// Writes just started succeeding again, after `lost` failed writes.
+    Recovered { lost: u64 },
 }
 
 impl Recorder {
@@ -301,7 +325,48 @@ impl Recorder {
             devices: HashMap::new(),
             flushes_since_prune: 0,
             newest_ts_ms: 0,
+            failing: false,
+            fails_in_streak: 0,
+            streak_error: None,
+            pending: None,
         }
+    }
+
+    /// Record the outcome of one store write, collapsing a run of them into edges.
+    fn note_write<T>(&mut self, r: Result<T, StoreError>) {
+        match r {
+            Ok(_) => {
+                if self.failing {
+                    self.failing = false;
+                    self.pending = Some(WriteTransition::Recovered {
+                        lost: self.fails_in_streak,
+                    });
+                    self.fails_in_streak = 0;
+                    self.streak_error = None;
+                }
+            }
+            Err(e) => {
+                self.fails_in_streak += 1;
+                if !self.failing {
+                    self.failing = true;
+                    let msg = e.to_string();
+                    self.streak_error = Some(msg.clone());
+                    self.pending = Some(WriteTransition::Degraded { error: msg });
+                }
+            }
+        }
+    }
+
+    /// Take the pending persistence edge, if any. The collector calls this once per tick
+    /// and narrates the result; nothing else observes it.
+    pub fn take_write_transition(&mut self) -> Option<WriteTransition> {
+        self.pending.take()
+    }
+
+    /// True while writes are failing — for a caller that wants the state rather than the
+    /// edge (the session stop mark checks it so a clean-shutdown claim stays honest).
+    pub fn is_degraded(&self) -> bool {
+        self.failing
     }
 
     /// Borrow the underlying store (for reads/`register_device`/replay queries).
@@ -378,26 +443,32 @@ impl Recorder {
         }
 
         for (tier, rollup) in sample_flushes {
-            // A persistence failure must not crash the collector: the live view keeps working
-            // even if the disk is full. Drop the rollup and move on.
-            let _ = self.store.insert_sample_rollups(tier, &[rollup]);
+            // A persistence failure must not crash the collector: the live view keeps
+            // working even if the disk is full. Drop the rollup and move on — but RECORD
+            // that it happened, so the collector can narrate it. Dropping data silently
+            // is the failure the flight-recorder promise cannot survive.
+            let r = self.store.insert_sample_rollups(tier, &[rollup]);
+            self.note_write(r);
         }
         if let Some(rows) = proc_flush {
-            let _ = self.store.insert_process_rollups(&rows);
+            let r = self.store.insert_process_rollups(&rows);
+            self.note_write(r);
         }
 
         if crossed_10s {
             self.flushes_since_prune += 1;
             if self.flushes_since_prune >= PRUNE_EVERY_FLUSHES {
                 self.flushes_since_prune = 0;
-                let _ = self.store.prune(self.newest_ts_ms);
+                let r = self.store.prune(self.newest_ts_ms);
+                self.note_write(r);
             }
         }
     }
 
     /// Append derived events to the store. Pass-through to [`SqliteStore::insert_events`].
     pub fn record_events(&mut self, events: &[Event]) {
-        let _ = self.store.insert_events(events);
+        let r = self.store.insert_events(events);
+        self.note_write(r);
     }
 
     /// Force-write every device's partial buckets (call on shutdown so the last, incomplete
@@ -436,9 +507,12 @@ impl Recorder {
             .filter(|(t, _)| *t == Tier::OneMin)
             .map(|(_, r)| r.clone())
             .collect();
-        let _ = self.store.insert_sample_rollups(Tier::TenSec, &tens);
-        let _ = self.store.insert_sample_rollups(Tier::OneMin, &mins);
-        let _ = self.store.insert_process_rollups(&procs);
+        let r = self.store.insert_sample_rollups(Tier::TenSec, &tens);
+        self.note_write(r);
+        let r = self.store.insert_sample_rollups(Tier::OneMin, &mins);
+        self.note_write(r);
+        let r = self.store.insert_process_rollups(&procs);
+        self.note_write(r);
     }
 }
 
@@ -938,6 +1012,7 @@ mod tests {
             sm_clock_avg: None,
             sm_clock_max: None,
             throttle_n: 0,
+            throttle_observed_n: 1,
             throttle_thermal_n: 0,
             throttle_power_n: 0,
             throttle_hw_n: 0,
@@ -1458,6 +1533,7 @@ mod tests {
             sm_clock_avg: None,
             sm_clock_max: None,
             throttle_n: 0,
+            throttle_observed_n: 1,
             throttle_thermal_n: 0,
             throttle_power_n: 0,
             throttle_hw_n: 0,
@@ -1497,6 +1573,7 @@ mod tests {
             sm_clock_avg: None,
             sm_clock_max: None,
             throttle_n: 0,
+            throttle_observed_n: 1,
             throttle_thermal_n: 0,
             throttle_power_n: 0,
             throttle_hw_n: 0,

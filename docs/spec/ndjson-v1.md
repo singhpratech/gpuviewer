@@ -35,6 +35,10 @@ asserts the output against this contract.
   So `util_pct`, `encoder_pct`, `decoder_pct`, and per-process `util_pct` can honestly land
   above 100 from such sources. A value over 100 is real data, never corruption — consumers
   must not reject or "fix" it.
+- **An unknown process list is `null`, never `[]`.** A failed process probe emits
+  `"processes": null`. An empty array is a positive claim that nothing was attached, and
+  the stream never makes that claim on the strength of a probe that did not answer. The
+  same rule governs narration: no `process_exited` event is derived from a failed probe.
 - **The process list may be incomplete.** Listing other users' processes requires
   privileges on most platforms; on WSL2 per-process GPU attribution is unavailable at the
   driver level. The device's `process_hint` (TUI-side) explains such gaps; absence of a
@@ -81,7 +85,7 @@ One per collection tick. Example (wrapped for readability — the stream never w
 | `name`            | string    | no       | Marketing/product name as reported by the driver. |
 | `mem_total_bytes` | integer   | yes      | Total device memory in bytes, so consumers can compute used/total without a second query. VRAM on discrete boards; on unified-memory devices (Apple Silicon) this is a **working-set budget**, not a VRAM capacity — the TUI labels it per device. `null` when the source does not expose it. |
 | `sample`          | object    | yes      | This tick's metrics (below). `null` when the device failed to answer this tick — the device is still listed so consumers see the gap. |
-| `processes`       | array of process objects | no | Processes attached to this device this tick. May be empty; may be incomplete (see honesty notes). |
+| `processes`       | array of process objects | **yes** | Processes attached to this device this tick. `[]` means the list was read and was empty. `null` means the process probe **failed** — the list is unknown, not empty. Consumers must not treat `null` as "nothing running". May be incomplete when non-null (see honesty notes). |
 
 ### Sample object
 
@@ -156,6 +160,7 @@ Emitted today:
 | `device_returned`  | fact       | A device previously declared lost answered again. The samples between loss and return were never collected; that gap stays blank in history, never zero-filled. Added additively under rules (b)/(c). |
 | `recording_started` | fact      | A recording session began folding history into the database — recorder lifecycle, not device behavior; only emitted when persistence is on. `evidence` carries the binary version, tick interval, backend names/device count, and database name. If the previous session never wrote its stop mark, the title says so: it ended uncleanly (crash, kill, or power loss) and the gap size is unknowable. Rides the first frame after startup. Added additively under rules (b)/(c). |
 | `recording_stopped` | fact      | The recording session ended cleanly; time after this mark is gpuviewer not running, never the GPU sitting idle. Emission choice: this line is the stream's final event when stdout is still open at shutdown (`--once`, a fatal collector stop); after a consumer hangup the stream is already gone, so the mark is recording-only. A killed process writes no mark at all — the next `recording_started` narrates that. Added additively under rules (b)/(c). |
+| `recording_degraded` | fact | History writes started failing (disk full, permissions, file removed), or started working again. The live view keeps running either way; this event is how the stream says the period is not being recorded. |
 
 ## Compatibility promise
 

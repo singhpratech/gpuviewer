@@ -70,6 +70,15 @@ pub enum EventKind {
     /// power loss — writes nothing, which is itself information: the NEXT session's
     /// start mark narrates the missing stop. Always `Confidence::Fact`.
     RecordingStopped,
+    /// Writes to the history database started failing (disk full, permissions revoked,
+    /// the file removed under a running session) — or, on the recovery edge, started
+    /// working again. The recorder swallows the error itself so a bad disk never takes
+    /// the live view down with it, but swallowing it SILENTLY is the one thing it must
+    /// not do: this product's entire promise is that you can scroll back, and a recorder
+    /// that quietly stopped recording breaks that promise exactly when it matters. The
+    /// same rule the collector applies to its own stalls, applied to its own storage.
+    /// Emitted by the tui collector. Always `Confidence::Fact`.
+    RecordingDegraded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,11 +234,23 @@ impl EventEngine {
             .unwrap_or_else(|| id.0.clone())
     }
 
+    /// Derive this tick's events.
+    ///
+    /// `processes` is `None` when the process list was **unobservable** — the backend's
+    /// process probe failed outright. That is emphatically not the same as `Some(&[])`,
+    /// which asserts the device really had no processes: an empty list makes every
+    /// previously-seen pid look like it exited, and `process_events` would narrate a
+    /// fact-grade "python (pid 4521) left GPU0, freeing 21.3 GiB" off a driver hiccup.
+    /// Fact-grade narration of an event that never happened is the failure mode this
+    /// project treats as fatal, so the unobservable case gets its own arm: the four
+    /// process-dependent derivations are skipped, and any inference resting on
+    /// *continuous* process observation is reset, because this tick broke that premise.
+    /// Device-level derivations (throttle, VRAM pressure) are unaffected and keep running.
     pub fn observe(
         &mut self,
         device: &DeviceId,
         sample: &DynamicSample,
-        processes: &[ProcessSample],
+        processes: Option<&[ProcessSample]>,
         mem_total: Option<u64>,
         temp_slowdown_c: Option<f32>,
     ) -> Vec<Event> {
@@ -238,14 +259,35 @@ impl EventEngine {
         let mut out = Vec::new();
 
         throttle_events(st, device, &name, sample, temp_slowdown_c, &mut out);
-        // Before process_events flips `seen_first_procs` / overwrites `st.procs`, so the
-        // newness diff that opens a spillover window sees this tick's arrivals.
-        spillover_events(st, device, &name, sample, processes, &mut out);
-        process_events(st, device, &name, sample.ts_ms, processes, &mut out);
-        // After process_events, so holder tracking sees this tick's process list.
-        hang_events(st, device, &name, sample, &mut out);
-        // After hang_events, so a hang that just fired can suppress the gap it lived in.
-        idle_gap_events(st, device, &name, sample, &mut out);
+        match processes {
+            Some(processes) => {
+                // Before process_events flips `seen_first_procs` / overwrites `st.procs`,
+                // so the newness diff that opens a spillover window sees this tick's
+                // arrivals.
+                spillover_events(st, device, &name, sample, processes, &mut out);
+                process_events(st, device, &name, sample.ts_ms, processes, &mut out);
+                // After process_events, so holder tracking sees this tick's process list.
+                hang_events(st, device, &name, sample, &mut out);
+                // After hang_events, so a hang that just fired can suppress the gap it
+                // lived in.
+                idle_gap_events(st, device, &name, sample, &mut out);
+            }
+            None => {
+                // Same discipline as `util_pct: None` below: drop the in-flight
+                // inferences rather than carry them across a blind tick. A hang claims a
+                // holder was resident for 10 unbroken minutes and an idle gap claims one
+                // stayed attached throughout — neither can be said across a tick where
+                // nobody could see the process list, and an open spillover window is
+                // judging a pid it can no longer observe.
+                st.hang = None;
+                st.idle_gap = None;
+                st.spillovers.clear();
+                // `st.procs` is deliberately LEFT INTACT: it is the last observed truth,
+                // not a claim about now. Clearing it would make every held process look
+                // like it exited on the next good tick — the same false narration by a
+                // slower route.
+            }
+        }
         vram_pressure_events(st, device, &name, sample, mem_total, &mut out);
 
         st.prev = Some(sample.clone());
@@ -873,7 +915,13 @@ mod tests {
     ) -> Vec<Event> {
         let mut out = Vec::new();
         for ts in ts_range.step_by(1000) {
-            out.extend(engine.observe(dev, &opt_sample(ts, util_pct), procs, Some(16 << 30), None));
+            out.extend(engine.observe(
+                dev,
+                &opt_sample(ts, util_pct),
+                Some(procs),
+                Some(16 << 30),
+                None,
+            ));
         }
         out
     }

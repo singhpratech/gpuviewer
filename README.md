@@ -110,8 +110,8 @@ irm https://raw.githubusercontent.com/singhpratech/gpuviewer/main/install.ps1 | 
 ```
 
 The scripts verify the download's SHA256 against the release's checksum file before
-installing, drop a single binary in your user bin dir, and never need root/admin. They
-work once the first release is tagged; until then `cargo build --release` always does.
+installing, drop a single binary in your user bin dir, and never need root/admin.
+`cargo build --release` works too, and always has.
 
 Packaged builds (Linux `tar.gz`/`.deb`/`.rpm`/AppImage, Windows `zip`, macOS `tar.gz` —
 with checksums and build-provenance attestations) are produced per release tag. Every
@@ -259,8 +259,7 @@ This project was built research-first, and the research is in the repo:
 
 ## Status
 
-**Working pre-release (v0.1.0).** Install paths:
-[`docs/packaging/installing.md`](docs/packaging/installing.md).
+**v0.1.0.** Install paths: [`docs/packaging/installing.md`](docs/packaging/installing.md).
 
 | Platform | Backends |
 |---|---|
@@ -273,7 +272,7 @@ box is to run it — and `--mock` works with no GPU at all. If something looks w
 [open an issue](https://github.com/singhpratech/gpuviewer/issues); reports from real
 hardware are the most useful thing you can send.
 
-Shipped — in the binary today:
+In the binary today:
 
 - **Backends:** NVIDIA (NVML, runtime-loaded — never hard-linked), AMD (sysfs/hwmon +
   versioned `gpu_metrics` throttle decoders v1.1–v3.0 + fdinfo), Intel (fdinfo in both the
@@ -301,13 +300,11 @@ Shipped — in the binary today:
 - **Tests:** the full suite passes on machines with no GPU — everything runs against the
   mock backend and committed sysfs/fdinfo fixture trees.
 
-In progress / not yet:
+Not in it yet:
 
-- First published binaries — the release pipeline (tar.gz/zip/deb/rpm, drafted per tag,
-  provenance-attested) is in-tree; artifacts appear with the next tagged release.
-- Soak across the full driver matrix — a manual pre-release checklist by design; CI stays
-  GPU-free so the suite runs anywhere.
-- iced GUI (v2) — see roadmap.
+- The iced GUI — see the roadmap below.
+- Soak across the full driver matrix, which is a manual checklist by design: CI stays
+  GPU-free so the whole suite runs on any machine, including yours.
 
 ## Architecture
 
@@ -390,16 +387,15 @@ lock on `<db>.lock`); a second gpuviewer opened by hand runs live-only and says 
 
 ### Roadmap
 
-- **v1.5 — Windows:** NVML + PDH dual-source — NVML for device truth, Windows GPU
-  performance counters for the per-process VRAM/util that NVML architecturally cannot see
-  under WDDM (an honest per-process number where Task Manager misleads). *Shipped.* The
-  cross-vendor WDDM backend (device + per-process AMD/Intel/NVIDIA via PDH) landed
-  alongside it.
-- **v2 — macOS Apple Silicon:** device-level telemetry only (per-process GPU is
-  OS-prohibited, and we say so in-UI rather than fake it) + an iced GUI from the same
-  core. *Device-level backend shipped; GUI not started.*
-- **v2+:** Prometheus exporter, multi-host views, vendor-depth Windows AMD/Intel beyond
-  the WDDM device tier.
+- **Windows** reads device truth from NVML and per-process VRAM/util from the Windows GPU
+  performance counters — the numbers NVML architecturally cannot see under WDDM, which is
+  where Task Manager misleads. The cross-vendor WDDM backend covers AMD and Intel (and
+  NVIDIA without NVML) over the same counters plus DXGI and D3DKMT.
+- **macOS Apple Silicon** reads device-level telemetry through Metal. Per-process GPU
+  attribution is prohibited by the OS for third-party tools, so the UI says so and blames
+  the OS rather than going quiet.
+- **Next:** an iced GUI on the same core, a Prometheus exporter, multi-host views, and
+  vendor-depth Windows AMD/Intel beyond what the WDDM counters expose.
 
 Deliberately not chasing: fan/OC control (LACT owns it), a daemon/client split ("always-on"
 means by virtue of normal use — for boot-time recording, run `gpuviewer --json` under your

@@ -510,6 +510,9 @@ fn sample_rollup(dev: &DeviceId, bucket_ms: u64) -> gpuviewer_history::SampleRol
         sm_clock_avg: Some(1500),
         sm_clock_max: Some(1800),
         throttle_n: 0,
+        // n=10 frames, all of which could read the bitmask: an observed all-clear, which
+        // must survive export/view as distinct from "never observable".
+        throttle_observed_n: 10,
         throttle_thermal_n: 0,
         throttle_power_n: 0,
         throttle_hw_n: 0,
