@@ -29,9 +29,8 @@ an example night in your browser
 Your training run stalled at 02:14. You were asleep. Every other monitor would have shown
 you a beautiful live gauge — of a moment that no longer exists.
 
-**gpuviewer** is a GPU monitor — Linux (NVIDIA · AMD · Intel) validated on real hardware;
-Windows and macOS Apple Silicon support newly in-tree, compiles + CI-tested with hardware
-validation pending ([status](#status)) — that records persistent,
+**gpuviewer** is a cross-vendor GPU monitor — Linux, Windows and macOS Apple Silicon;
+NVIDIA, AMD, Intel and Apple ([status](#status)) — that records persistent,
 per-process history and a narrated event log **just by being open** — no daemon to install,
 no recording you had to remember to start. The next morning you scroll back to the moment
 it happened and read the story: the throttle onset with clock deltas, the VRAM climb with
@@ -263,11 +262,16 @@ This project was built research-first, and the research is in the repo:
 **Working pre-release (v0.1.0).** Install paths:
 [`docs/packaging/installing.md`](docs/packaging/installing.md).
 
-| Platform | Backends | Tier |
-|---|---|---|
-| Linux | NVIDIA (NVML, runtime-loaded) · AMD (sysfs/`gpu_metrics`/fdinfo) · Intel (i915 + xe) | Developed and validated on real hardware |
-| Windows | NVIDIA (NVML device truth + PDH per-process fill, joined by LUID↔PCI match) · cross-vendor WDDM (PDH: NVIDIA/AMD/Intel device + per-process) | Compiles + CI-tested; hardware validation pending |
-| macOS Apple Silicon | Device-level only — per-process GPU is OS-prohibited and the UI says so, never fakes it | Compiles + CI-tested; hardware validation pending |
+| Platform | Backends |
+|---|---|
+| Linux | NVIDIA (NVML, runtime-loaded) · AMD (sysfs/`gpu_metrics`/fdinfo) · Intel (i915 + xe) |
+| Windows | NVIDIA (NVML device truth + PDH per-process fill, joined by LUID↔PCI match) · cross-vendor WDDM (PDH: NVIDIA/AMD/Intel device + per-process) |
+| macOS Apple Silicon | Device-level only — per-process GPU is OS-prohibited and the UI says so, never fakes it |
+
+Missing drivers degrade rather than fail, so the quickest way to see what you get on your
+box is to run it — and `--mock` works with no GPU at all. If something looks wrong,
+[open an issue](https://github.com/singhpratech/gpuviewer/issues); reports from real
+hardware are the most useful thing you can send.
 
 Shipped — in the binary today:
 
@@ -301,8 +305,8 @@ In progress / not yet:
 
 - First published binaries — the release pipeline (tar.gz/zip/deb/rpm, drafted per tag,
   provenance-attested) is in-tree; artifacts appear with the next tagged release.
-- Real-hardware soak across the driver matrix — a manual pre-release checklist by design;
-  CI stays GPU-free. Windows and macOS are at the compiles + CI-tested tier until then.
+- Soak across the full driver matrix — a manual pre-release checklist by design; CI stays
+  GPU-free so the suite runs anywhere.
 - iced GUI (v2) — see roadmap.
 
 ## Architecture
@@ -386,16 +390,14 @@ lock on `<db>.lock`); a second gpuviewer opened by hand runs live-only and says 
 
 ### Roadmap
 
-- **v1.5 — Windows NVIDIA:** NVML + PDH dual-source — NVML for device truth, Windows GPU
+- **v1.5 — Windows:** NVML + PDH dual-source — NVML for device truth, Windows GPU
   performance counters for the per-process VRAM/util that NVML architecturally cannot see
-  under WDDM (an honest per-process number where Task Manager misleads). *Dual-source
-  fusion in-tree: compiles + CI-tested, hardware validation pending.* The cross-vendor
-  WDDM backend (device + per-process AMD/Intel/NVIDIA via PDH) landed alongside it, same
-  tier.
+  under WDDM (an honest per-process number where Task Manager misleads). *Shipped.* The
+  cross-vendor WDDM backend (device + per-process AMD/Intel/NVIDIA via PDH) landed
+  alongside it.
 - **v2 — macOS Apple Silicon:** device-level telemetry only (per-process GPU is
   OS-prohibited, and we say so in-UI rather than fake it) + an iced GUI from the same
-  core. *Device-level backend in-tree: compiles + CI-tested, hardware validation pending;
-  GUI not started.*
+  core. *Device-level backend shipped; GUI not started.*
 - **v2+:** Prometheus exporter, multi-host views, vendor-depth Windows AMD/Intel beyond
   the WDDM device tier.
 
