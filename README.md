@@ -454,6 +454,6 @@ dual licensed as above, without any additional terms or conditions.
 
 <div align="center">
 
-&copy; Prateek Singh · [theaivibe.org/about](https://theaivibe.org/about)
+&copy; [Prateek Singh](https://theaivibe.org/about)
 
 </div>
