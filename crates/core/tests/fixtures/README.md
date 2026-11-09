@@ -47,6 +47,50 @@ new captures taken per kernel/driver release.
   the sentinel to `Some(all-false)` — before the sentinel guard this hardware narrated
   thermal+power+hw_slowdown+other on every sample, permanently. Minimal sysfs otherwise
   (no `pp_dpm_*`, no fan, no cap).
+- `amd-vega20-radeonvii-kernel6.8/` — models a Radeon VII (Vega 20, `1002:66af` rev `c1`):
+  full SOC15 dGPU hwmon in the real channel order (temp1 edge 71 °C, temp2 junction /
+  temp3 mem decoys, `temp1_crit` and `power1_cap_max` and `pwm1` decoys, fan RPM + max),
+  an `amdgpu.ids` with a same-device different-revision decoy line, and a `gpu_metrics`
+  **v1_0** blob (sizeof 80): legacy `throttle_status`@68 = 0x40 (ASIC-specific — decodes
+  only as coarse `other`), `current_fan_speed`@72 and pcie width/speed @74–75 as adjacent
+  decoys, and the 4-byte header pad @4–7 plus tail pad @76–79 filled with 0xFF (the swsmu
+  memset convention; whether Vega 20's powerplay path memsets the same way is unverified —
+  those bytes are never read either way).
+- `amd-mi300-kernel6.12/` — models an Instinct MI300X (`1002:74a1`, PCI id approximate)
+  on a kernel 6.7–6.12: hwmon with **no temp1/edge channel** (temp2 = junction 68 °C,
+  temp3 = mem 74 °C — the hotter decoy that must never be reported as device
+  temperature), `power1_input` only, no fan, no cap; and a `gpu_metrics` **v1_5** blob
+  (sizeof 360) laid out on the SMU's 0xFF memset: legacy `throttle_status`@104 = 0x2,
+  `system_clock_counter`@96 and `gfxclk_lock_status`@108 = 0xFF as adjacent decoys, idle
+  VCN clocks plus `padding`/tail pad @354–359 left 0xFF. No v1_7 blob is committed: the
+  6.13+ residency revisions' total sizeof is not pinned by the in-repo docs, so their
+  tests build blobs in-test at the literal prefix offsets instead of committing a
+  fabricated size. MI300 XCP partition topology vs PCI dedupe is **[HW-VERIFY]**.
+- `amd-polaris-rx580-kernel6.8/` — models an RX 580 (Polaris 20, `1002:67df` rev `e7`):
+  pre-SMU-metrics hardware with **no `gpu_metrics` node at all** (GC < 9.1.0 hides it),
+  so throttle must be `None`; full hwmon (edge temp1, `power1_average`, `power1_cap`, fan
+  RPM + max, `temp1_crit`/`pwm1` decoys), an 8-level `pp_dpm_sclk` in `Mhz` casing, and
+  one game pid (dota2) in the 6.8 fdinfo dialect.
+- `amd-phoenix-apu-kernel6.8/` — models a Phoenix APU (Radeon 780M, `1002:15bf` rev `c4`):
+  edge temp1 only, `power1_input` µW only, no fan/cap, a 512 MiB carve-out plus 15 GiB
+  `mem_info_gtt_*` (unread here), and a `gpu_metrics` **v2_1** blob (sizeof 120) with
+  legacy `throttle_status`@108 = 0 between a nonzero `current_l3clk` decoy @104 and the
+  0xFF'd `fan_pwm`/padding @112–119. `/proc` holds a GTT-dominant game pid 5150
+  (192 MiB VRAM, 2.5 GiB GTT, `amd-requested-*`/`amd-evicted-*` decoys) and a VAAPI
+  playback pid 6060 (mpv: `drm-engine-dec` plus a little gfx) that drives the
+  media-engine-counts-toward-util test.
+- `amd-fdinfo-kernel6.13/` — a minimal device (`1002:7550`) whose `/proc` carries the
+  standardized `drm_print_memory_stats` keys (`drm-total/shared/active/resident/
+  purgeable-{cpu,gtt,vram}`, bytes by default, scaled to KiB/MiB only when exactly
+  divisible). pid 3001 is forward-looking (legacy `drm-memory-*` alias removed, resident
+  "512 MiB", `drm-total-vram`/`amd-requested-vram` decoys); pid 3002 is 6.13-true (both
+  key families, "98308 KiB", agreeing); pid 3003 has a bare-bytes resident 12345678 whose
+  legacy alias floor-divides to 12056 KiB (the kernel-true decoy for a legacy-first
+  parser); pid 3004 is an idle client with no engine lines (util must stay `None`, not 0).
+- `amd-fdinfo-kernel5.15/` — a minimal device whose one client speaks the 5.14–5.18
+  fdinfo dialect (`pdev:`, `vram mem: … kB`, `gfx0: 37.5%`). That dialect is not parsed
+  (the parse gate is 5.19+), so the process probe reports Unavailable — an unknown list —
+  rather than an empty list that would claim nothing is attached.
 - `intel-i915-kernel6.8/` — models an Arc A770 dGPU (DG2, `8086:56a0`) on the in-tree
   i915 driver around kernel 6.8: card-level `gt_act_freq_mhz`/`gt_cur_freq_mhz`/
   `gt_RP0_freq_mhz` and `lmem_total_bytes`, hwmon with `power1_max` (µW) and the

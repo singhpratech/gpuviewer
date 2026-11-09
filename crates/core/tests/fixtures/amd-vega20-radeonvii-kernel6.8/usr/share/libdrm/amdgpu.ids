@@ -1,0 +1,6 @@
+# SYNTHETIC fixture (see the fixtures README) mirroring the libdrm amdgpu.ids format
+# device_id,	revision_id,	product_name
+1.0.0
+66A1,	02,	AMD Instinct MI60 / MI50
+66AF,	C0,	AMD Radeon Pro Vega II
+66AF,	C1,	AMD Radeon VII

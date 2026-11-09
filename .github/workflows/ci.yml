@@ -70,7 +70,7 @@ jobs:
               exit 1
             fi
           }
-          # Floors = enumerated counts on 2026-06-07.
-          check_floor amd_fixtures 19
+          # Floors = enumerated counts on 2026-11-08 (AMD/Intel Phase 2 fixture trees).
+          check_floor amd_fixtures 34
           check_floor intel_fixtures 43
           check_floor nvml_stub_loader 2
