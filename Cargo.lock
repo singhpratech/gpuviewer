@@ -599,6 +599,7 @@ version = "0.1.1"
 dependencies = [
  "core-foundation",
  "dlopen2",
+ "libc",
  "nvml-wrapper",
  "objc2",
  "objc2-foundation",

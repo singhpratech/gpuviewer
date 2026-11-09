@@ -1,0 +1,27 @@
+pos:	0
+flags:	02100002
+mnt_id:	24
+ino:	1510
+drm-driver:	xe
+drm-client-id:	41
+drm-pdev:	0000:03:00.0
+drm-total-system:	0
+drm-total-gtt:	16384 KiB
+drm-resident-gtt:	16384 KiB
+drm-total-vram0:	4194304 KiB
+drm-resident-vram0:	3145728 KiB
+drm-cycles-rcs:	300000
+drm-total-cycles-rcs:	80000000
+drm-engine-capacity-rcs:	1
+drm-cycles-bcs:	90000
+drm-total-cycles-bcs:	80000000
+drm-engine-capacity-bcs:	1
+drm-cycles-vcs:	0
+drm-total-cycles-vcs:	80000000
+drm-engine-capacity-vcs:	2
+drm-cycles-vecs:	0
+drm-total-cycles-vecs:	80000000
+drm-engine-capacity-vecs:	2
+drm-cycles-ccs:	64000000
+drm-total-cycles-ccs:	80000000
+drm-engine-capacity-ccs:	4

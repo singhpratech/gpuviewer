@@ -72,5 +72,5 @@ jobs:
           }
           # Floors = enumerated counts on 2026-06-07.
           check_floor amd_fixtures 19
-          check_floor intel_fixtures 23
+          check_floor intel_fixtures 43
           check_floor nvml_stub_loader 2

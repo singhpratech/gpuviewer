@@ -12,7 +12,9 @@
 //! - xe (Lunar Lake, Battlemage+): fdinfo `drm-cycles-*` / `drm-total-cycles-*` GT-clock
 //!   counters (6.11+), memory regions named `vram0`/`system`/`gtt` (6.8+),
 //!   `device/tile0/gt0/freq0/*` freq files, NO VRAM-total sysfs at all, hwmon package
-//!   temp on `temp2_input` — there is NO temp1, and temp3 is the VRAM sensor (6.15+).
+//!   temp on `temp2_input` — there is NO temp1, and temp3 is the VRAM sensor (6.15+);
+//!   hwmon power channels by scope, index 1 = card / index 2 = pkg (card preferred, pkg
+//!   fallback — see [`resolve_power_channel`]).
 //!
 //! Per the domain rules in CLAUDE.md:
 //! - Every path derives from a root-dir parameter (`with_root`), so the whole backend
@@ -81,7 +83,9 @@ fn known_gpu_name(device: &str) -> Option<&'static str> {
     Some(match device {
         "56a0" => "Intel Arc A770",
         "56a1" => "Intel Arc A750",
+        "56a2" => "Intel Arc A580",
         "56a5" => "Intel Arc A380",
+        "56a6" => "Intel Arc A310",
         "e20b" => "Intel Arc B580",
         "e20c" => "Intel Arc B570",
         _ => return None,
@@ -114,15 +118,80 @@ fn temp_c(hwmon: &Path, dialect: Dialect) -> Option<f32> {
     Some(millic as f32 / 1000.0)
 }
 
-/// `power1_max` (the sustained power limit — Intel hwmon has no `power1_cap`) is
+/// Which hwmon power/energy channel index a device's power numbers come from (research
+/// 07 §3.2.2). xe numbers its channels by SCOPE: index 1 = card, index 2 = pkg (the GPU
+/// package). i915 only ever exposes index 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerChannel {
+    /// `power1_max` / `energy1_input`.
+    Card,
+    /// `power2_max` / `energy2_input` — xe only.
+    Pkg,
+}
+
+impl PowerChannel {
+    fn max_file(self) -> &'static str {
+        match self {
+            PowerChannel::Card => "power1_max",
+            PowerChannel::Pkg => "power2_max",
+        }
+    }
+
+    fn energy_file(self) -> &'static str {
+        match self {
+            PowerChannel::Card => "energy1_input",
+            PowerChannel::Pkg => "energy2_input",
+        }
+    }
+}
+
+/// `StaticInfo::source_caveat` for an xe device whose power comes from the pkg channel:
+/// the number is GPU-package power, not the whole-card figure an NVIDIA/AMD board
+/// reports, and must not be read as if it were. (The model has no per-metric scope
+/// field; `source_caveat` is its existing honesty-label slot.)
+const PKG_POWER_CAVEAT: &str = "power: xe pkg (GPU package) channel, not whole-card power";
+
+/// Resolve the ONE channel both power numbers (limit and derived draw) come from.
+///
+/// i915: index 1 only — i915 hwmon has no pkg channel, so there is nothing to fall
+/// back to (and a stray index-2 file on i915 would be some other claim).
+///
+/// xe (§3.2.2): prefer card, fall back to pkg, `None` only when both are absent. Card
+/// energy is BMG/PMT-gated and pkg is what BMG and DG2-forced-on-xe expose, so a
+/// card-only read leaves pkg-only platforms at `None` while a real Some sits in sysfs.
+///
+/// The channel is chosen ONCE per device and shared by `power_limit_mw` and `power_mw`,
+/// never mixed per quantity: the TUI draws power as a fill of "draw / limit", and pkg
+/// draw over a card limit is a ratio of two different physical scopes — a
+/// confidently-wrong proportion. The energy counter (the live reading) decides the
+/// channel; the limit file only decides when neither channel has energy. If the chosen
+/// channel lacks a limit file the limit is honestly `None`, never borrowed from the
+/// other channel. Which channels exist per tag/SKU is [HW-VERIFY] in research 07
+/// §3.2.2 — the fallback order is the documented one, not a capture.
+fn resolve_power_channel(hwmon: &Path, dialect: Dialect) -> Option<PowerChannel> {
+    match dialect {
+        Dialect::I915 => Some(PowerChannel::Card),
+        Dialect::Xe => {
+            let readable = |file: &str| read_parse::<u64>(&hwmon.join(file)).is_some();
+            let by = |file: fn(PowerChannel) -> &'static str| {
+                [PowerChannel::Card, PowerChannel::Pkg]
+                    .into_iter()
+                    .find(|&ch| readable(file(ch)))
+            };
+            by(PowerChannel::energy_file).or_else(|| by(PowerChannel::max_file))
+        }
+    }
+}
+
+/// `power<N>_max` (the sustained PL1 power limit — Intel hwmon has no `power1_cap`) is
 /// MICROwatts; the model carries milliwatts.
-fn power_cap_mw(hwmon: &Path) -> Option<u32> {
-    let uw: u64 = read_parse(&hwmon.join("power1_max"))?;
+fn power_cap_mw(hwmon: &Path, ch: PowerChannel) -> Option<u32> {
+    let uw: u64 = read_parse(&hwmon.join(ch.max_file()))?;
     Some((uw / 1000) as u32)
 }
 
 /// i915/xe hwmon exposes no instantaneous power reading — only the cumulative
-/// `energy1_input` MICROjoule counter. Power is the delta between two sightings:
+/// `energy<N>_input` MICROjoule counter. Power is the delta between two sightings:
 /// ΔµJ / Δms = mW exactly. No baseline or a counter that went backwards → `None`.
 fn energy_delta_mw(prev_uj: u64, prev_ts_ms: u64, cur_uj: u64, cur_ts_ms: u64) -> Option<u32> {
     let wall_ms = cur_ts_ms.checked_sub(prev_ts_ms)?;
@@ -145,6 +214,11 @@ struct FdinfoDrm {
     video_ns: Option<u64>,
     venh_ns: Option<u64>,
     compute_ns: Option<u64>,
+    // `drm-engine-capacity-<class>` for the class utilization is computed from (i915
+    // `render`, xe `rcs`). Raw: absent stays `None` (the spec's "assume 1"); a present
+    // but zero/unparsable value is stored as `Some(0)` — see [`class_capacity`].
+    render_capacity: Option<u64>,
+    rcs_capacity: Option<u64>,
     // xe dialect: cumulative busy-cycles and the matching elapsed-cycles base, in
     // GT-clock ticks (NOT time units — see `cycles_util_pct`).
     rcs_cycles: Option<u64>,
@@ -173,6 +247,8 @@ impl FdinfoDrm {
         mx(&mut self.video_ns, other.video_ns);
         mx(&mut self.venh_ns, other.venh_ns);
         mx(&mut self.compute_ns, other.compute_ns);
+        mx(&mut self.render_capacity, other.render_capacity);
+        mx(&mut self.rcs_capacity, other.rcs_capacity);
         mx(&mut self.rcs_cycles, other.rcs_cycles);
         mx(&mut self.rcs_total_cycles, other.rcs_total_cycles);
         mx(&mut self.vcs_cycles, other.vcs_cycles);
@@ -231,6 +307,10 @@ fn parse_fdinfo(contents: &str) -> FdinfoDrm {
             "drm-engine-video" => out.video_ns = parse_suffixed(val, "ns"),
             "drm-engine-video-enhance" => out.venh_ns = parse_suffixed(val, "ns"),
             "drm-engine-compute" => out.compute_ns = parse_suffixed(val, "ns"),
+            // A present capacity key that is zero or garbage is kept as Some(0) (invalid),
+            // NOT folded into absence: absence legitimately means 1, garbage does not.
+            "drm-engine-capacity-render" => out.render_capacity = Some(val.parse().unwrap_or(0)),
+            "drm-engine-capacity-rcs" => out.rcs_capacity = Some(val.parse().unwrap_or(0)),
             "drm-cycles-rcs" => out.rcs_cycles = val.parse().ok(),
             "drm-total-cycles-rcs" => out.rcs_total_cycles = val.parse().ok(),
             "drm-cycles-vcs" => out.vcs_cycles = val.parse().ok(),
@@ -266,17 +346,37 @@ fn parse_mem_bytes(val: &str) -> Option<u64> {
     val.parse().ok()
 }
 
+/// Resolve a raw `drm-engine-capacity-<class>` value (drm-usage-stats): the number of
+/// identical hardware engines the class's counters are summed across. Absent → 1 (the
+/// spec's stated default). Zero is disallowed by the spec and garbage is not a number,
+/// so both → `None`: the class's utilization is refused rather than divided by a
+/// capacity we made up.
+fn class_capacity(raw: Option<u64>) -> Option<u64> {
+    match raw {
+        None => Some(1),
+        Some(0) => None,
+        Some(c) => Some(c),
+    }
+}
+
 /// i915 utilization: engine counters are cumulative busy-NANOSECONDS, so utilization is
-/// the busy delta over WALL time between two sightings. No baseline (first sighting) or
-/// a counter that went backwards (pid reuse re-created the client) → `None`, never a
-/// guess.
-fn engine_util_pct(prev_ns: u64, prev_ts_ms: u64, cur_ns: u64, cur_ts_ms: u64) -> Option<f32> {
+/// the busy delta over capacity × WALL time between two sightings — a class of N
+/// identical engines can accrue N × wall busy-ns. No baseline (first sighting) or a
+/// counter that went backwards (pid reuse re-created the client) → `None`, never a
+/// guess. The clamp is a last-resort guard against inconsistent counters, not the math.
+fn engine_util_pct(
+    prev_ns: u64,
+    prev_ts_ms: u64,
+    cur_ns: u64,
+    cur_ts_ms: u64,
+    capacity: u64,
+) -> Option<f32> {
     let wall_ms = cur_ts_ms.checked_sub(prev_ts_ms)?;
-    if wall_ms == 0 {
+    if wall_ms == 0 || capacity == 0 {
         return None;
     }
     let busy_ns = cur_ns.checked_sub(prev_ns)?;
-    let pct = busy_ns as f64 / (wall_ms as f64 * 1_000_000.0) * 100.0;
+    let pct = busy_ns as f64 / (wall_ms as f64 * 1_000_000.0 * capacity as f64) * 100.0;
     Some(pct.min(100.0) as f32)
 }
 
@@ -284,15 +384,18 @@ fn engine_util_pct(prev_ns: u64, prev_ts_ms: u64, cur_ns: u64, cur_ts_ms: u64) -
 /// elapsed base in the SAME ticks. Utilization is Δbusy-cycles / Δtotal-cycles — NOT
 /// divided by wall time. Dividing cycle counts by wall nanoseconds is the classic
 /// i915→xe porting bug: GT-clock frequency changes with DVFS, so cycles have no fixed
-/// time value and only the kernel-provided base is a valid denominator. Clamped because
-/// multi-engine classes (drm-engine-capacity > 1) can run busy-cycles past the base.
-fn cycles_util_pct(prev_c: u64, prev_t: u64, cur_c: u64, cur_t: u64) -> Option<f32> {
+/// time value and only the kernel-provided base is a valid denominator. A multi-engine
+/// class (`drm-engine-capacity` > 1) sums busy-cycles across its instances, so the
+/// denominator is capacity × Δtotal (research 07 §3.2) — dividing by Δtotal alone and
+/// clamping would report a half-busy 2-engine class as 100%. The clamp that remains is
+/// a last-resort guard against inconsistent counters, not the math.
+fn cycles_util_pct(prev_c: u64, prev_t: u64, cur_c: u64, cur_t: u64, capacity: u64) -> Option<f32> {
     let total = cur_t.checked_sub(prev_t)?;
-    if total == 0 {
+    if total == 0 || capacity == 0 {
         return None;
     }
     let busy = cur_c.checked_sub(prev_c)?;
-    let pct = busy as f64 / total as f64 * 100.0;
+    let pct = busy as f64 / (total as f64 * capacity as f64) * 100.0;
     Some(pct.min(100.0) as f32)
 }
 
@@ -347,8 +450,26 @@ fn comm_name(root: &Path, pid: u32) -> String {
 fn first_hwmon(dev_path: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(dev_path.join("hwmon")).ok()?;
     let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    dirs.sort(); // read_dir order is arbitrary
+    // read_dir order is arbitrary, and a plain string sort puts `hwmon10` before
+    // `hwmon5` — order numerically (research 07 §3.2 minor hardening).
+    dirs.sort_by_cached_key(|p| hwmon_sort_key(p));
     dirs.into_iter().next()
+}
+
+/// Sort key for an hwmon dir: `hwmonN` orders by N numerically, ahead of any entry not
+/// shaped `hwmon<digits>` (those fall back to name order, after every numbered dir).
+fn hwmon_sort_key(path: &Path) -> (bool, u64, String) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name
+        .strip_prefix("hwmon")
+        .and_then(|d| d.parse::<u64>().ok())
+    {
+        Some(n) => (false, n, name),
+        None => (true, 0, name),
+    }
 }
 
 /// One enumerated i915/xe PCI device, resolved at init.
@@ -361,6 +482,33 @@ struct IntelDevice {
     /// `{root}/sys/class/drm/cardN/device` — the PCI dir; xe's freq tree hangs off it.
     dev_path: PathBuf,
     hwmon: Option<PathBuf>,
+    /// The single hwmon channel both power numbers come from, resolved at init (sysfs
+    /// attribute visibility is fixed at hwmon registration). Fixed for the session, so
+    /// the energy watermark can never difference two different channels' counters.
+    power_channel: Option<PowerChannel>,
+}
+
+impl IntelDevice {
+    /// `power<N>_max` on the resolved channel.
+    fn power_limit_mw(&self) -> Option<u32> {
+        power_cap_mw(self.hwmon.as_deref()?, self.power_channel?)
+    }
+
+    /// Cumulative `energy<N>_input` µJ on the resolved channel.
+    fn energy_uj(&self) -> Option<u64> {
+        read_parse(
+            &self
+                .hwmon
+                .as_deref()?
+                .join(self.power_channel?.energy_file()),
+        )
+    }
+
+    /// The pkg-scope honesty label, when (and only when) power comes from xe's pkg
+    /// channel.
+    fn source_caveat(&self) -> Option<String> {
+        (self.power_channel == Some(PowerChannel::Pkg)).then(|| PKG_POWER_CAVEAT.to_string())
+    }
 }
 
 impl IntelDevice {
@@ -537,12 +685,16 @@ fn discover(root: &Path) -> Vec<IntelDevice> {
             continue;
         };
         let hwmon = first_hwmon(&dev_path);
+        let power_channel = hwmon
+            .as_deref()
+            .and_then(|h| resolve_power_channel(h, dialect));
         devs.push(IntelDevice {
             id: DeviceId(pci.to_ascii_lowercase()),
             dialect,
             card_path,
             dev_path,
             hwmon,
+            power_channel,
         });
     }
     devs
@@ -628,7 +780,9 @@ impl GpuBackend for IntelBackend {
                 Dialect::I915 => read_parse(&d.card_path.join("lmem_total_bytes")),
                 Dialect::Xe => None,
             },
-            power_limit_mw: d.hwmon.as_deref().and_then(power_cap_mw),
+            // On the one resolved channel (card preferred, xe pkg fallback) — the same
+            // channel `power_mw` derives from, so draw/limit is one physical scope.
+            power_limit_mw: d.power_limit_mw(),
             max_sm_clock_mhz: d.max_freq_mhz(),
             // No sysfs source for the thermal-slowdown knee; claiming one would
             // mis-narrate throttle events. Honest absence.
@@ -637,8 +791,11 @@ impl GpuBackend for IntelBackend {
             // kernel, and the uevent DRIVER= field is a name, not a version.
             driver_version: None,
             process_hint: self.process_hint.clone(),
-            // sysfs/fdinfo numbers carry their plain meanings — nothing to qualify.
-            source_caveat: None,
+            // sysfs/fdinfo numbers carry their plain meanings — except xe power read from
+            // the pkg channel, which is package-scope, not whole-card, and says so.
+            source_caveat: d.source_caveat(),
+            // The PCI link files under the card describe the dGPU's internal switch port,
+            // not the slot link — comparing against them would be a lie. Honest absence.
             pcie_max_gen: None,
             pcie_max_width: None,
         })
@@ -647,11 +804,11 @@ impl GpuBackend for IntelBackend {
     fn refresh_dynamic(&mut self, dev: &DeviceId) -> Result<DynamicSample, BackendError> {
         let d = self.device(dev)?;
         let sm_clock_mhz = d.act_freq_mhz();
+        // The cap on the same resolved channel as power_mw, re-read per tick so a changed
+        // PL1 is narrated (power_limit_changed).
+        let power_limit_mw = d.power_limit_mw();
         let temp_c = d.hwmon.as_deref().and_then(|h| temp_c(h, d.dialect));
-        let energy_uj: Option<u64> = d
-            .hwmon
-            .as_deref()
-            .and_then(|h| read_parse(&h.join("energy1_input")));
+        let energy_uj = d.energy_uj();
         // Decode throttle reasons before any &mut self borrow below releases `d`.
         let throttle = d.throttle();
 
@@ -693,7 +850,8 @@ impl GpuBackend for IntelBackend {
             // Some(default): observed honest silence. This is the metric intel_gpu_top
             // still does not surface on xe.
             throttle,
-            power_limit_mw: None,
+            power_limit_mw,
+            // See static_info: the card's link files describe its internal switch port.
             pcie_gen: None,
             pcie_width: None,
             ecc_uncorrected: None,
@@ -742,15 +900,21 @@ impl GpuBackend for IntelBackend {
             // Per-dialect watermark math; first sighting has no baseline → None. A
             // kernel below the dialect's gate never produces the keys, so util stays
             // None while the process itself is still listed.
+            // The watermark is still advanced when the capacity is invalid, so a later
+            // sane capacity has a baseline; only the reported rate is refused.
             let util_pct = match dialect {
                 Dialect::I915 => agg.render_ns.and_then(|cur| {
                     let prev = self.last_render.insert((dev.clone(), pid), (cur, ts));
-                    prev.and_then(|(p_ns, p_ts)| engine_util_pct(p_ns, p_ts, cur, ts))
+                    let cap = class_capacity(agg.render_capacity);
+                    prev.zip(cap)
+                        .and_then(|((p_ns, p_ts), cap)| engine_util_pct(p_ns, p_ts, cur, ts, cap))
                 }),
                 Dialect::Xe => match (agg.rcs_cycles, agg.rcs_total_cycles) {
                     (Some(c), Some(t)) => {
                         let prev = self.last_cycles.insert((dev.clone(), pid), (c, t));
-                        prev.and_then(|(p_c, p_t)| cycles_util_pct(p_c, p_t, c, t))
+                        let cap = class_capacity(agg.rcs_capacity);
+                        prev.zip(cap)
+                            .and_then(|((p_c, p_t), cap)| cycles_util_pct(p_c, p_t, c, t, cap))
                     }
                     _ => None,
                 },
@@ -854,29 +1018,69 @@ mod tests {
     #[test]
     fn i915_engine_util_needs_baseline_and_handles_resets() {
         // 500ms of busy-ns over 1000ms of wall = 50%.
-        assert_eq!(engine_util_pct(0, 0, 500_000_000, 1_000), Some(50.0));
+        assert_eq!(engine_util_pct(0, 0, 500_000_000, 1_000, 1), Some(50.0));
         // Counter went backwards (pid reuse re-created the client): no claim.
-        assert_eq!(engine_util_pct(900, 0, 100, 1_000), None);
+        assert_eq!(engine_util_pct(900, 0, 100, 1_000, 1), None);
         // Zero wall delta cannot produce a rate.
-        assert_eq!(engine_util_pct(0, 1_000, 100, 1_000), None);
-        // More busy-ns than wall time (multi-queue accounting) clamps, never exceeds.
-        assert_eq!(engine_util_pct(0, 0, 10_000_000_000, 1_000), Some(100.0));
+        assert_eq!(engine_util_pct(0, 1_000, 100, 1_000, 1), None);
+        // More busy-ns than capacity × wall (inconsistent counters) clamps, never exceeds.
+        assert_eq!(engine_util_pct(0, 0, 10_000_000_000, 1_000, 1), Some(100.0));
+    }
+
+    #[test]
+    fn engine_capacity_divides_instead_of_clamping() {
+        // A 2-engine class accrues up to 2 × wall busy-ns: 1000ms busy over 1000ms wall
+        // is HALF its capacity, not a clamped 100%.
+        assert_eq!(engine_util_pct(0, 0, 1_000_000_000, 1_000, 2), Some(50.0));
+        // xe: 1.2M busy-cycles summed over 2 instances across 1.2M elapsed = 50%.
+        assert_eq!(cycles_util_pct(0, 0, 1_200_000, 1_200_000, 2), Some(50.0));
+        // Zero capacity cannot be a denominator.
+        assert_eq!(engine_util_pct(0, 0, 1, 1_000, 0), None);
+        assert_eq!(cycles_util_pct(0, 0, 1, 1_000, 0), None);
+    }
+
+    #[test]
+    fn capacity_key_absent_means_one_and_garbage_is_refused() {
+        // drm-usage-stats: absent capacity → assume 1.
+        assert_eq!(class_capacity(parse_fdinfo("").render_capacity), Some(1));
+        let f = parse_fdinfo("drm-engine-capacity-render:\t2\ndrm-engine-capacity-rcs:\t4\n");
+        assert_eq!(class_capacity(f.render_capacity), Some(2));
+        assert_eq!(class_capacity(f.rcs_capacity), Some(4));
+        // Zero is disallowed by the spec and garbage is not a number: refuse, never
+        // silently fall back to the absent-key default of 1.
+        let f = parse_fdinfo("drm-engine-capacity-render:\t0\ndrm-engine-capacity-rcs:\tzz\n");
+        assert_eq!(class_capacity(f.render_capacity), None);
+        assert_eq!(class_capacity(f.rcs_capacity), None);
+        // Other classes' capacities are not the utilization class's.
+        let f = parse_fdinfo("drm-engine-capacity-video:\t2\ndrm-engine-capacity-ccs:\t4\n");
+        assert_eq!((f.render_capacity, f.rcs_capacity), (None, None));
+    }
+
+    #[test]
+    fn hwmon_dirs_sort_numerically() {
+        let mut v: Vec<PathBuf> = ["hwmon10", "hwmon5", "weird", "hwmon2"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        v.sort_by_cached_key(|p| hwmon_sort_key(p));
+        let names: Vec<_> = v.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(names, ["hwmon2", "hwmon5", "hwmon10", "weird"]);
     }
 
     #[test]
     fn xe_cycles_util_is_over_total_cycles_not_wall_time() {
         // 600k busy cycles over 1.2M elapsed cycles = 50%, regardless of wall time.
         assert_eq!(
-            cycles_util_pct(1_000_000, 50_000_000, 1_600_000, 51_200_000),
+            cycles_util_pct(1_000_000, 50_000_000, 1_600_000, 51_200_000, 1),
             Some(50.0)
         );
         // Either counter going backwards (client re-created): no claim.
-        assert_eq!(cycles_util_pct(900, 0, 100, 1_000), None);
-        assert_eq!(cycles_util_pct(0, 900, 100, 100), None);
+        assert_eq!(cycles_util_pct(900, 0, 100, 1_000, 1), None);
+        assert_eq!(cycles_util_pct(0, 900, 100, 100, 1), None);
         // Zero elapsed-cycles base cannot produce a rate.
-        assert_eq!(cycles_util_pct(0, 500, 100, 500), None);
-        // capacity > 1 classes can run busy past the base: clamps, never exceeds.
-        assert_eq!(cycles_util_pct(0, 0, 4_000, 1_000), Some(100.0));
+        assert_eq!(cycles_util_pct(0, 500, 100, 500, 1), None);
+        // Busy past capacity × base (inconsistent counters): clamps, never exceeds.
+        assert_eq!(cycles_util_pct(0, 0, 4_000, 1_000, 1), Some(100.0));
     }
 
     #[test]
@@ -925,6 +1129,8 @@ mod tests {
     fn known_arc_names_resolve_and_unknowns_do_not() {
         assert_eq!(known_gpu_name("56a0"), Some("Intel Arc A770"));
         assert_eq!(known_gpu_name("e20b"), Some("Intel Arc B580"));
+        assert_eq!(known_gpu_name("56a2"), Some("Intel Arc A580"));
+        assert_eq!(known_gpu_name("56a6"), Some("Intel Arc A310"));
         assert_eq!(
             known_gpu_name("46a6"),
             None,

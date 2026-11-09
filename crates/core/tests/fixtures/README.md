@@ -55,7 +55,12 @@ new captures taken per kernel/driver release.
   6.8-era `drm-total-local0`/`drm-resident-local0` memory regions. pid 3100 (ffplay)
   holds two fds (dedupe-by-max coverage) with a busy video engine; pid 5200 (blender)
   is render-only (honestly Unknown kind); pid 6300 (python3) has a busy compute
-  engine; pid 980 (Xorg) sits on a different pdev and must be filtered out. The per-GT
+  engine; pid 980 (Xorg) sits on a different pdev and must be filtered out; pid 7400
+  (kwin_wayland) is the **pre-gate shape** — `drm-pdev` plus `local0`/`system0` memory
+  regions but NO `drm-engine-*` keys at all (a synthetic key-subset case, not a specific
+  kernel's capture: it pins the path where the engine counters are simply absent) —
+  and must be listed with its VRAM, `Unknown` kind, and `util_pct` `None` on every
+  sighting, never a 0% invented from missing keys. The per-GT
   `gt/gt0/throttle_reason_*` flags ship quiescent (status=0, every reason 0); throttle
   tests drive scratch copies to assert the bit→model mapping and the status gate.
 - `intel-xe-kernel6.11/` — models an Arc B580 dGPU (BMG, `8086:e20b`) on the xe driver
@@ -89,3 +94,32 @@ new captures taken per kernel/driver release.
   channel (`power1_max`/`energy1_input`) stays preferred; `fan1_input` = 1450 RPM with no
   max asserts `fan_pct` stays `None`; `freq0/rpa_freq` (2200) is a freq-file decoy; and
   `tile0/gt0/gtidle/idle_residency_ms` is pre-staged for future GT-awake% work.
+- `intel-xe-dg2-forced/` — an Arc A770 (DG2, `8086:56a0`) force-probed onto the **xe**
+  driver (DRIVER=xe — a real user configuration; DG2 stays i915-default), kernel ~6.12
+  ABI. Its hwmon is **pkg-only**: `power2_max` = 225 W and `energy2_input`, with NO
+  index-1 (card) power/energy files — a card-only read reports `None` while a real
+  value sits in sysfs (research 07 §3.2.2). `power2_rated_max` = 190 W is a DECOY (the
+  default TDP, not the enforced PL1). Power limit AND derived draw both come from the
+  pkg channel, and `source_caveat` labels the reading package-scope. No temp files (xe
+  temps gate 6.15+). xe freq layout with an `rp0_freq`/`max_freq` decoy pair; one
+  python3 pid with xe cycles, `vram0` memory, and `drm-engine-capacity-ccs: 4`.
+  Which channels a real DG2-on-xe box exposes is [HW-VERIFY] — this tree models the
+  documented channel scheme, not a capture.
+- `intel-i915-igpu-mtl/` — a Meteor Lake iGPU (`8086:7d55`, DRIVER=i915, `0000:00:02.0`):
+  no hwmon, no `lmem_total_bytes`, card-level freq files (act 1650 / RP0 2250 / user-cap
+  decoy 2000). **Two GTs**: `gt/gt0` throttle flags quiescent, while `gt/gt1` — MTL's
+  MEDIA GT — has `throttle_reason_status` = 1 with thermal + pl1 set, plus
+  `rps_act`/`rps_RP0` freq decoys: only gt0 may be consulted, or the render device
+  narrates a throttle that is not happening. fdinfo regions are `system0` and
+  `stolen-system0` only (system RAM — `mem_bytes` must stay `None`, never VRAM), with
+  i915 busy-ns engines: pid 2900 (gnome-shell) render-only → `Unknown`; pid 4700
+  (ffmpeg) busy video → Graphics, carrying `drm-engine-capacity-video: 2` (a different
+  class's capacity, which must not touch render utilization).
+- `intel-xe-igpu-lnl/` — a Lunar Lake iGPU (`8086:64a0`, DRIVER=xe, `0000:00:02.0`): NO
+  hwmon dir at all (xe registers hwmon for discrete parts only), `tile0/gt0/freq0/*`
+  (act 1450 / RP0 2050 / user-cap decoy 1900) plus a `tile0/gt1` MEDIA-GT decoy set
+  (act 900, RP0 1300, and an active `throttle/status` = 1 with `reason_thermal` = 1).
+  fdinfo carries `system`/`gtt`/`stolen` regions and **no `vram0`** (`mem_bytes`
+  `None`), and xe `drm-cycles-*`/`drm-total-cycles-*` counters so per-process
+  utilization (Δbusy / Δtotal cycles) works on an iGPU: pid 3300 (gnome-shell) rcs-only
+  → `Unknown`; pid 6100 (mpv) busy vcs → Graphics.
