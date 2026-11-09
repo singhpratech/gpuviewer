@@ -108,6 +108,7 @@ mod tests {
             util_pct: None,
             cpu_pct: None,
             container: None,
+            cmdline: None,
         }];
         let sample = DynamicSample {
             ts_ms: 1000,
@@ -166,6 +167,7 @@ mod tests {
             util_pct: Some(96.0),
             cpu_pct: None,
             container: None,
+            cmdline: None,
         }];
         let dev = DeviceId("test".into());
 
@@ -442,6 +444,7 @@ mod tests {
             util_pct: None,
             cpu_pct: None,
             container: None,
+            cmdline: None,
         };
 
         // Climb from 86% toward 95% at ~600 MiB/min; the pressure event fires once the
@@ -514,6 +517,7 @@ mod tests {
             util_pct: None,
             cpu_pct: None,
             container: None,
+            cmdline: None,
         }
     }
 
@@ -708,6 +712,7 @@ mod tests {
             util_pct,
             cpu_pct,
             container: None,
+            cmdline: None,
         }
     }
 

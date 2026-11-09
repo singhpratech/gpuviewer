@@ -1156,6 +1156,7 @@ mod backend_impl {
                         // No /proc on Windows: both honestly None (§3.5).
                         cpu_pct: None,
                         container: None,
+                        cmdline: None,
                     }
                 })
                 .collect())

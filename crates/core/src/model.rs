@@ -211,6 +211,13 @@ pub struct ProcessSample {
     /// `None` for host processes or when unknown. `serde(default)` for old recordings.
     #[serde(default)]
     pub container: Option<String>,
+    /// The process's command line ("python train.py --cfg big"), argv0 reduced to its
+    /// basename and secret-looking argument values redacted at capture
+    /// ([`crate::proc_meta::parse_cmdline`]). `None` when unreadable (another user's
+    /// process without privilege, a kernel thread, Windows/macOS today). `serde(default)`
+    /// for older recordings.
+    #[serde(default)]
+    pub cmdline: Option<String>,
 }
 
 /// Normalize a PCI address (`domain:bus:dev.func`) for cross-backend dedupe: NVML reports

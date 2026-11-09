@@ -1977,6 +1977,7 @@ mod tests {
             util_pct: util,
             cpu_pct: None,
             container: None,
+            cmdline: None,
         }
     }
 

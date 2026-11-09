@@ -224,6 +224,9 @@ struct ProcAccum {
     util: Agg,
     cpu: Agg,
     container: Option<String>,
+    /// Last observed command line; a blind read (`None`) keeps the previous one — the
+    /// process did not lose its arguments, we just could not read them that tick.
+    cmdline: Option<String>,
 }
 
 impl ProcAccum {
@@ -235,6 +238,7 @@ impl ProcAccum {
             util: Agg::default(),
             cpu: Agg::default(),
             container: None,
+            cmdline: None,
         };
         a.fold(p);
         a
@@ -249,6 +253,9 @@ impl ProcAccum {
         self.util.push(p.util_pct.map(|v| v as f64));
         self.cpu.push(p.cpu_pct.map(|v| v as f64));
         self.container = p.container.clone();
+        if p.cmdline.is_some() {
+            self.cmdline = p.cmdline.clone();
+        }
     }
 
     fn to_rollup(&self, device_id: &DeviceId, bucket_ms: u64, pid: u32) -> ProcessRollup {
@@ -262,6 +269,7 @@ impl ProcAccum {
             util_avg: self.util.avg().map(|v| v as f32),
             cpu_avg: self.cpu.avg().map(|v| v as f32),
             container: self.container.clone(),
+            cmdline: self.cmdline.clone(),
         }
     }
 }
@@ -1042,6 +1050,7 @@ mod tests {
                 util_avg: None,
                 cpu_avg: None,
                 container: None,
+                cmdline: None,
             }])
             .unwrap();
         store
@@ -1103,6 +1112,7 @@ mod tests {
             util_avg: Some(10.0),
             cpu_avg: None,
             container: None,
+            cmdline: None,
         };
         // Buckets at 100000 and 110000; nothing at 120000.
         store
@@ -1145,6 +1155,7 @@ mod tests {
             util_pct: Some(util),
             cpu_pct: Some(cpu),
             container: None,
+            cmdline: None,
         };
         rec.observe(
             &d,
@@ -1647,6 +1658,7 @@ mod tests {
             util_avg: Some(50.0),
             cpu_avg: Some(120.0),
             container: Some("docker:abc123".into()),
+            cmdline: None,
         };
         store
             .insert_process_rollups(&[proc_at(50_000, "decoy-proc"), proc_at(70_000, "kept-proc")])
@@ -1660,7 +1672,7 @@ mod tests {
             ])
             .unwrap();
 
-        let counts = store.export_to(&out.path, 60_000, 179_999).unwrap();
+        let counts = store.export_to(&out.path, 60_000, 179_999, true).unwrap();
         assert_eq!(counts.devices, 1);
         assert_eq!(counts.samples_10s, 2, "only the in-window 10s buckets copy");
         assert_eq!(counts.samples_1m, 2, "only the in-window 1m buckets copy");
@@ -1705,7 +1717,7 @@ mod tests {
         let (store, _) = SqliteStore::open(&scratch.path).unwrap();
         std::fs::write(&out.path, b"someone's shared incident file").unwrap();
 
-        let err = store.export_to(&out.path, 0, 1_000).unwrap_err();
+        let err = store.export_to(&out.path, 0, 1_000, true).unwrap_err();
         assert!(
             matches!(err, StoreError::OutputExists(_)),
             "must refuse with OutputExists, got: {err}"

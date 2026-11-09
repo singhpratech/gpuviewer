@@ -139,6 +139,92 @@ pub fn container_of(pid: u32) -> Option<String> {
     parse_cgroup(&content)
 }
 
+/// The command line of a live PID from `/proc/<pid>/cmdline`, via [`parse_cmdline`]. Any
+/// IO error (PID gone, another user's process under `hidepid`, no procfs) → `None`.
+pub fn cmdline_of(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    parse_cmdline(&raw)
+}
+
+/// Longest command line kept, in chars. The table truncates anyway; this bounds what a
+/// `--json` consumer and the history db carry for a process with a 100 KB argv.
+pub const CMDLINE_MAX_CHARS: usize = 240;
+
+/// Argument-name fragments whose VALUE is redacted ("--hf-token=…", "--password …",
+/// "AWS_SECRET_ACCESS_KEY=…"). Deliberately broad: redacting a harmless `--auth-mode`
+/// costs nothing, while leaking a token into a recording someone later exports is the
+/// kind of mistake a tool earns distrust for.
+const SECRET_HINTS: &[&str] = &[
+    "token",
+    "secret",
+    "passw",
+    "pwd",
+    "apikey",
+    "api-key",
+    "api_key",
+    "auth",
+    "credential",
+    "private",
+    "access-key",
+    "access_key",
+];
+
+fn looks_secret(name: &str) -> bool {
+    let n = name.trim_start_matches('-').to_ascii_lowercase();
+    SECRET_HINTS.iter().any(|h| n.contains(h))
+}
+
+/// Turn a raw NUL-separated `/proc/<pid>/cmdline` into a display string: argv0 reduced
+/// to its basename, values of secret-looking flags and `KEY=value` args replaced with
+/// `***`, `scheme://user:pass@host` userinfo stripped, length capped. `None` for an empty
+/// command line (kernel threads, zombies).
+pub fn parse_cmdline(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let mut args: Vec<String> = text
+        .split('\0')
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .collect();
+    if args.is_empty() {
+        return None;
+    }
+    if let Some(base) = args[0].rsplit('/').next() {
+        args[0] = base.to_string();
+    }
+    let mut redact_next = false;
+    for a in args.iter_mut().skip(1) {
+        if redact_next {
+            *a = "***".into();
+            redact_next = false;
+            continue;
+        }
+        if let Some((k, _)) = a.split_once('=') {
+            if looks_secret(k) {
+                *a = format!("{k}=***");
+                continue;
+            }
+        } else if a.starts_with('-') && looks_secret(a) {
+            redact_next = true;
+            continue;
+        }
+        // Credentials embedded in a URL: keep the scheme and host, drop the userinfo.
+        if let Some((scheme, rest)) = a.split_once("://") {
+            if let Some((userinfo, host)) = rest.split_once('@') {
+                if !userinfo.contains('/') {
+                    *a = format!("{scheme}://***@{host}");
+                }
+            }
+        }
+    }
+    let joined = args.join(" ");
+    Some(if joined.chars().count() > CMDLINE_MAX_CHARS {
+        let cut: String = joined.chars().take(CMDLINE_MAX_CHARS).collect();
+        format!("{cut}…")
+    } else {
+        joined
+    })
+}
+
 /// Tracks per-PID CPU time across ticks to turn the kernel's *cumulative* counter into an
 /// instantaneous rate. A single `/proc/<pid>/stat` read only gives total ticks consumed since
 /// the process started; the rate is the delta between two reads over the wall time between them.
@@ -339,5 +425,32 @@ mod tests {
         assert!(!t.seen.contains_key(&111));
         assert!(t.seen.contains_key(&222));
         assert!(!t.seen.contains_key(&333));
+    }
+
+    #[test]
+    fn cmdline_reduces_argv0_and_redacts_secrets() {
+        let raw = b"/usr/bin/python3\0train.py\0--cfg\0big.yaml\0--hf-token=hf_abc123\0--password\0hunter2\0WANDB_API_KEY=xyz\0--data\0s3://AKIA:secret@bucket/path\0";
+        assert_eq!(
+            parse_cmdline(raw).as_deref(),
+            Some("python3 train.py --cfg big.yaml --hf-token=*** --password *** WANDB_API_KEY=*** --data s3://***@bucket/path")
+        );
+    }
+
+    #[test]
+    fn cmdline_empty_is_none_and_long_is_capped() {
+        assert_eq!(parse_cmdline(b""), None);
+        assert_eq!(
+            parse_cmdline(b"\0\0"),
+            None,
+            "kernel threads have an empty cmdline"
+        );
+        let long = format!("prog\0{}", "x".repeat(1000));
+        let out = parse_cmdline(long.as_bytes()).unwrap();
+        assert_eq!(
+            out.chars().count(),
+            CMDLINE_MAX_CHARS + 1,
+            "cap plus the ellipsis"
+        );
+        assert!(out.ends_with('…'));
     }
 }

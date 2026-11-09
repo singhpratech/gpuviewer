@@ -987,12 +987,15 @@ fn proc_header() -> Row<'static> {
     )
 }
 
-/// "ollama [docker:3f2a9c1b]" — the container identity rides with the name column so a
-/// containerized workload is recognizable at a glance.
-fn proc_display_name(name: &str, container: Option<&str>) -> String {
+/// "python train.py --cfg big [docker:3f2a9c1b]" — the command line (when captured)
+/// tells three `python` processes apart, and the container identity rides with it so a
+/// containerized workload is recognizable at a glance. Without a captured command line
+/// the process name stands alone.
+fn proc_display_name(name: &str, cmdline: Option<&str>, container: Option<&str>) -> String {
+    let base = cmdline.unwrap_or(name);
     match container {
-        Some(c) => format!("{name} [{c}]"),
-        None => name.to_string(),
+        Some(c) => format!("{base} [{c}]"),
+        None => base.to_string(),
     }
 }
 
@@ -1023,7 +1026,7 @@ fn render_processes(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info:
         .map(|p| {
             Row::new(vec![
                 p.pid.to_string(),
-                proc_display_name(&p.name, p.container.as_deref()),
+                proc_display_name(&p.name, p.cmdline.as_deref(), p.container.as_deref()),
                 p.kind.label().to_string(),
                 p.mem_bytes.map(fmt_bytes).unwrap_or_else(|| "—".into()),
                 fmt_opt_pct(p.util_pct),
@@ -1082,7 +1085,7 @@ fn render_processes_replay(
         .map(|p| {
             Row::new(vec![
                 p.pid.to_string(),
-                proc_display_name(&p.name, p.container.as_deref()),
+                proc_display_name(&p.name, p.cmdline.as_deref(), p.container.as_deref()),
                 p.kind.label().to_string(),
                 p.mem_max.map(fmt_bytes).unwrap_or_else(|| "—".into()),
                 fmt_opt_pct(p.util_avg),
@@ -1745,6 +1748,7 @@ mod tests {
             util_pct: Some(80.0),
             cpu_pct: Some(42.0),
             container: Some("docker:3f2a9c1b".into()),
+            cmdline: None,
         }];
         let screen = draw(&app, &shared);
         assert!(

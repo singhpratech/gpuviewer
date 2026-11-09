@@ -888,6 +888,7 @@ impl GpuBackend for AmdBackend {
                 util_pct,
                 cpu_pct: None,
                 container: None,
+                cmdline: None,
             });
         }
         // Drop watermarks for pids that vanished from this device (exited processes).
@@ -902,6 +903,7 @@ impl GpuBackend for AmdBackend {
             for p in &mut out {
                 p.cpu_pct = self.cpu.sample(p.pid);
                 p.container = crate::proc_meta::container_of(p.pid);
+                p.cmdline = crate::proc_meta::cmdline_of(p.pid);
             }
             let live: Vec<u32> = out.iter().map(|p| p.pid).collect();
             self.cpu.prune(&live);

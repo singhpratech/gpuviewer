@@ -103,7 +103,8 @@ fn help_text() -> String {
                 [--db <path>] [--on-event <cmd>]\n  \
       gpuviewer report [--since <spec>] [--until <spec>] [--db <path>] [--mock]\n  \
       gpuviewer demo [--seed-only]\n  \
-      gpuviewer export [--since <spec>] [--db <path>] [--mock] <out.gpvr>\n  \
+      gpuviewer export [--since <spec>] [--until <spec>] [--keep-cmdline] [--db <path>]\n                   \
+                       [--mock] <out.gpvr>\n  \
       gpuviewer view <file.gpvr>\n\n\
     LIVE OPTIONS:\n  \
       --json          stream one NDJSON frame per tick to stdout\n  \
@@ -137,7 +138,10 @@ fn help_text() -> String {
     export — copy a window of recorded history into a standalone, shareable .gpvr file\n    \
     (opens anywhere with `gpuviewer view` — no GPU required). Prints per-table row counts;\n    \
     refuses to overwrite an existing output file:\n  \
-      --since <spec>  window start; default 24h (the window always ends now)\n  \
+      --since <spec>  window start; default 24h\n  \
+      --until <spec>  window end; default now\n  \
+      --keep-cmdline  include process command lines (omitted by default: a .gpvr is made\n                  \
+                      to be shared, and argv can name private paths)\n  \
       --db <path>     source history database (default: the recorded default)\n  \
       --mock          read history-mock.db as the source\n\n\
     view — replay a .gpvr file read-only: no backends, no recording, no live mode.\n    \
@@ -279,6 +283,11 @@ fn parse_demo_args(it: impl Iterator<Item = String>) -> Result<DemoArgs> {
 /// Parsed `export` subcommand options.
 struct ExportArgs {
     since: Option<String>,
+    /// Window end; default now. "Send me last night's incident" should not drag in
+    /// everything recorded since.
+    until: Option<String>,
+    /// Keep process command lines in the shareable file (dropped by default).
+    keep_cmdline: bool,
     db: Option<PathBuf>,
     mock: bool,
     /// The output `.gpvr` path (positional).
@@ -287,6 +296,8 @@ struct ExportArgs {
 
 fn parse_export_args(mut it: impl Iterator<Item = String>) -> Result<ExportArgs> {
     let mut since = None;
+    let mut until = None;
+    let mut keep_cmdline = false;
     let mut db = None;
     let mut mock = false;
     let mut out: Option<PathBuf> = None;
@@ -304,6 +315,13 @@ fn parse_export_args(mut it: impl Iterator<Item = String>) -> Result<ExportArgs>
                         .ok_or_else(|| anyhow::anyhow!("--db needs a path"))?,
                 ))
             }
+            "--until" => {
+                until = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--until needs a spec"))?,
+                )
+            }
+            "--keep-cmdline" => keep_cmdline = true,
             "--mock" => mock = true,
             "--help" | "-h" => {
                 emit_line(&help_text());
@@ -320,6 +338,8 @@ fn parse_export_args(mut it: impl Iterator<Item = String>) -> Result<ExportArgs>
     }
     Ok(ExportArgs {
         since,
+        until,
+        keep_cmdline,
         db,
         mock,
         out: out
@@ -1024,6 +1044,19 @@ fn run_export(args: ExportArgs) -> Result<()> {
         })?,
         None => now.saturating_sub(24 * 3600 * 1000),
     };
+    let to = match &args.until {
+        Some(s) => parse_spec(s, now).ok_or_else(|| {
+            anyhow::anyhow!("--until: cannot parse {s:?} (try 12h, 45m, 7d, HH:MM)")
+        })?,
+        None => now,
+    };
+    if to <= from {
+        bail!(
+            "empty window: --until ({}) is not after --since ({})",
+            fmt_clock(to),
+            fmt_clock(from)
+        );
+    }
 
     let src = match &args.db {
         Some(p) => p.clone(),
@@ -1046,20 +1079,25 @@ fn run_export(args: ExportArgs) -> Result<()> {
     let store = SqliteStore::open_readonly(&src)
         .map_err(|e| anyhow::anyhow!("cannot open {} read-only: {e}", src.display()))?;
     let counts = store
-        .export_to(&args.out, from, now)
+        .export_to(&args.out, from, to, args.keep_cmdline)
         .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
 
     emit(&format!(
         "exported {} .. {} into {}\n  devices        {}\n  samples_10s    {}\n  \
-         samples_1m     {}\n  processes_10s  {}\n  events         {}\n",
+         samples_1m     {}\n  processes_10s  {}\n  events         {}\n{}",
         fmt_clock(from),
-        fmt_clock(now),
+        fmt_clock(to),
         args.out.display(),
         counts.devices,
         counts.samples_10s,
         counts.samples_1m,
         counts.processes_10s,
         counts.events,
+        if args.keep_cmdline {
+            "  process command lines KEPT (--keep-cmdline) — review before sharing\n"
+        } else {
+            "  process command lines omitted (pass --keep-cmdline to include them)\n"
+        },
     ));
     Ok(())
 }

@@ -635,6 +635,7 @@ impl GpuBackend for NvidiaBackend {
                         util_pct: None,
                         cpu_pct: None,
                         container: None,
+                        cmdline: None,
                     });
             }
         }
@@ -670,6 +671,7 @@ impl GpuBackend for NvidiaBackend {
             for (pid, p) in by_pid.iter_mut() {
                 p.cpu_pct = self.cpu.sample(*pid);
                 p.container = crate::proc_meta::container_of(*pid);
+                p.cmdline = crate::proc_meta::cmdline_of(*pid);
             }
             self.cpu.prune(&live);
         }
@@ -719,6 +721,9 @@ impl GpuBackend for NvidiaBackend {
                             util_pct: util.get(&pid).map(|u| u.pct as f32),
                             cpu_pct: None,
                             container: None,
+                            // Windows has no /proc; reading another process's PEB is
+                            // out of scope (§3.5).
+                            cmdline: None,
                         },
                     );
                 }

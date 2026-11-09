@@ -48,7 +48,10 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 /// stamped HIGHER than this constant was written by a NEWER gpuviewer, and every write
 /// open refuses it with the file untouched ([`StoreError::SchemaTooNew`]) — this build
 /// must never migrate, prune, or down-stamp a shape it has never seen.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// v3: `throttle_observed_n` on both rollup tables ([`SqliteStore::migrate_throttle_observed`]).
+/// v4: `processes_10s.cmdline` ([`SqliteStore::migrate_process_cmdline`]).
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Retention windows. Public because the UI tells the user how far back history reaches
 /// ("10s detail for 48h, 1m for 30 days").
@@ -174,6 +177,10 @@ pub struct ProcessRollup {
     pub util_avg: Option<f32>,
     pub cpu_avg: Option<f32>,
     pub container: Option<String>,
+    /// The process's command line as captured (secret-looking argument values already
+    /// redacted at capture), `None` when unreadable or recorded by a pre-v4 binary.
+    /// `export` drops it by default — a `.gpvr` is made to be shared.
+    pub cmdline: Option<String>,
 }
 
 /// A device's static identity as persisted in `devices`. Returned by [`SqliteStore::devices`]
@@ -203,8 +210,33 @@ const SAMPLE_COLS: &str = "device_id, bucket_ms, n, util_min, util_avg, util_max
      mem_max, power_avg_mw, power_max_mw, temp_avg_c, temp_max_c, fan_max_pct, sm_clock_min, \
      sm_clock_avg, sm_clock_max, throttle_n, throttle_thermal_n, throttle_power_n, \
      throttle_hw_n, throttle_observed_n";
+/// `cmdline` stays LAST: it is the migration-added column, so a table created before v4
+/// and one created after both have it in this position, and the export's positional
+/// `INSERT INTO processes_10s SELECT …` lines up either way.
 const PROC_COLS: &str =
-    "device_id, bucket_ms, pid, name, kind, mem_max, util_avg, cpu_avg, container";
+    "device_id, bucket_ms, pid, name, kind, mem_max, util_avg, cpu_avg, container, cmdline";
+
+/// [`PROC_COLS`] as a SELECT list over `schema.processes_10s`, with `cmdline` replaced by
+/// `NULL` when the table predates v4 (a read-only open of an old recording or `.gpvr`
+/// never migrates, and selecting a missing column would fail the whole query) or when the
+/// caller asked for it to be withheld (export without `--keep-cmdline`).
+fn proc_select_cols(conn: &Connection, schema: &str, keep_cmdline: bool) -> String {
+    let have = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('processes_10s', ?1) WHERE name = 'cmdline'",
+            params![schema],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some();
+    if have && keep_cmdline {
+        PROC_COLS.to_string()
+    } else {
+        PROC_COLS.replace(", cmdline", ", NULL")
+    }
+}
 const EVENT_COLS: &str = "ts_ms, device_id, kind, severity, confidence, title, evidence";
 
 /// `?1,?2,…,?N` for the N columns in one of the `*_COLS` lists above.
@@ -632,6 +664,7 @@ impl SqliteStore {
         // database is only ever stamped with a shape it actually has.
         self.migrate_event_dedupe()?;
         self.migrate_throttle_observed()?;
+        self.migrate_process_cmdline()?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         let now = now_ms_wall();
@@ -727,6 +760,26 @@ impl SqliteStore {
                      ADD COLUMN throttle_observed_n INTEGER NOT NULL DEFAULT 0"
                 ))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Schema v3 -> v4: add the nullable `processes_10s.cmdline` column. Same shape and
+    /// rationale as [`Self::migrate_throttle_observed`]: gated on the column's presence,
+    /// ADD COLUMN (cannot fail on existing data, O(1), keeps every row), and historical
+    /// rows read NULL — "not captured", which is the truth for them.
+    fn migrate_process_cmdline(&self) -> Result<(), StoreError> {
+        let have: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('processes_10s') WHERE name = 'cmdline'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if have.is_none() {
+            self.conn
+                .execute_batch("ALTER TABLE processes_10s ADD COLUMN cmdline TEXT")?;
         }
         Ok(())
     }
@@ -865,6 +918,7 @@ impl SqliteStore {
                     r.util_avg,
                     r.cpu_avg,
                     r.container,
+                    r.cmdline,
                 ])?;
             }
         }
@@ -999,8 +1053,9 @@ impl SqliteStore {
         let Some(chosen) = chosen else {
             return Ok(Vec::new());
         };
+        let cols = proc_select_cols(&self.conn, "main", true);
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {PROC_COLS} FROM processes_10s \
+            "SELECT {cols} FROM processes_10s \
              WHERE device_id = ?1 AND bucket_ms = ?2 ORDER BY pid ASC"
         ))?;
         let rows = stmt
@@ -1102,17 +1157,23 @@ impl SqliteStore {
     ///
     /// Refuses to overwrite an existing `out_path` ([`StoreError::OutputExists`]); a failed
     /// export removes its half-written file so a retry is not blocked by that refusal.
+    ///
+    /// `keep_cmdline: false` (the CLI default) writes the process rows with `cmdline`
+    /// NULL. Capture redacts secret-looking argument values, but a shareable file must not
+    /// rely on a heuristic: someone's `--model /home/alice/clients/acme/…` is nobody
+    /// else's business either. Opting in is explicit (`export --keep-cmdline`).
     pub fn export_to(
         &self,
         out_path: impl AsRef<Path>,
         from_ms: u64,
         to_ms: u64,
+        keep_cmdline: bool,
     ) -> Result<ExportCounts, StoreError> {
         let out_path = out_path.as_ref();
         if out_path.exists() {
             return Err(StoreError::OutputExists(out_path.to_path_buf()));
         }
-        let result = self.copy_window(out_path, from_ms, to_ms);
+        let result = self.copy_window(out_path, from_ms, to_ms, keep_cmdline);
         if result.is_err() {
             let _ = std::fs::remove_file(out_path);
             for ext in ["-wal", "-shm"] {
@@ -1129,6 +1190,7 @@ impl SqliteStore {
         out_path: &Path,
         from_ms: u64,
         to_ms: u64,
+        keep_cmdline: bool,
     ) -> Result<ExportCounts, StoreError> {
         let mut dest = Self::try_open_init(out_path)?;
         // ATTACH cannot run inside a transaction, so bind the source first. `mode=ro` is
@@ -1138,6 +1200,7 @@ impl SqliteStore {
             params![format!("file:{}?mode=ro", uri_path(&self.path))],
         )?;
         let (from, to) = (from_ms as i64, to_ms as i64);
+        let proc_cols = proc_select_cols(&dest.conn, "src", keep_cmdline);
         let tx = dest.conn.transaction()?;
         // Source meta wins over the fresh file's own stamps: created_ms etc. describe the
         // recording, not the export. The window is stamped alongside so the file says what
@@ -1172,7 +1235,7 @@ impl SqliteStore {
         )?;
         let processes_10s = tx.execute(
             &format!(
-                "INSERT INTO processes_10s SELECT {PROC_COLS} FROM src.processes_10s \
+                "INSERT INTO processes_10s SELECT {proc_cols} FROM src.processes_10s \
                  WHERE bucket_ms >= ?1 AND bucket_ms <= ?2"
             ),
             params![from, to],
@@ -1240,6 +1303,7 @@ fn process_rollup_from_row(row: &rusqlite::Row) -> rusqlite::Result<ProcessRollu
         util_avg: row.get(6)?,
         cpu_avg: row.get(7)?,
         container: row.get(8)?,
+        cmdline: row.get(9)?,
     })
 }
 

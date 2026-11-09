@@ -958,6 +958,7 @@ mod tests {
             util_pct: Some(35.0),
             cpu_pct: Some(150.0),
             container: Some("docker:3f2a9c1b".into()),
+            cmdline: None,
         }
     }
 

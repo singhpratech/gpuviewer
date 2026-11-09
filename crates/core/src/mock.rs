@@ -286,6 +286,7 @@ impl TrainSim {
                 // gap, the CPU-bound stall fingerprint) — gives the CPU% column live coverage.
                 cpu_pct: Some(if idle { 320.0 } else { 180.0 }),
                 container: None,
+                cmdline: Some("python train.py --config configs/llama-7b.yaml".into()),
             },
             ProcessSample {
                 pid: 1203,
@@ -295,6 +296,7 @@ impl TrainSim {
                 util_pct: Some(2.0),
                 cpu_pct: Some(6.0),
                 container: None,
+                cmdline: None,
             },
         ]
     }
@@ -353,6 +355,7 @@ impl DesktopSim {
             util_pct: Some(3.0),
             cpu_pct: Some(12.0),
             container: None,
+            cmdline: None,
         }];
         if self.ollama_present {
             v.push(ProcessSample {
@@ -365,6 +368,7 @@ impl DesktopSim {
                 // core or so serving the model — gives both new columns mock coverage.
                 cpu_pct: Some(140.0),
                 container: Some("docker:3f2a9c1b4d5e".into()),
+                cmdline: Some("ollama serve".into()),
             });
         }
         v

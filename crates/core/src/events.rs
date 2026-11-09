@@ -1151,6 +1151,7 @@ mod tests {
             util_pct,
             cpu_pct,
             container: None,
+            cmdline: None,
         }
     }
 
