@@ -380,14 +380,17 @@ fn paused_event(paused_at_ms: u64, now_ms: u64, anchor: DeviceId) -> Event {
 
 /// Repeats of the same Xid code on the same device inside this window are folded into a
 /// count carried by the next narration.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const XID_REPEAT_WINDOW_MS: u64 = 60_000;
 
 /// Xid codes NVIDIA documents as fatal to the running context or the device (fallen off
 /// the bus, double-bit ECC, uncontained ECC, NVLink failure, GSP timeouts, row-remap
 /// failure). Severity is presentation only; the narration quotes the driver either way.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const XID_CRITICAL: &[u32] = &[48, 64, 74, 79, 95, 119, 120, 154];
 
 /// The `xid_error` fact: the driver's own words, attributed, never reinterpreted.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn xid_event(
     di: usize,
     id: &DeviceId,
@@ -519,6 +522,7 @@ pub struct Engine {
     xid: Option<gpuviewer_core::kmsg::XidWatcher>,
     /// Per (device index, Xid code): when it was last narrated and how many repeats were
     /// folded since — a driver can log the same Xid many times a second.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     xid_last: HashMap<(usize, u32), (u64, u32)>,
     /// Last time we emitted a slow-probe note for a given device.
     last_slow_note: HashMap<DeviceId, Instant>,
@@ -1027,6 +1031,9 @@ impl Engine {
     /// wire contract says every event's `device` names a frame device). Repeats of the same
     /// (device, code) within [`XID_REPEAT_WINDOW_MS`] are folded and counted into the next
     /// narration instead of flooding the feed.
+    // Only the Linux kernel-log reader (and tests) call this; elsewhere it is dead code
+    // by platform, not by mistake.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn xid_events(
         &mut self,
         ids: &[DeviceId],

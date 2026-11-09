@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/history", "crates/tui"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # Empirically verified: 1.95 is the oldest toolchain that builds the workspace
 # (libsqlite3-sys 0.38's build script uses `cfg_select!`, stabilized in 1.95).
@@ -20,8 +20,8 @@ repository = "https://github.com/singhpratech/gpuviewer"
 # `version` alongside `path`: inside the workspace cargo uses the path, but crates.io
 # requires a version requirement on every dependency and strips the path on publish.
 # Without it `cargo publish` refuses the manifest. Bump these with the workspace version.
-gpuviewer-core = { version = "0.1.1", path = "crates/core" }
-gpuviewer-history = { version = "0.1.1", path = "crates/history" }
+gpuviewer-core = { version = "0.2.0", path = "crates/core" }
+gpuviewer-history = { version = "0.2.0", path = "crates/history" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

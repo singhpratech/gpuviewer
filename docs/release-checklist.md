@@ -171,11 +171,47 @@ Tip: smoke tests on real GPUs record to the default `history.db`. Use
   Pass: exits within the grace window instead of hanging on the stuck probe thread.
 - [ ] **Inter-tick CollectorStall on real stalls** — No clock seam exists in tests (G8);
   this is the explicit manual home for it. Precondition: any machine.
-  Run: `cargo run --release -- --db /tmp/smoke.db`, then suspend/resume the laptop (or
-  `kill -STOP <pid>`, wait 30 s, `kill -CONT <pid>`), then
-  `cargo run --release -- report --since 10m --db /tmp/smoke.db`.
-  Pass: a CollectorStall self-honesty event records the gap with its duration; charts show
-  the gap rather than interpolating through it.
+  Run: `cargo run --release -- --db /tmp/smoke.db`, then `kill -STOP <pid>`, wait 30 s,
+  `kill -CONT <pid>`, then `cargo run --release -- report --since 10m --db /tmp/smoke.db`.
+  Pass: a CollectorStall self-honesty event records the gap with its duration (and does NOT
+  blame a blocked probe); charts show the gap rather than interpolating through it. With
+  backoff active on an idle machine, NO stall is narrated for the stretched cadence itself.
+- [ ] **Suspend → host_suspended** — Precondition: a laptop. Run the TUI with
+  `--db /tmp/smoke.db`, suspend for ≥1 min, resume, check `report --since 10m`.
+  Pass (Linux/macOS): one `[likely] host likely asleep …` event with both clocks in its
+  evidence, no collector_stall for the same gap. Windows: record what happens — if
+  `Instant` counts suspend there, a collector_stall (no blocked-probe claim) is the
+  expected, honest outcome.
+- [ ] **SIGTERM under systemd** — Precondition: the shipped user unit installed.
+  Run: `systemctl --user start gpuviewer`, wait 30 s, `systemctl --user stop gpuviewer`,
+  start again, `report --since 5m`.
+  Pass: a `recording_stopped` mark at the stop, and the next `recording_started` does NOT
+  say the previous session ended uncleanly.
+- [ ] **Power-limit change** — Precondition: NVIDIA dGPU with a settable limit.
+  Run: gpuviewer running, then `sudo nvidia-smi -pl <lower W>`, then restore.
+  Pass: `power limit lowered A→B W` (Warning) then `raised` (Info); the power gauge's
+  denominator follows the live limit.
+- [ ] **PCIe generation under load** — Precondition: any NVIDIA dGPU; ideally also one
+  behind a riser or in a slot known to train below its max.
+  Run: a sustained ≥50% load for >60 s; compare `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max --format=csv`.
+  Pass: a healthy link stays silent (verified 2026-11-08 on an RTX 4090 Laptop: Gen4 under
+  load, x8 against a reported x16 max — width is never judged); a link stuck below its max
+  generation under load narrates `pcie_link_degraded` once.
+- [ ] **Xid errors** — Precondition: an NVIDIA box where an Xid can be provoked or has
+  occurred (a datacenter part is likeliest); kernel log readable (`gpuviewer doctor` →
+  `xid errors enabled`).
+  Pass: the Xid appears as an `xid_error` Fact quoting the driver text, attributed to the
+  right GPU by PCI address; with `kernel.dmesg_restrict=1` and no CAP_SYSLOG, `doctor` says
+  "off" and nothing is fabricated.
+- [ ] **ECC counters** — Precondition: an ECC-enabled datacenter GPU.
+  Pass: `doctor` lists `ecc` as available; GeForce lists it unavailable (never 0).
+- [ ] **AMD Phase 2 decoders** — Precondition: Radeon VII/MI50 (gpu_metrics v1_0), MI300
+  (v1_5 on 6.7–6.12; v1_7/v1_8 on 6.13+). The offsets were walked by hand from the C struct
+  layouts and cross-checked against the offsets in 07-non-nvidia-coverage.md §2.2, not
+  against a header in the repo.
+  Pass: throttle reasons decode (or stay None) consistently with `amd-smi`/`rocm-smi`;
+  MI300 temperature reads the junction sensor and the caveat names it.
+- [ ] **`gpuviewer doctor` on every box above** — attach its output to the checklist run.
 - [ ] **fdinfo privilege hint** — Precondition: Linux box with another user's GPU process
   running. Run: `cargo run --release -- --db /tmp/smoke.db` unprivileged.
   Pass: process table shows the "your processes only" hint; the list is not presented as

@@ -41,7 +41,7 @@ it happened and read the story in plain English.
   <a href="#keybinds">Keybinds</a>
 </p>
 
-> **Status — `v0.1.0` is out.** Prebuilt binaries for Linux (`tar.gz` / `.deb` / `.rpm` /
+> **Status — `v0.2.0` is out.** Prebuilt binaries for Linux (`tar.gz` / `.deb` / `.rpm` /
 > AppImage), Windows (`zip`) and macOS Apple Silicon (`tar.gz`), each with checksums and
 > build-provenance attestations. Linux covers NVIDIA, AMD and Intel; Windows covers all
 > three through NVML and the WDDM performance counters; macOS covers Apple Silicon at the
@@ -102,12 +102,24 @@ the sentence itself and carry the raw numbers in an auditable evidence field.
 - `[likely]` GPU0 sat idle 47s while python (pid 4521) stayed attached — likely a dataloader or checkpoint stall
 - `[likely]` GPU0: python (pid 4521) likely hung — held 20.1 GiB for 10m 12s with zero GPU activity, process still alive
 - `[likely]` ollama (pid 7777) loaded 11.3 GiB but GPU1 is ~idle while its CPU runs hot — likely partial CPU offload (model may not fit in VRAM)
-- `[fact]` collection stalled 4.2s — a backend probe blocked; the data gap is recorded, last good frame at 02:14:31
+- `[fact]` GPU0 driver reported Xid 79: GPU has fallen off the bus (python pid 4521)
+- `[fact]` GPU0 reported 2 new uncorrectable ECC memory errors (3 since driver load)
+- `[fact]` GPU0 power limit lowered 450→350 W
+- `[likely]` GPU0 PCIe link likely degraded — Gen1 x16 under load for 1m 0s (supports Gen4)
+- `[likely]` host likely asleep for 6h 12m (23:58:10–06:10:31) — nothing was recorded; the gap is the machine suspended, not the GPU idle
+- `[fact]` collection stalled 42.0s — no frames were taken; the data gap is recorded, last good frame at 02:14:31
 - `[fact]` python (pid 4521) left GPU0, freeing 21.3 GiB
 
 Inference thresholds are deliberately conservative — a hang is only narrated after ten
 unbroken minutes of held VRAM with zero engine activity, and any break in the premise drops
-the claim silently. A confidently-wrong narration is worse than no narration.
+the claim silently. A degraded PCIe link is only judged while the GPU is busy (links slow
+down at idle by design), and only by generation — laptop boards wired x8 report a x16
+maximum, so the width is shown but never judged. A confidently-wrong narration is worse
+than no narration.
+
+Xid errors are read from the kernel log, which needs `CAP_SYSLOG` where
+`kernel.dmesg_restrict=1` (the Ubuntu/Debian default); without it gpuviewer simply records
+no Xid events, and `gpuviewer doctor` tells you which case you are in.
 
 ## The morning-after digest
 
@@ -127,6 +139,9 @@ GPU1 (Radeon RX 7900 XTX): util avg 12% / max 87%, temp max 71°C, mem max 12.4 
 03:02:11  WARN  [likely]  GPU0 VRAM 92% and climbing ~270 MiB/min — likely full in ~8 min (largest holder: python pid 4521)
 06:58:40  INFO  [fact]    python (pid 4521) left GPU0, freeing 21.3 GiB
 ```
+
+`report --json` prints the same digest as one JSON object (`"type":"report"`) for scripts
+and dashboards.
 
 ## Install
 
@@ -159,8 +174,15 @@ gpuviewer                            # live TUI — already recording
 gpuviewer demo                       # 8h simulated incident, opens at the throttle onset
 gpuviewer report --since 12h         # the digest above, from your real history
 gpuviewer export --since 2h oom.gpvr # shareable incident slice
+gpuviewer export --since 01:00 --until 03:00 night.gpvr   # just the incident
 gpuviewer view oom.gpvr              # replays anywhere — no GPU required
+gpuviewer doctor                     # what this build can see here — paste into bug reports
 ```
+
+Process rows carry the command line (`python train.py --config big.yaml`), so three
+`python` processes are told apart; values of secret-looking arguments (`--hf-token=…`,
+`--password …`, `*_API_KEY=…`) are redacted at capture. Exports leave command lines out
+unless you pass `--keep-cmdline` — a `.gpvr` is made to be shared.
 
 No GPU? No problem — `--mock` (also the automatic fallback) runs the full TUI on simulated
 GPUs. Mock data is always labeled "(mock data)" and records to a separate database, never
@@ -248,10 +270,13 @@ a confidently-wrong number would kill the whole premise:
   is complete.
 - **Unrecorded time renders blank.** On the timeline and every chart, a gap in the recording
   is a visible hole — never interpolated, never painted as zero activity.
-- **The recorder reports on itself.** A blocked driver probe or missed tick becomes a
-  recorded `[fact]` event ("collection stalled … the data gap is recorded") — a hole in the
-  recording never masquerades as the GPU having gone quiet. A quarantined-and-recreated
-  history file is narrated as a history reset, for the same reason.
+- **The recorder reports on itself.** A slow driver probe, a missed tick, a pause, or the
+  host going to sleep becomes a recorded event ("collection stalled … the data gap is
+  recorded", "host likely asleep for 6h 12m") — a hole in the recording never masquerades
+  as the GPU having gone quiet. A quarantined-and-recreated history file is narrated as a
+  history reset, for the same reason. `systemctl stop`, Ctrl-C and a dropped SSH session
+  all end the session cleanly, so its stop mark lands and the next session does not
+  misreport it as a crash.
 - **Polling must not perturb what it measures.** Idle GPUs are polled on a stretched cadence
   (up to 5× the interval) so monitoring doesn't keep them awake or break GFXOFF; the
   effective cadence is shown in the footer rather than hidden; `--no-backoff` opts out.
@@ -292,7 +317,7 @@ This project was built research-first, and the research is in the repo:
 
 ## Status
 
-**v0.1.0.** Install paths: [`docs/packaging/installing.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md).
+**v0.2.0.** Install paths: [`docs/packaging/installing.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md).
 
 | Platform | Backends |
 |---|---|
@@ -308,11 +333,14 @@ hardware are the most useful thing you can send.
 In the binary today:
 
 - **Backends:** NVIDIA (NVML, runtime-loaded — never hard-linked), AMD (sysfs/hwmon +
-  versioned `gpu_metrics` throttle decoders v1.1–v3.0 + fdinfo), Intel (fdinfo in both the
-  i915 and xe dialects + sysfs), deterministic mock fallback. Devices deduped across
+  versioned `gpu_metrics` throttle decoders v1.0–v3.0, including the MI300 residency
+  counters, + fdinfo with the standardized `drm-resident-*` keys and media engines), Intel
+  (fdinfo in both the i915 and xe dialects + sysfs, xe card→pkg power fallback),
+  deterministic mock fallback. Devices deduped across
   backends by PCI address.
 - **Always-on recording:** SQLite (WAL) 10s/1m rollups + an append-only event log, with
-  per-process rollups (memory, util, CPU%, container identity when knowable), retention
+  per-process rollups (memory, util, CPU%, container identity and redacted command line
+  when knowable), retention
   sweeps, and corrupt-database quarantine. Raw 1 Hz samples never touch disk — the live
   window rides in RAM rings.
 - **Timeline overview:** the whole recording as solid strips, 1h–7d zoom, peak-per-column
@@ -322,12 +350,15 @@ In the binary today:
   to jump straight to it; scrub by 10s/5m; works on your real history, the demo, and
   exported recordings.
 - **Narrated events:** throttle onset/recovery with clock deltas, process attach/exit with
-  freed VRAM, VRAM-pressure ETA, idle gap, suspected hang, CPU spillover, collector
-  stall/slow-probe self-reports, history reset.
+  freed VRAM, VRAM-pressure ETA, idle gap, suspected hang, CPU spillover, NVIDIA Xid errors
+  from the kernel log, uncorrectable ECC errors, power-limit changes, a PCIe link stuck
+  below its generation under load, host suspend, collector stall/slow-probe/pause
+  self-reports, device lost/returned, recording start/stop/degraded, history reset.
 - **Chart styles:** braille step-outline (default) or solid fill — `c` toggles, your pick;
   both break honestly at recording gaps.
-- **Subcommands and sinks:** `report` (plain-text digest), `demo` (pre-seeded incident),
-  `export`/`view` (shareable `.gpvr` incident files that replay anywhere, no GPU required),
+- **Subcommands and sinks:** `report` (plain-text digest, or `--json`), `demo` (pre-seeded
+  incident), `export`/`view` (shareable `.gpvr` incident files that replay anywhere, no GPU
+  required; `--until` bounds the window), `doctor` (what this build can see here),
   `--json` (NDJSON contract v1 with JSON Schema and a conformance test that runs the built
   binary), `--on-event` command sink, adaptive idle backoff.
 - **Tests:** the full suite passes on machines with no GPU — everything runs against the
@@ -375,6 +406,8 @@ mirror `Home`/`End`.
 | `r` | replay at the newest recorded moment |
 | `t` | timeline overview |
 | `c` | chart style: braille ↔ solid |
+| `f` | story filter: all · warnings+ · facts only |
+| `Ctrl-C` | quit (any mode) |
 
 | Replay | |
 |---|---|
@@ -384,7 +417,7 @@ mirror `Home`/`End`.
 | `Home` / `g` | oldest recorded moment |
 | `End` / `G` | newest recorded moment |
 | `↑` `↓` / `w` `s` then `Enter` | jump to the selected event |
-| `t` / `c` | timeline · chart style |
+| `t` / `c` / `f` | timeline · chart style · story filter |
 
 | Timeline | |
 |---|---|

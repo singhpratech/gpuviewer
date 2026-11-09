@@ -29,6 +29,9 @@ it extends 04-synthesis with the same re-litigate-only-with-new-evidence status.
 cargo build                 # build all crates
 cargo test                  # all tests run against the mock backend — no GPU needed
 cargo test -p gpuviewer-core --lib          # single-crate tests
+cargo test -p gpuviewer-core --test intel_fixtures          # one integration-test target
+cargo test -p gpuviewer-tui --test ndjson_contract <name>   # one test by name filter
+cargo fmt --check && cargo clippy --all-targets -- -D warnings   # what CI gates on
 cargo run --release -- --mock               # TUI with simulated GPUs
 cargo run --release -- --json --once --mock # one NDJSON frame + events to stdout (CI/scripting)
 cargo run --release -- --json --mock --interval 100   # fast-forward sim, NDJSON stream
@@ -37,14 +40,17 @@ cargo run --release -- demo --seed-only     # just build history-demo.db (no tty
 cargo run --release -- report --since 12h   # plain-text digest of recorded history
 cargo run --release -- export --since 12h out.gpvr    # shareable incident slice
 cargo run --release -- view out.gpvr        # replay a .gpvr read-only, no GPU required
+cargo run --release -- doctor               # what this build sees here (backends, metrics, xid, db)
 ```
 
 Flags: `--json`, `--once`, `--mock`, `--interval <ms>` (default 1000, clamped to min 100 with
 a stderr warning), `--db <path>`, `--no-persist` (disable recording — replay and `report` need
 it), `--no-backoff` (disable the adaptive idle cadence), `--on-event 'CMD'` (per event, with
 `GPV_EVENT_*` env vars, capped 60 spawns/min; `sh -c` on Unix, `cmd /C` on Windows), `-V`/`-h`.
-`report` takes `--since`/`--until`/`--db`/`--mock`; `export` takes `--since`/`--db`/`--mock`
-plus one output path — its window **always ends now**, there is no `--until`. Time specs:
+`report` takes `--since`/`--until`/`--db`/`--mock`/`--json` (one `"type":"report"` object);
+`export` takes `--since`/`--until`/`--db`/`--mock`/`--keep-cmdline` plus one output path (an
+inverted window is refused); `doctor` takes `--db`/`--mock` and never opens the db for
+writing. Time specs:
 `30s`/`45m`/`12h`/`7d` or `HH:MM` (today, else yesterday); default window 24h. **Subcommands
 must be the first argument** (`gpuviewer --mock report` fails with "unknown flag: report").
 
@@ -71,7 +77,13 @@ process, and event rows window-filtered; `export_from_ms`/`export_to_ms` stamped
 constants): 10s detail and per-process rows 48h; 1m rollups and events 30d; the Recorder
 auto-prunes roughly hourly. `--json` treats a closed stdout (`| head`) as a clean shutdown with
 the recording tail persisted, and a `--once` run ends with the `recording_stopped` stop-mark as
-its final NDJSON line.
+its final NDJSON line. SIGTERM/SIGINT/SIGHUP (`signals.rs`, live modes only) set a cooperative
+flag the loops poll — same clean exit as `q`, stop mark included; a second signal exits at
+once. In raw mode Ctrl-C arrives as a key, and the event loop quits on it before dispatch.
+
+Process command lines (`proc_meta::parse_cmdline`) have argv0 reduced to its basename and
+secret-looking argument values redacted to `***` **at capture**; `export` writes them NULL
+unless `--keep-cmdline` — a `.gpvr` is made to be shared, so redaction is never relied on.
 
 MSRV is **1.95**, pinned once at the workspace root (`[workspace.package] rust-version`) and
 inherited by every crate — forced by libsqlite3-sys 0.38 (rusqlite 0.40, bundled) using
@@ -82,11 +94,15 @@ inherited by every crate — forced by libsqlite3-sys 0.38 (rusqlite 0.40, bundl
 
 - `crates/core` — model (`model.rs`), `GpuBackend` trait + registry (`backend.rs`), event
   derivation (`events.rs`), mock simulation (`mock.rs`), shared Linux `/proc` metadata
-  (`proc_meta.rs` — `CpuTracker` cumulative-ticks→rate and `parse_cgroup`/`container_of`
-  docker/k8s/podman/lxc labels, never a fabricated id; used by all three Linux backends), and
+  (`proc_meta.rs` — `CpuTracker` cumulative-ticks→rate, `parse_cgroup`/`container_of`
+  docker/k8s/podman/lxc labels (never a fabricated id), and `cmdline_of`; used by all three
+  Linux backends), the NVIDIA Xid kernel-log reader (`kmsg.rs` — pure `parse_xid` on every OS,
+  a non-blocking `/dev/kmsg` `XidWatcher` on Linux that starts at the buffer END; needs
+  CAP_SYSLOG under `dmesg_restrict=1`, otherwise off and reported by `doctor`), and
   the vendor backends: `nvidia.rs` (NVML, Linux+Windows), `amd.rs`/`intel.rs` (Linux
   sysfs/fdinfo), `wddm.rs` (Windows cross-vendor DXGI/PDH/D3DKMT), `apple.rs` (macOS Metal +
-  gated IOReport tiers). serde is the only unconditional dep; features `nvidia`/`wddm`/`apple`
+  gated IOReport tiers). serde is the only unconditional dep (`libc` is linux-only, for
+  `kmsg.rs`); features `nvidia`/`wddm`/`apple`
   (all default-on) pull target-gated deps — `nvml-wrapper` 0.12 (linux/windows,
   `legacy-functions`), `windows` 0.62 minor-pinned (windows), the objc2 family + `dlopen2` +
   `core-foundation` (macos; objc2's `exception` feature is **banned** — it compiles a C shim,
@@ -101,7 +117,11 @@ inherited by every crate — forced by libsqlite3-sys 0.38 (rusqlite 0.40, bundl
   `UNIQUE(ts_ms, device_id, kind, title)` created **only** by `migrate_event_dedupe`, never in
   `SCHEMA_SQL`: a CREATE UNIQUE there would fail on pre-v2 duplicates, read as corruption, and
   quarantine a healthy file. Schema changes = bump `SCHEMA_VERSION` + add a migration; never
-  add constraints to `SCHEMA_SQL` that can fail on existing data.
+  add constraints to `SCHEMA_SQL` that can fail on existing data. Current `SCHEMA_VERSION` 4:
+  v2 dedupe index, v3 `throttle_observed_n`, v4 `processes_10s.cmdline` — the v3/v4 columns
+  exist ONLY via ADD COLUMN migrations (not in `SCHEMA_SQL`), so `cmdline` is last in
+  `PROC_COLS` and read paths go through `proc_select_cols` (NULL for a pre-v4 file opened
+  read-only — old recordings and `.gpvr`s must still replay).
 - `crates/tui` — `collector.rs` (Engine = tick loop shared by TUI thread and `--json` mode,
   adaptive backoff, collector self-honesty events incl. device-lost/returned and recording
   start/stop session marks), `app.rs` (**three** modes: live, scroll-back replay with
@@ -110,8 +130,10 @@ inherited by every crate — forced by libsqlite3-sys 0.38 (rusqlite 0.40, bundl
   threadless `Collector::stationary`, where `Esc`/`r` stay inert; all rendering must read
   through the mode-gated `replay_window()`/`timeline_window()` accessors or a stale cache leaks
   into live), `ui.rs` (tabs/charts/gauges/process table/story feed + timeline strips and event
-  lane; STALE/LOST staleness affordances), `main.rs` (CLI: `report`/`demo`/`export`/`view`
-  subcommands, NDJSON emission).
+  lane; STALE/LOST staleness affordances; `f` story filter — Live indexes the FILTERED feed,
+  Replay keeps a real window index and skips hidden rows), `main.rs` (CLI:
+  `report`/`demo`/`export`/`view`/`doctor` subcommands, NDJSON emission), `doctor.rs`,
+  `signals.rs`.
 
 ## Roadmap sequencing (do not reorder casually)
 
@@ -154,23 +176,31 @@ exporter, cluster views, macOS per-process GPU (OS-prohibited — see below).
   raw 1Hz samples to SQLite. One timestamp per collection frame, not per metric.
 - **Events are two-tier**: facts (throttle bit set, process exited) asserted plainly;
   inferences (dataloader stall) always labeled "likely" and expandable to raw evidence.
-  A confidently-wrong narration kills the product's trust thesis. Concretely: **14 kinds**.
-  `EventEngine` derives throttle start/end and process attach/exit as Facts, plus four hedged
+  A confidently-wrong narration kills the product's trust thesis. Concretely: **20 kinds**.
+  `EventEngine` derives throttle start/end, process attach/exit, `power_limit_changed` (≥1 W
+  move; a blind tick is never a change) and `ecc_error` (volatile uncorrected counter rose, or
+  non-zero at first sight) as Facts, plus five hedged
   Likely inferences with hard-coded thresholds (consts in `events.rs`): VramPressure (≥85% of
   total climbing ≥16 MiB/min over a 180s window), IdleGap (util <10% for ≥10s after ≥30s of
   ≥50%, with a ≥256 MiB holder attached throughout; narrated at recovery), HangSuspected
   (device ≤2% + an idle ≥1 GiB holder unbroken for 600s), CpuSpillover (new ≥2 GiB holder, 90s
-  window, mean util <15% + mean CPU ≥150% of a core). The other six kinds (`collector_stall`,
-  `history_reset`, `device_lost`/`_returned`, `recording_started`/`_stopped`) are
-  collector-emitted facts about the recorder itself, never `EventEngine` output. Derivation
-  order inside `observe()` is load-bearing: throttle → spillover → process → hang → idle_gap →
-  vram. `throttle: None` means **unobservable**, never "not throttling" — an open throttle
+  window, mean util <15% + mean CPU ≥150% of a core), PcieLinkDegraded (≥50% util unbroken
+  for 60s with the link GENERATION below NVML's max — width is shown, never judged: a laptop
+  RTX 4090 measured x8 under load against a reported x16 max). The other eight kinds
+  (`collector_stall`, `history_reset`, `device_lost`/`_returned`,
+  `recording_started`/`_stopped`/`_degraded`, `host_suspended` [Likely: wall−monotonic ≥30s
+  across one gap], `xid_error` [Fact, from `kmsg.rs`, repeats folded per minute]) are
+  collector-emitted, never `EventEngine` output. Derivation order inside `observe()` is
+  load-bearing: throttle → spillover → process → hang → idle_gap → vram, then the
+  device-only power-limit/ecc/pcie checks. `throttle: None` means **unobservable**, never "not throttling" — an open throttle
   episode is dropped silently on None, with no fabricated `ThrottleEnd`.
 - **Backoff policy** (tested constants — change together with `ui.rs`): idle = <5% util, with a
   util-less fallback for Intel (encoder/decoder ≥5%, an asserted throttle bit, ≥4 MiB VRAM
   delta, or >25 MHz clock jitter); 60 consecutive all-idle ticks stretch cadence to 5×
   interval capped at 10s, and any activity snaps back instantly; **a failed probe is not idle**
-  — faults are watched at full rate. Stall threshold = `max(3×interval, 5s)`; 3 consecutive
+  — faults are watched at full rate. Stall threshold = `max(3×cadence, 5s)` where cadence is
+  the sleep the collector actually takes (`Engine::set_cadence`) — judging a backed-off 5s
+  sleep against the 1s interval narrated a false stall every low-power tick; 3 consecutive
   tick panics = Critical event + collection stops. Charts never bridge gaps >15s
   (`ui.rs GAP_BRIDGE_S`, derived from the 10s backoff cap — unrecorded time must render as a
   hole, never as zero).
@@ -221,15 +251,17 @@ exporter, cluster views, macOS per-process GPU (OS-prohibited — see below).
   builder *and* layout entry together.
 - The NDJSON contract has a conformance suite (`crates/tui/tests/ndjson_contract.rs`) that runs
   the built binary and **hand-asserts** the wire format documented in `docs/spec/ndjson-v1.md`
-  (hardcoded 14-kind event list; `recording_stopped` must be the final line of a `--once` run).
+  (hardcoded 20-kind event list; `recording_stopped` must be the final line of a `--once` run).
   `ndjson-v1.schema.json` has **no automated consumer** — stream changes must update spec,
   schema, and suite together by hand; the suite only enforces the first and third.
-- CLI behavior is pinned by `crates/tui/tests/launch_artifacts.rs` — 7 tests running the real
+- CLI behavior is pinned by `crates/tui/tests/launch_artifacts.rs` — 11 tests running the real
   built binary hermetically (`XDG_DATA_HOME`/`HOME`/`LOCALAPPDATA`/`USERPROFILE` all redirected
   to a scratch dir): `demo --seed-only` without a tty, export window math + overwrite refusal,
   `view` junk-file rejection, EPIPE clean exit, the mock/real DB contamination guard in both
   directions, the single-recorder instance lock (incl. a bounded post-kill retry for Windows
-  `LockFileEx` release delay), and `--help` coverage. Keep new CLI surfaces covered there.
+  `LockFileEx` release delay), `--help` coverage, `export --until`/`--keep-cmdline`,
+  `report --json`, `doctor` (writes no db), and (unix) SIGTERM ending a `--json` session with
+  the stop mark as its last line. Keep new CLI surfaces covered there.
 - NVML loader plumbing tested against a stub `.so` exporting a subset of NVML symbols:
   `crates/core/tests/nvml_stub_loader.rs` (Linux-only **and** gated on the default `nvidia`
   feature — a `--no-default-features` run silently drops it to zero tests) compiles
@@ -248,11 +280,12 @@ windows-latest, macos-15 (pinned: `macos-latest` re-points to macos-26 from 2026
 `cargo fmt --check` runs on ubuntu only; `cargo clippy --all-targets -- -D warnings` runs on
 **every** leg — ubuntu alone would never compile the cfg(windows)/cfg(macos) paths; `cargo test`
 on every leg (mock backend, no GPU). The Linux leg enforces a lying-green guard: fixture-suite
-test counts must stay ≥ committed floors (amd_fixtures 19, intel_fixtures 23, nvml_stub_loader
+test counts must stay ≥ committed floors (amd_fixtures 34, intel_fixtures 43, nvml_stub_loader
 2, enumerated via `cargo test --test <t> -- --list`) — **raise** the floor when adding fixture
-tests; never lower it without a recorded reason. A manual-only `macos-probe` job
-(workflow_dispatch) dumps `ioreg` and runs `examples/macos_probe.rs` for ground-truth fixture
-capture.
+tests; never lower it without a recorded reason. The manual-only `macos-probe` job lives in
+its **own** workflow, `.github/workflows/macos-probe.yml` (workflow_dispatch) — it was moved
+out of ci.yml because a conditional job reports as a SKIPPED check on every push. It dumps
+`ioreg` and runs `crates/core/examples/macos_probe.rs` for ground-truth fixture capture.
 
 Local cross-target checks (fast feedback, core crate only — `-history`/`-tui` cannot cross-check
 here because libsqlite3-sys's bundled C build needs a target C toolchain):
