@@ -1401,8 +1401,9 @@ impl EventSink {
         });
     }
 
-    /// Hooks currently alive (test visibility for the live cap).
-    #[cfg(test)]
+    /// Hooks currently alive (test visibility for the live cap; the never-exiting-hook
+    /// fixture is `sleep`, so unix-only).
+    #[cfg(all(test, unix))]
     fn live(&self) -> usize {
         self.children.len()
     }
@@ -1416,8 +1417,8 @@ impl EventSink {
         self.children.clear();
     }
 
-    /// Kill every live hook (tests only — the never-exiting-hook fixture).
-    #[cfg(test)]
+    /// Kill every live hook (tests only — the never-exiting-hook fixture, unix-only).
+    #[cfg(all(test, unix))]
     fn kill_all(&mut self) {
         for (c, _) in &mut self.children {
             let _ = c.kill();
