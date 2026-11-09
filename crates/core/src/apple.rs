@@ -559,6 +559,9 @@ mod backend_impl {
                 // unified-memory answer. SOURCE_CAVEAT (private interfaces) joins this
                 // the moment Tier B/C goes live (§4.3).
                 source_caveat: Some(tier_a_source_caveat(self.has_unified_memory).to_string()),
+                // Apple Silicon GPUs are on-die: there is no PCIe link to describe.
+                pcie_max_gen: None,
+                pcie_max_width: None,
             })
         }
 
@@ -583,6 +586,10 @@ mod backend_impl {
                 // An all-false struct would read as a fact-grade "not throttling": a
                 // fabricated negative this source has no basis to assert.
                 throttle: None,
+                power_limit_mw: None,
+                pcie_gen: None, // on-die GPU: no PCIe link
+                pcie_width: None,
+                ecc_uncorrected: None,
             })
         }
 

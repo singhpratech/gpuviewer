@@ -378,6 +378,78 @@ fn paused_event(paused_at_ms: u64, now_ms: u64, anchor: DeviceId) -> Event {
     }
 }
 
+/// Repeats of the same Xid code on the same device inside this window are folded into a
+/// count carried by the next narration.
+const XID_REPEAT_WINDOW_MS: u64 = 60_000;
+
+/// Xid codes NVIDIA documents as fatal to the running context or the device (fallen off
+/// the bus, double-bit ECC, uncontained ECC, NVLink failure, GSP timeouts, row-remap
+/// failure). Severity is presentation only; the narration quotes the driver either way.
+const XID_CRITICAL: &[u32] = &[48, 64, 74, 79, 95, 119, 120, 154];
+
+/// The `xid_error` fact: the driver's own words, attributed, never reinterpreted.
+fn xid_event(
+    di: usize,
+    id: &DeviceId,
+    x: &gpuviewer_core::kmsg::XidRecord,
+    folded: u32,
+    at_ms: u64,
+) -> Event {
+    // Lift the optional `pid=…, name=…` prefix out of the description for the title.
+    let mut pid = None;
+    let mut pname = None;
+    let mut rest = x.detail.as_str();
+    loop {
+        let r = rest.trim_start();
+        if let Some(v) = r.strip_prefix("pid=") {
+            let (val, tail) = v.split_once(',').unwrap_or((v, ""));
+            pid = Some(val.trim().to_string());
+            rest = tail;
+        } else if let Some(v) = r.strip_prefix("name=") {
+            let (val, tail) = v.split_once(',').unwrap_or((v, ""));
+            pname = Some(val.trim().to_string());
+            rest = tail;
+        } else {
+            rest = r;
+            break;
+        }
+    }
+    let who = match (pname, pid) {
+        (Some(n), Some(p)) => format!(" ({n} pid {p})"),
+        (None, Some(p)) => format!(" (pid {p})"),
+        _ => String::new(),
+    };
+    let desc = if rest.is_empty() {
+        String::new()
+    } else {
+        format!(": {rest}")
+    };
+    Event {
+        ts_ms: at_ms,
+        device: id.clone(),
+        kind: EventKind::XidError,
+        severity: if XID_CRITICAL.contains(&x.code) {
+            Severity::Critical
+        } else {
+            Severity::Warning
+        },
+        confidence: Confidence::Fact,
+        title: format!("GPU{di} driver reported Xid {}{desc}{who}", x.code),
+        evidence: format!(
+            "kernel log: {}{}",
+            x.raw,
+            if folded > 0 {
+                format!(
+                    " — {folded} earlier repeat{} of this Xid in the previous minute folded",
+                    if folded == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            }
+        ),
+    }
+}
+
 /// A single backend `refresh_dynamic` probe taking longer than this is worth a one-line
 /// Info note ("nvidia probe took 1.2s — driver slow to respond"): NVML/sysfs calls can block
 /// (PCIe-throughput queries, a sleeping GPU waking) and a slow probe foreshadows a stall.
@@ -441,6 +513,13 @@ pub struct Engine {
     cadence: Duration,
     /// Unix ms the user paused collection (TUI `p`), until the next tick narrates it.
     paused_since_ms: Option<u64>,
+    /// Kernel-log reader for NVIDIA Xid errors — Linux, a real NVIDIA device registered,
+    /// and a readable `/dev/kmsg`; otherwise `None` (`gpuviewer doctor` explains why).
+    #[cfg(target_os = "linux")]
+    xid: Option<gpuviewer_core::kmsg::XidWatcher>,
+    /// Per (device index, Xid code): when it was last narrated and how many repeats were
+    /// folded since — a driver can log the same Xid many times a second.
+    xid_last: HashMap<(usize, u32), (u64, u32)>,
     /// Last time we emitted a slow-probe note for a given device.
     last_slow_note: HashMap<DeviceId, Instant>,
     /// A pending `HistoryReset` to fold into the very first tick's events (the store reported
@@ -509,6 +588,11 @@ impl Engine {
                             seen_pci.insert(key, b.name());
                         }
                         event_engine.register_device(id.clone(), format!("GPU{}", devices.len()));
+                        event_engine.register_pcie_max(
+                            id.clone(),
+                            info.pcie_max_gen,
+                            info.pcie_max_width,
+                        );
                         devices.push((bi, id, info));
                     }
                     Err(e) => {
@@ -643,6 +727,13 @@ impl Engine {
 
         let sink = config.on_event.map(EventSink::new);
         let health = vec![ProbeHealth::default(); devices.len()];
+        #[cfg(target_os = "linux")]
+        let xid = (!mock_in_use
+            && devices
+                .iter()
+                .any(|(_, _, i)| i.vendor == gpuviewer_core::Vendor::Nvidia))
+        .then(gpuviewer_core::kmsg::XidWatcher::open)
+        .and_then(Result::ok);
 
         Self {
             backends,
@@ -655,6 +746,9 @@ impl Engine {
             last_tick_end_wall_ms: None,
             cadence: config.interval,
             paused_since_ms: None,
+            #[cfg(target_os = "linux")]
+            xid,
+            xid_last: HashMap::new(),
             last_slow_note: HashMap::new(),
             pending_reset,
             pending_session_start,
@@ -852,6 +946,14 @@ impl Engine {
             });
         }
 
+        // Driver-logged Xid errors since the last tick, attributed by PCI address.
+        #[cfg(target_os = "linux")]
+        {
+            let records = self.xid.as_mut().map(|w| w.poll()).unwrap_or_default();
+            let ids: Vec<DeviceId> = self.devices.iter().map(|(_, id, _)| id.clone()).collect();
+            events.extend(self.xid_events(&ids, records, now_ms()));
+        }
+
         // Persistence edges: the recorder swallowed any write error above, so ask it
         // whether its ability to record just changed and narrate the edge. Done before
         // the events are persisted below, so the degraded fact is itself in the batch —
@@ -918,6 +1020,51 @@ impl Engine {
     /// rather than a stall. Idempotent — the earliest pause instant is kept.
     pub fn note_paused(&mut self) {
         self.paused_since_ms.get_or_insert_with(now_ms);
+    }
+
+    /// Turn parsed Xid records into `xid_error` facts, attributing each to the device
+    /// whose PCI address it names (an Xid for a device we do not monitor is dropped — the
+    /// wire contract says every event's `device` names a frame device). Repeats of the same
+    /// (device, code) within [`XID_REPEAT_WINDOW_MS`] are folded and counted into the next
+    /// narration instead of flooding the feed.
+    fn xid_events(
+        &mut self,
+        ids: &[DeviceId],
+        records: Vec<gpuviewer_core::kmsg::XidRecord>,
+        at_ms: u64,
+    ) -> Vec<Event> {
+        let mut out = Vec::new();
+        for x in records {
+            let Some(di) = ids
+                .iter()
+                .position(|id| gpuviewer_core::kmsg::xid_matches_device(&x.pci, &id.0))
+            else {
+                continue;
+            };
+            let key = (di, x.code);
+            let folded = match self.xid_last.get_mut(&key) {
+                Some((last, n)) if at_ms.saturating_sub(*last) < XID_REPEAT_WINDOW_MS => {
+                    *n += 1;
+                    continue;
+                }
+                Some((_, n)) => std::mem::take(n),
+                None => 0,
+            };
+            self.xid_last.insert(key, (at_ms, 0));
+            out.push(xid_event(di, &ids[di], &x, folded, at_ms));
+        }
+        out
+    }
+
+    /// Test seam: feed Xid records as if the kernel log produced them this tick.
+    #[cfg(test)]
+    pub(crate) fn inject_xid(
+        &mut self,
+        records: Vec<gpuviewer_core::kmsg::XidRecord>,
+        at_ms: u64,
+    ) -> Vec<Event> {
+        let ids: Vec<DeviceId> = self.devices.iter().map(|(_, id, _)| id.clone()).collect();
+        self.xid_events(&ids, records, at_ms)
     }
 
     /// The `device` anchor for collector-scoped events (stall, panic, session boundary):
@@ -1814,6 +1961,10 @@ mod tests {
             // Most scripted ticks model an observing source that sees no throttle;
             // the bare-sample "no signal at all" test overrides this to None.
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 
@@ -2229,6 +2380,8 @@ mod tests {
                 driver_version: None,
                 process_hint: None,
                 source_caveat: None,
+                pcie_max_gen: None,
+                pcie_max_width: None,
             })
         }
         fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {
@@ -2491,6 +2644,8 @@ mod tests {
                 driver_version: None,
                 process_hint: None,
                 source_caveat: None,
+                pcie_max_gen: None,
+                pcie_max_width: None,
             })
         }
         fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {
@@ -2847,6 +3002,8 @@ mod tests {
                 driver_version: None,
                 process_hint: None,
                 source_caveat: None,
+                pcie_max_gen: None,
+                pcie_max_width: None,
             })
         }
         fn refresh_dynamic(&mut self, _dev: &DeviceId) -> Result<DynamicSample, BackendError> {
@@ -3725,5 +3882,49 @@ mod tests {
         assert_eq!(sink.live(), SINK_MAX_LIVE, "survivors are capped");
         assert!(sink.warned, "hitting the live cap warns");
         sink.kill_all();
+    }
+
+    /// Xid attribution, wording, and repeat folding — exercised through the injection
+    /// seam (the kernel log itself is a hardware/privilege matter for the checklist).
+    #[test]
+    fn xid_records_become_attributed_facts_with_repeats_folded() {
+        use gpuviewer_core::kmsg::parse_xid;
+        let mut engine = flaky_engine(None, |_| false);
+        // flaky_engine's device id is not a PCI address; re-point it at one.
+        engine.devices[0].1 = DeviceId("0000:01:00.0".into());
+        let x79 = parse_xid(
+            "NVRM: Xid (PCI:0000:01:00): 79, pid=4521, name=python, GPU has fallen off the bus.",
+        )
+        .unwrap();
+        let other = parse_xid("NVRM: Xid (PCI:0000:02:00): 13, Graphics Exception").unwrap();
+
+        let ev = engine.inject_xid(vec![x79.clone(), other], 1_000);
+        assert_eq!(ev.len(), 1, "an Xid for an unmonitored device is dropped");
+        let e = &ev[0];
+        assert_eq!(e.kind, EventKind::XidError);
+        assert_eq!(e.confidence, Confidence::Fact);
+        assert_eq!(e.severity, Severity::Critical, "Xid 79 is fatal");
+        assert_eq!(
+            e.title,
+            "GPU0 driver reported Xid 79: GPU has fallen off the bus (python pid 4521)"
+        );
+        assert!(
+            e.evidence.contains("NVRM: Xid (PCI:0000:01:00): 79"),
+            "{}",
+            e.evidence
+        );
+
+        // Two repeats inside the minute fold silently...
+        assert!(engine
+            .inject_xid(vec![x79.clone(), x79.clone()], 2_000)
+            .is_empty());
+        // ...and are counted into the next narration once the window passes.
+        let ev = engine.inject_xid(vec![x79], 70_000);
+        assert_eq!(ev.len(), 1);
+        assert!(
+            ev[0].evidence.contains("2 earlier repeats"),
+            "{}",
+            ev[0].evidence
+        );
     }
 }

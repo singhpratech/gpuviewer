@@ -1636,6 +1636,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: None,
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         });
         let screen = draw(&app, &shared);
         assert!(
@@ -1813,6 +1817,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         });
 
         // Alive: no stale affordances anywhere.

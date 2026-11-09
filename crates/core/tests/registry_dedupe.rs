@@ -73,6 +73,8 @@ impl GpuBackend for ScriptedBackend {
             driver_version: None,
             process_hint: None,
             source_caveat: None,
+            pcie_max_gen: None,
+            pcie_max_width: None,
         })
     }
 
@@ -92,6 +94,10 @@ impl GpuBackend for ScriptedBackend {
             encoder_pct: None,
             decoder_pct: None,
             throttle: None,
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         })
     }
 

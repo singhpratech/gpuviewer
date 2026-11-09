@@ -38,6 +38,11 @@ serde.workspace = true
 # binds extra lazily-loaded symbols).
 nvml-wrapper = { version = "0.12", optional = true, features = ["legacy-functions"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# kmsg.rs: O_NONBLOCK/EPIPE for the /dev/kmsg Xid reader. The libc crate is bindings to the
+# OS C library (already in the tree via crossterm), not a vendor SDK.
+libc = "0.2"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # OS system libraries (pdh/gdi32/dxgi), not vendor SDKs — direct linking is allowed.
 # Pin the minor: the Wdk_* feature namespace has moved between windows-rs releases.

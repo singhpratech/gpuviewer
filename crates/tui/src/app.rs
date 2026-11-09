@@ -837,6 +837,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 
@@ -925,6 +929,8 @@ mod tests {
             driver_version: None,
             process_hint: None,
             source_caveat: None,
+            pcie_max_gen: None,
+            pcie_max_width: None,
         }];
         let collector = crate::collector::Collector::stationary(infos, Some(path.clone()));
         App::viewer(collector, store, "incident.gpvr".into())

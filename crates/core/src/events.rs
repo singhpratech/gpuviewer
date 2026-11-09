@@ -83,6 +83,24 @@ pub enum EventKind {
     /// more than the monotonic clock (which stops during suspend). `Likely`, because a
     /// forward wall-clock step looks identical. Emitted by the tui collector.
     HostSuspended,
+    /// The driver's enforced power limit changed between two observations (`nvidia-smi
+    /// -pl`, a control panel, a power-capping policy). A FACT about the cap — never a claim
+    /// about who changed it or why. Warning when lowered (it caps clocks), Info when raised.
+    PowerLimitChanged,
+    /// The GPU ran busy for a sustained window while its PCIe link sat below what the
+    /// device and slot support together. An inference (`Likely`): link power management
+    /// legitimately lowers the speed, which is why it is only narrated under load — a
+    /// riser, a bad seat, or a lane-sharing slot is the usual cause, and it is never
+    /// claimed as such.
+    PcieLinkDegraded,
+    /// The device's uncorrectable-ECC counter (volatile, since driver load) rose, or was
+    /// already non-zero when first observed. A FACT straight from the driver counter; on
+    /// datacenter parts this is the earliest warning before a job dies.
+    EccError,
+    /// The NVIDIA kernel driver logged an Xid error for this device (read from the kernel
+    /// log). A FACT: the driver's own message is quoted verbatim, never reinterpreted.
+    /// Emitted by the tui collector, which owns the kernel-log reader.
+    XidError,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +169,16 @@ struct DevState {
     pre_throttle_clock: Option<u32>,
     vram_window: VecDeque<(u64, u64)>,
     last_pressure_evt: Option<u64>,
+    /// Last OBSERVED enforced power limit — a blind tick (`None`) keeps the previous value,
+    /// so a hiccup is never narrated as a change.
+    last_power_limit_mw: Option<u32>,
+    /// Last observed volatile uncorrectable-ECC count, and whether one was ever observed.
+    last_ecc: Option<u64>,
+    /// An under-load PCIe-link episode in flight (see [`PcieEpisode`]).
+    pcie: Option<PcieEpisode>,
+    /// Latched once a degraded-link episode was narrated; cleared only when the link is
+    /// observed back at its maximum, so one bad seat narrates once, not once per minute.
+    pcie_narrated: bool,
     /// ts when util first crossed `IDLE_ACTIVE_UTIL_PCT`; None while below it.
     active_since: Option<u64>,
     /// Latched after `IDLE_ACTIVE_MIN_MS` of sustained activity: a trough only reads
@@ -201,6 +229,16 @@ struct HangEpisode {
     fired: bool,
 }
 
+/// A sustained under-load window with the PCIe link below its maximum.
+struct PcieEpisode {
+    start_ms: u64,
+    util_sum: f64,
+    util_n: u32,
+    /// Lowest generation and width seen during the episode, for the narration.
+    min_gen: u32,
+    min_width: u32,
+}
+
 /// A CPU-spillover assessment in flight for one freshly-attached big-memory process.
 struct Spillover {
     name: String,
@@ -219,6 +257,8 @@ struct Spillover {
 pub struct EventEngine {
     state: HashMap<DeviceId, DevState>,
     short_names: HashMap<DeviceId, String>,
+    /// Per-device PCIe maxima (device ∧ slot) — the baseline for the degraded-link check.
+    pcie_max: HashMap<DeviceId, (u32, u32)>,
 }
 
 impl EventEngine {
@@ -229,6 +269,22 @@ impl EventEngine {
     /// Register a friendly short name ("GPU0") used in narration.
     pub fn register_device(&mut self, id: DeviceId, short_name: String) {
         self.short_names.insert(id, short_name);
+    }
+
+    /// Register the PCIe link maxima (generation, width) the device and its slot support
+    /// together. Without both, the degraded-link inference stays silent for the device —
+    /// there is no honest baseline to compare against.
+    pub fn register_pcie_max(
+        &mut self,
+        id: DeviceId,
+        max_gen: Option<u32>,
+        max_width: Option<u32>,
+    ) {
+        if let (Some(g), Some(w)) = (max_gen, max_width) {
+            if g > 0 && w > 0 {
+                self.pcie_max.insert(id, (g, w));
+            }
+        }
     }
 
     fn short(&self, id: &DeviceId) -> String {
@@ -259,6 +315,7 @@ impl EventEngine {
         temp_slowdown_c: Option<f32>,
     ) -> Vec<Event> {
         let name = self.short(device);
+        let pcie_max = self.pcie_max.get(device).copied();
         let st = self.state.entry(device.clone()).or_default();
         let mut out = Vec::new();
 
@@ -293,6 +350,11 @@ impl EventEngine {
             }
         }
         vram_pressure_events(st, device, &name, sample, mem_total, &mut out);
+        // State-change facts and the link inference ride last: they read only the device
+        // sample, so their position cannot disturb the load-bearing order above.
+        power_limit_events(st, device, &name, sample, &mut out);
+        ecc_events(st, device, &name, sample, &mut out);
+        pcie_link_events(st, device, &name, sample, pcie_max, &mut out);
 
         st.prev = Some(sample.clone());
         out
@@ -840,6 +902,185 @@ fn vram_pressure_events(
     });
 }
 
+/// Smallest power-limit change narrated, milliwatts — below this is rounding between
+/// driver reads, not somebody moving the cap.
+const POWER_LIMIT_MIN_DELTA_MW: u32 = 1_000;
+
+fn power_limit_events(
+    st: &mut DevState,
+    device: &DeviceId,
+    name: &str,
+    sample: &DynamicSample,
+    out: &mut Vec<Event>,
+) {
+    let Some(now) = sample.power_limit_mw else {
+        return; // unobservable this tick: keep the last observed value, claim nothing
+    };
+    if let Some(prev) = st.last_power_limit_mw {
+        if prev.abs_diff(now) >= POWER_LIMIT_MIN_DELTA_MW {
+            let lowered = now < prev;
+            out.push(Event {
+                ts_ms: sample.ts_ms,
+                device: device.clone(),
+                kind: EventKind::PowerLimitChanged,
+                severity: if lowered {
+                    Severity::Warning
+                } else {
+                    Severity::Info
+                },
+                confidence: Confidence::Fact,
+                title: format!(
+                    "{name} power limit {} {}→{} W",
+                    if lowered { "lowered" } else { "raised" },
+                    fmt_watts(prev),
+                    fmt_watts(now)
+                ),
+                evidence: format!(
+                    "enforced power limit read {prev} mW, now {now} mW{}",
+                    match sample.power_mw {
+                        Some(p) => format!("; drawing {} W at the change", fmt_watts(p)),
+                        None => String::new(),
+                    }
+                ),
+            });
+        }
+    }
+    st.last_power_limit_mw = Some(now);
+}
+
+fn ecc_events(
+    st: &mut DevState,
+    device: &DeviceId,
+    name: &str,
+    sample: &DynamicSample,
+    out: &mut Vec<Event>,
+) {
+    let Some(now) = sample.ecc_uncorrected else {
+        return; // no ECC on this part, ECC disabled, or a blind tick — never "zero"
+    };
+    match st.last_ecc {
+        Some(prev) if now > prev => out.push(Event {
+            ts_ms: sample.ts_ms,
+            device: device.clone(),
+            kind: EventKind::EccError,
+            severity: Severity::Critical,
+            confidence: Confidence::Fact,
+            title: format!(
+                "{name} reported {} new uncorrectable ECC memory error{} ({now} since driver load)",
+                now - prev,
+                if now - prev == 1 { "" } else { "s" }
+            ),
+            evidence: format!(
+                "volatile uncorrected ECC counter {prev} → {now}; uncorrectable errors \
+                 corrupt the data a kernel reads and usually precede an Xid or a job abort"
+            ),
+        }),
+        None if now > 0 => out.push(Event {
+            ts_ms: sample.ts_ms,
+            device: device.clone(),
+            kind: EventKind::EccError,
+            severity: Severity::Warning,
+            confidence: Confidence::Fact,
+            title: format!(
+                "{name} already has {now} uncorrectable ECC memory error{} since driver load",
+                if now == 1 { "" } else { "s" }
+            ),
+            evidence: format!(
+                "volatile uncorrected ECC counter read {now} at the first observation of \
+                 this session; when they occurred is not knowable from the counter"
+            ),
+        }),
+        // Equal, or lower (a driver reload resets the volatile counter): nothing new.
+        _ => {}
+    }
+    st.last_ecc = Some(now);
+}
+
+/// Device util that counts as "busy" for the degraded-link check: NVIDIA raises the link
+/// to full speed under real load, so a low link is only a story while the GPU is working.
+const PCIE_BUSY_UTIL_PCT: f32 = 50.0;
+/// How long the busy-and-below-max pattern must hold, unbroken, before it is narrated.
+const PCIE_DEGRADED_MIN_MS: u64 = 60_000;
+
+fn pcie_link_events(
+    st: &mut DevState,
+    device: &DeviceId,
+    name: &str,
+    sample: &DynamicSample,
+    max: Option<(u32, u32)>,
+    out: &mut Vec<Event>,
+) {
+    let (Some((max_gen, max_width)), Some(gen), Some(width)) =
+        (max, sample.pcie_gen, sample.pcie_width)
+    else {
+        st.pcie = None; // no baseline or a blind tick: the "unbroken" premise is gone
+        return;
+    };
+    if gen >= max_gen && width >= max_width {
+        // Observed at full link: the episode (and the narrated latch) are over.
+        st.pcie = None;
+        st.pcie_narrated = false;
+        return;
+    }
+    let busy = sample.util_pct.filter(|u| *u >= PCIE_BUSY_UTIL_PCT);
+    let Some(util) = busy else {
+        st.pcie = None; // idle link power management is normal — never a story
+        return;
+    };
+    if st.pcie_narrated {
+        return;
+    }
+    let ep = st.pcie.get_or_insert(PcieEpisode {
+        start_ms: sample.ts_ms,
+        util_sum: 0.0,
+        util_n: 0,
+        min_gen: gen,
+        min_width: width,
+    });
+    ep.util_sum += util as f64;
+    ep.util_n += 1;
+    ep.min_gen = ep.min_gen.min(gen);
+    ep.min_width = ep.min_width.min(width);
+    let held = sample.ts_ms.saturating_sub(ep.start_ms);
+    if held < PCIE_DEGRADED_MIN_MS {
+        return;
+    }
+    let mean = ep.util_sum / ep.util_n.max(1) as f64;
+    out.push(Event {
+        ts_ms: sample.ts_ms,
+        device: device.clone(),
+        kind: EventKind::PcieLinkDegraded,
+        severity: Severity::Warning,
+        confidence: Confidence::Likely,
+        title: format!(
+            "{name} PCIe link likely degraded — Gen{} x{} under load for {} (supports Gen{max_gen} x{max_width})",
+            ep.min_gen,
+            ep.min_width,
+            fmt_dur_ms(held)
+        ),
+        evidence: format!(
+            "link at or below Gen{} x{} for {} while device util averaged {mean:.0}% \
+             (≥{PCIE_BUSY_UTIL_PCT:.0}% every tick); device+slot maximum Gen{max_gen} \
+             x{max_width}. Links slow down at idle by design, so only a busy GPU is judged; \
+             a riser, a loose seat, or a slot sharing lanes are common causes",
+            ep.min_gen,
+            ep.min_width,
+            fmt_dur_ms(held)
+        ),
+    });
+    st.pcie = None;
+    st.pcie_narrated = true;
+}
+
+/// Milliwatts → a compact watts string ("450", "287.5").
+fn fmt_watts(mw: u32) -> String {
+    if mw.is_multiple_of(1000) {
+        format!("{}", mw / 1000)
+    } else {
+        format!("{:.1}", mw as f64 / 1000.0)
+    }
+}
+
 fn severity_for(t: &ThrottleReasons) -> Severity {
     if t.hw_slowdown {
         Severity::Critical
@@ -887,6 +1128,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 
@@ -1021,6 +1266,192 @@ mod tests {
         assert_eq!(
             n, 1,
             "fully-observed near-idle GPU plus hot CPU must still narrate exactly once"
+        );
+    }
+
+    /// A busy 1 Hz sample carrying the state-change fields under test.
+    fn state_sample(
+        ts_ms: u64,
+        util: f32,
+        power_limit_mw: Option<u32>,
+        link: Option<(u32, u32)>,
+        ecc: Option<u64>,
+    ) -> DynamicSample {
+        DynamicSample {
+            power_limit_mw,
+            pcie_gen: link.map(|l| l.0),
+            pcie_width: link.map(|l| l.1),
+            ecc_uncorrected: ecc,
+            ..opt_sample(ts_ms, Some(util))
+        }
+    }
+
+    fn kinds(out: &[Event], k: EventKind) -> Vec<&Event> {
+        out.iter().filter(|e| e.kind == k).collect()
+    }
+
+    #[test]
+    fn power_limit_change_is_a_fact_and_a_blind_tick_is_not_a_change() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("d".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+        let mut out = Vec::new();
+        for (ts, pl) in [
+            (0, Some(450_000)),
+            (1_000, Some(450_200)), // sub-watt jitter: silent
+            (2_000, None),          // blind: silent, value kept
+            (3_000, Some(450_000)), // same as before the blind tick: silent
+            (4_000, Some(350_000)), // lowered: Warning
+            (5_000, Some(400_000)), // raised: Info
+        ] {
+            out.extend(engine.observe(
+                &dev,
+                &state_sample(ts, 90.0, pl, None, None),
+                Some(&[]),
+                None,
+                None,
+            ));
+        }
+        let ev = kinds(&out, EventKind::PowerLimitChanged);
+        assert_eq!(
+            ev.len(),
+            2,
+            "{:?}",
+            ev.iter().map(|e| &e.title).collect::<Vec<_>>()
+        );
+        assert_eq!(ev[0].severity, Severity::Warning);
+        assert_eq!(ev[0].confidence, Confidence::Fact);
+        assert!(ev[0].title.contains("lowered 450→350 W"), "{}", ev[0].title);
+        assert_eq!(ev[1].severity, Severity::Info);
+        assert!(ev[1].title.contains("raised 350→400 W"), "{}", ev[1].title);
+    }
+
+    #[test]
+    fn ecc_counter_rise_is_critical_and_none_is_never_zero() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("d".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+        let mut out = Vec::new();
+        for (ts, ecc) in [
+            (0, None),
+            (1_000, Some(0)),
+            (2_000, None),
+            (3_000, Some(0)),
+            (4_000, Some(2)),
+        ] {
+            out.extend(engine.observe(
+                &dev,
+                &state_sample(ts, 90.0, None, None, ecc),
+                Some(&[]),
+                None,
+                None,
+            ));
+        }
+        let ev = kinds(&out, EventKind::EccError);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].severity, Severity::Critical);
+        assert!(
+            ev[0].title.contains("2 new uncorrectable"),
+            "{}",
+            ev[0].title
+        );
+
+        // A counter already non-zero on first sight is narrated once, as pre-existing.
+        let mut engine = EventEngine::new();
+        let out = engine.observe(
+            &dev,
+            &state_sample(0, 90.0, None, None, Some(3)),
+            Some(&[]),
+            None,
+            None,
+        );
+        let ev = kinds(&out, EventKind::EccError);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].severity, Severity::Warning);
+        assert!(ev[0].title.contains("already has 3"), "{}", ev[0].title);
+        // A driver reload resets the volatile counter downward: nothing new to say.
+        let out = engine.observe(
+            &dev,
+            &state_sample(1_000, 90.0, None, None, Some(0)),
+            Some(&[]),
+            None,
+            None,
+        );
+        assert!(kinds(&out, EventKind::EccError).is_empty());
+    }
+
+    #[test]
+    fn pcie_link_degraded_needs_a_busy_unbroken_minute_and_narrates_once() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("d".into());
+        engine.register_device(dev.clone(), "GPU0".into());
+        engine.register_pcie_max(dev.clone(), Some(4), Some(16));
+        let drive = |engine: &mut EventEngine,
+                     range: std::ops::RangeInclusive<u64>,
+                     util: f32,
+                     link: (u32, u32)| {
+            let mut out = Vec::new();
+            for ts in range.step_by(1000) {
+                out.extend(engine.observe(
+                    &dev,
+                    &state_sample(ts, util, None, Some(link), None),
+                    Some(&[]),
+                    None,
+                    None,
+                ));
+            }
+            out
+        };
+        // Idle at Gen1: link power management, never a story.
+        let out = drive(&mut engine, 0..=120_000, 3.0, (1, 16));
+        assert!(
+            kinds(&out, EventKind::PcieLinkDegraded).is_empty(),
+            "idle downclock is normal"
+        );
+        // Busy at full link: silent.
+        let out = drive(&mut engine, 121_000..=200_000, 95.0, (4, 16));
+        assert!(kinds(&out, EventKind::PcieLinkDegraded).is_empty());
+        // Busy at x8 for 59s, then util drops: the unbroken premise breaks, silent.
+        let mut out = drive(&mut engine, 201_000..=259_000, 95.0, (4, 8));
+        out.extend(drive(&mut engine, 260_000..=261_000, 20.0, (4, 8)));
+        assert!(
+            kinds(&out, EventKind::PcieLinkDegraded).is_empty(),
+            "59s is under the bar"
+        );
+        // Busy at x8 for a full minute: narrated once, hedged.
+        let out = drive(&mut engine, 262_000..=400_000, 95.0, (4, 8));
+        let ev = kinds(&out, EventKind::PcieLinkDegraded);
+        assert_eq!(ev.len(), 1, "one bad seat narrates once, not every minute");
+        assert_eq!(ev[0].confidence, Confidence::Likely);
+        assert!(ev[0].title.contains("likely"), "{}", ev[0].title);
+        assert!(
+            ev[0].title.contains("Gen4 x8") && ev[0].title.contains("Gen4 x16"),
+            "{}",
+            ev[0].title
+        );
+        // Back at full link re-arms; a new degraded minute narrates again.
+        let mut out = drive(&mut engine, 401_000..=402_000, 95.0, (4, 16));
+        out.extend(drive(&mut engine, 403_000..=470_000, 95.0, (3, 16)));
+        assert_eq!(kinds(&out, EventKind::PcieLinkDegraded).len(), 1);
+    }
+
+    #[test]
+    fn pcie_link_check_is_silent_without_a_registered_baseline() {
+        let mut engine = EventEngine::new();
+        let dev = DeviceId("d".into());
+        let mut out = Vec::new();
+        for ts in (0..=200_000).step_by(1000) {
+            out.extend(engine.observe(
+                &dev,
+                &state_sample(ts, 95.0, None, Some((1, 4)), None),
+                Some(&[]),
+                None,
+                None,
+            ));
+        }
+        assert!(
+            kinds(&out, EventKind::PcieLinkDegraded).is_empty(),
+            "no maximum, no claim"
         );
     }
 }

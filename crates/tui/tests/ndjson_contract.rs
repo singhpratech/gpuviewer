@@ -197,6 +197,10 @@ fn unobservable_throttle_serializes_as_null_and_roundtrips() {
         encoder_pct: None,
         decoder_pct: None,
         throttle: None,
+        power_limit_mw: None,
+        pcie_gen: None,
+        pcie_width: None,
+        ecc_uncorrected: None,
     };
     let v = serde_json::to_value(&sample).expect("sample serializes");
     assert!(

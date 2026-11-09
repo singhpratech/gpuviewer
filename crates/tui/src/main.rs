@@ -1109,6 +1109,8 @@ fn static_info_from_row(d: DeviceRow) -> StaticInfo {
         // Recordings do not (yet) persist the per-device source caveat; absence here is
         // honest "unknown", not an assertion that the recorded source needed no label.
         source_caveat: None,
+        pcie_max_gen: None,
+        pcie_max_width: None,
     }
 }
 
@@ -1206,6 +1208,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle,
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 

@@ -535,6 +535,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 
@@ -627,6 +631,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle,
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 

@@ -18,6 +18,7 @@ pub mod backend;
 pub mod events;
 #[cfg(target_os = "linux")]
 pub mod intel;
+pub mod kmsg;
 pub mod mock;
 pub mod model;
 #[cfg(all(feature = "nvidia", any(target_os = "linux", target_os = "windows")))]
@@ -121,6 +122,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         };
         let events = engine.observe(&dev, &sample, Some(&procs), Some(1 << 30), None);
         assert!(
@@ -148,6 +153,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         };
         let procs = vec![ProcessSample {
             pid: 4521,
@@ -213,6 +222,10 @@ mod tests {
                     thermal,
                     ..Default::default()
                 }),
+                power_limit_mw: None,
+                pcie_gen: None,
+                pcie_width: None,
+                ecc_uncorrected: None,
             }
         }
         let run = |end_clock: u32| -> Event {
@@ -286,6 +299,10 @@ mod tests {
                 encoder_pct: None,
                 decoder_pct: None,
                 throttle,
+                power_limit_mw: None,
+                pcie_gen: None,
+                pcie_width: None,
+                ecc_uncorrected: None,
             }
         }
         let thermal = Some(ThrottleReasons {
@@ -358,6 +375,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         };
         let mut engine = EventEngine::new();
         let dev = DeviceId("test".into());
@@ -408,6 +429,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         };
         let proc_named = |pid: u32, name: &str, mem: Option<u64>| ProcessSample {
             pid,
@@ -473,6 +498,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 
@@ -656,6 +685,10 @@ mod tests {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 

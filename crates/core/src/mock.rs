@@ -140,6 +140,8 @@ impl GpuBackend for MockBackend {
                 driver_version: Some("mock 999.99".into()),
                 process_hint: None,
                 source_caveat: None,
+                pcie_max_gen: Some(4),
+                pcie_max_width: Some(16),
             })
         } else if *dev == self.ids[1] {
             Ok(StaticInfo {
@@ -154,6 +156,8 @@ impl GpuBackend for MockBackend {
                 driver_version: Some("mock amdgpu".into()),
                 process_hint: None,
                 source_caveat: None,
+                pcie_max_gen: None,
+                pcie_max_width: None,
             })
         } else {
             Err(BackendError::DeviceNotFound(dev.clone()))
@@ -258,6 +262,14 @@ impl TrainSim {
                 thermal: self.throttling,
                 ..Default::default()
             }),
+            power_limit_mw: Some(450_000),
+            // Like a real NVIDIA board: the link drops to Gen1 at idle (power management)
+            // and runs at full Gen4 x16 under load — so the mock never trips the
+            // degraded-link inference, which only judges a busy GPU.
+            pcie_gen: Some(if idle { 1 } else { 4 }),
+            pcie_width: Some(16),
+            // GeForce has no ECC: absent, never zero.
+            ecc_uncorrected: None,
         }
     }
 
@@ -325,6 +337,10 @@ impl DesktopSim {
             encoder_pct: None,
             decoder_pct: None,
             throttle: Some(ThrottleReasons::default()),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         }
     }
 

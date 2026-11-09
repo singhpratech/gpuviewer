@@ -60,6 +60,17 @@ pub struct StaticInfo {
     /// source needs no caveat. `serde(default)` so older serialized infos still decode.
     #[serde(default)]
     pub source_caveat: Option<String>,
+    /// Highest PCIe link generation this device AND its slot support together (NVML
+    /// `nvmlDeviceGetMaxPcieLinkGeneration` — a Gen4 card in a Gen3 slot reports 3). The
+    /// baseline the link-degraded inference compares against; `None` where unexposed.
+    /// Only NVML fills it: AMD/Intel sysfs link files describe the card's internal switch
+    /// port on most dGPUs, not the slot link, and would make the comparison a lie.
+    #[serde(default)]
+    pub pcie_max_gen: Option<u32>,
+    /// Widest PCIe link (lanes) this device and its slot support together; see
+    /// [`Self::pcie_max_gen`].
+    #[serde(default)]
+    pub pcie_max_width: Option<u32>,
 }
 
 /// Decoded throttle/clocks-event reasons. Decoding is tolerant: unknown future bits land in
@@ -130,6 +141,27 @@ pub struct DynamicSample {
     /// recorded before this change deserialize (missing field → `None`).
     #[serde(default)]
     pub throttle: Option<ThrottleReasons>,
+    /// The power limit the driver is enforcing right now, milliwatts. Read per tick (not
+    /// once at startup) because it changes under a running workload — `nvidia-smi -pl`,
+    /// a vendor control panel, a datacenter power-capping policy — and a lowered cap is
+    /// a quiet cause of a slower run. `None` where unexposed. `serde(default)` for older
+    /// recordings.
+    #[serde(default)]
+    pub power_limit_mw: Option<u32>,
+    /// Current PCIe link generation (1–6). NVIDIA drops the link speed at idle to save
+    /// power, so a low value on an idle GPU is normal — only a low value under load is a
+    /// story. `None` where unexposed (see [`StaticInfo::pcie_max_gen`] for why only NVML
+    /// fills it).
+    #[serde(default)]
+    pub pcie_gen: Option<u32>,
+    /// Current PCIe link width, lanes.
+    #[serde(default)]
+    pub pcie_width: Option<u32>,
+    /// Uncorrectable ECC memory errors since the driver loaded (NVML volatile counter).
+    /// `None` on parts without ECC or with ECC disabled — most consumer GeForce boards —
+    /// never `0`: "no ECC to count" is not "zero errors".
+    #[serde(default)]
+    pub ecc_uncorrected: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

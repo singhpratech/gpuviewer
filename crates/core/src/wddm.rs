@@ -1059,6 +1059,9 @@ mod backend_impl {
                      power/temperature/clock API for this GPU"
                         .into(),
                 ),
+                // No public PCIe link API through the OS GPU surfaces (§3.4).
+                pcie_max_gen: None,
+                pcie_max_width: None,
             })
         }
 
@@ -1104,6 +1107,11 @@ mod backend_impl {
                 // ("not throttling" asserted as fact), which this model change exists to
                 // make unrepresentable.
                 throttle: None,
+                // Same §3.6 story: no public power-limit / PCIe-link / ECC source here.
+                power_limit_mw: None,
+                pcie_gen: None,
+                pcie_width: None,
+                ecc_uncorrected: None,
             })
         }
 

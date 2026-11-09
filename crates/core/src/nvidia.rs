@@ -507,6 +507,8 @@ impl GpuBackend for NvidiaBackend {
             driver_version: opt(self.nvml.sys_driver_version()),
             process_hint,
             source_caveat,
+            pcie_max_gen: opt(d.max_pcie_link_gen()),
+            pcie_max_width: opt(d.max_pcie_link_width()),
         })
     }
 
@@ -559,6 +561,15 @@ impl GpuBackend for NvidiaBackend {
             encoder_pct: opt(d.encoder_utilization()).map(|e| e.utilization as f32),
             decoder_pct: opt(d.decoder_utilization()).map(|e| e.utilization as f32),
             throttle,
+            // Cheap reads (no PCIe-throughput sampling — that is the ~20ms blocking call).
+            power_limit_mw: opt(d.enforced_power_limit()),
+            pcie_gen: opt(d.current_pcie_link_gen()),
+            pcie_width: opt(d.current_pcie_link_width()),
+            // NOT_SUPPORTED on non-ECC parts and when ECC is disabled → None, never 0.
+            ecc_uncorrected: opt(d.total_ecc_errors(
+                nvml_wrapper::enum_wrappers::device::MemoryError::Uncorrected,
+                nvml_wrapper::enum_wrappers::device::EccCounter::Volatile,
+            )),
         })
     }
 

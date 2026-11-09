@@ -639,6 +639,8 @@ impl GpuBackend for IntelBackend {
             process_hint: self.process_hint.clone(),
             // sysfs/fdinfo numbers carry their plain meanings — nothing to qualify.
             source_caveat: None,
+            pcie_max_gen: None,
+            pcie_max_width: None,
         })
     }
 
@@ -691,6 +693,10 @@ impl GpuBackend for IntelBackend {
             // Some(default): observed honest silence. This is the metric intel_gpu_top
             // still does not surface on xe.
             throttle,
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         })
     }
 

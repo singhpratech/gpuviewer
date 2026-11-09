@@ -785,6 +785,8 @@ impl GpuBackend for AmdBackend {
             process_hint: self.process_hint.clone(),
             // sysfs numbers carry their plain meanings — nothing to qualify.
             source_caveat: None,
+            pcie_max_gen: None,
+            pcie_max_width: None,
         })
     }
 
@@ -823,6 +825,10 @@ impl GpuBackend for AmdBackend {
             throttle: fs::read(p.join("gpu_metrics"))
                 .ok()
                 .and_then(|buf| decode_gpu_metrics_throttle(&buf)),
+            power_limit_mw: None,
+            pcie_gen: None,
+            pcie_width: None,
+            ecc_uncorrected: None,
         })
     }
 
