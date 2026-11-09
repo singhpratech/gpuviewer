@@ -62,9 +62,12 @@ One per collection tick. Example (wrapped for readability — the stream never w
              "power_mw":400176,"temp_c":74.1,"fan_pct":62.0,"sm_clock_mhz":2447,
              "mem_clock_mhz":10500,"encoder_pct":0.0,"decoder_pct":null,
              "throttle":{"thermal":false,"power_cap":false,"hw_slowdown":false,
-                         "sync_boost":false,"other":false}},
+                         "sync_boost":false,"other":false},
+             "power_limit_mw":450000,"pcie_gen":4,"pcie_width":16,
+             "ecc_uncorrected":null},
    "processes":[{"pid":4521,"name":"python","kind":"compute","mem_bytes":20620229113,
-                 "util_pct":96.0,"cpu_pct":null,"container":null}]}
+                 "util_pct":96.0,"cpu_pct":null,"container":null,
+                 "cmdline":"python train.py --config big.yaml --hf-token=***"}]}
 ]}
 ```
 
@@ -102,6 +105,10 @@ One per collection tick. Example (wrapped for readability — the stream never w
 | `mem_clock_mhz`  | integer   | yes      | Memory clock, MHz. |
 | `encoder_pct`    | number    | yes      | Video encoder utilization, percent. Nominally 0–100; engine-derived sources can exceed 100 (see honesty notes). |
 | `decoder_pct`    | number    | yes      | Video decoder utilization, percent. Nominally 0–100; engine-derived sources can exceed 100 (see honesty notes). |
+| `power_limit_mw` | integer   | yes      | The power limit the driver enforces **right now**, milliwatts. Re-read every tick because it changes under a running job (`nvidia-smi -pl`, a control panel, a power-capping policy); a change is narrated as `power_limit_changed`. Added additively under rules (b)/(c). |
+| `pcie_gen`       | integer   | yes      | Current PCIe link generation. Links drop speed at idle by design, so a low value on an idle GPU is normal. Only NVML reports it; AMD/Intel sysfs link files describe the card's internal switch, not the slot, so they stay `null`. Additive. |
+| `pcie_width`     | integer   | yes      | Current PCIe link width, lanes. Reported, never judged (laptop boards wired x8 report a maximum of x16). Additive. |
+| `ecc_uncorrected`| integer   | yes      | Uncorrectable ECC memory errors since the driver loaded (NVML volatile counter). `null` on parts without ECC or with ECC disabled — most consumer boards — and **never `0` for "no ECC"**. Additive. |
 | `throttle`       | object    | yes      | Decoded throttle reasons. When present, an object of five booleans, all always present: `thermal`, `power_cap`, `hw_slowdown`, `sync_boost`, `other` (unknown future driver bits land in `other`, never dropped). **`null` means the source cannot observe throttling at all** (Windows cross-vendor WDDM counters, macOS, a failed NVML query) — treat it as "unknown", never as "not throttling": an all-false object is an *observation* of quiet, `null` is a blind spot. |
 
 ### Process object
@@ -115,6 +122,7 @@ One per collection tick. Example (wrapped for readability — the stream never w
 | `util_pct`  | number    | yes      | Per-process GPU utilization, percent. Nominally 0–100; engine-derived sources can exceed 100 (see honesty notes). Weak semantics under concurrency on some drivers — treat as indicative. |
 | `cpu_pct`   | number    | yes      | Process CPU usage as % of one core (`100.0` = one full core; can exceed 100 on multithreaded processes). `null` when unknown. |
 | `container` | string    | yes      | Container identity when the process runs in one, e.g. `"docker:1a2b3c4d5e6f"`. `null` for host processes or when unknown. |
+| `cmdline`   | string    | yes      | Command line, e.g. `"python train.py --config big.yaml"`: argv0 reduced to its basename, values of secret-looking arguments (`--*token*`, `--password`, `*_API_KEY=`, URL userinfo) replaced with `***`, capped at 240 characters. `null` when unreadable (another user's process, a kernel thread) and on Windows/macOS today. Additive. |
 
 ## Event line
 
@@ -161,6 +169,11 @@ Emitted today:
 | `recording_started` | fact      | A recording session began folding history into the database — recorder lifecycle, not device behavior; only emitted when persistence is on. `evidence` carries the binary version, tick interval, backend names/device count, and database name. If the previous session never wrote its stop mark, the title says so: it ended uncleanly (crash, kill, or power loss) and the gap size is unknowable. Rides the first frame after startup. Added additively under rules (b)/(c). |
 | `recording_stopped` | fact      | The recording session ended cleanly; time after this mark is gpuviewer not running, never the GPU sitting idle. Emission choice: this line is the stream's final event when stdout is still open at shutdown (`--once`, a fatal collector stop); after a consumer hangup the stream is already gone, so the mark is recording-only. A killed process writes no mark at all — the next `recording_started` narrates that. Added additively under rules (b)/(c). |
 | `recording_degraded` | fact | History writes started failing (disk full, permissions, file removed), or started working again. The live view keeps running either way; this event is how the stream says the period is not being recorded. |
+| `host_suspended` | likely | Between two ticks the wall clock advanced at least 30s more than the monotonic clock (which stops during suspend): the machine very likely slept, so the gap is the host asleep — not the GPU idle, and not gpuviewer stopped. `likely` because a forward wall-clock step looks identical. Info. Added additively under rules (b)/(c). |
+| `power_limit_changed` | fact | The enforced power limit moved by at least 1 W between two observations; the title carries both values. Warning when lowered (it caps clocks), Info when raised. Who changed it is never claimed. Additive. |
+| `pcie_link_degraded` | likely | The GPU stayed ≥50% busy for an unbroken minute while its PCIe link generation sat below the reported maximum. Only the generation is judged (see `pcie_width`), only under load (idle downclocking is normal), and it narrates once per episode. A riser, a loose seat, or signal integrity are the usual causes — never asserted. Additive. |
+| `ecc_error` | fact | The uncorrectable-ECC counter rose (Critical), or was already non-zero at the session's first observation (Warning). Straight from the driver counter. Additive. |
+| `xid_error` | fact | The NVIDIA kernel driver logged an Xid error for this device; the title quotes the driver's own description and the evidence carries the raw kernel-log line. Repeats of the same Xid within a minute are folded and counted into the next narration. Requires a readable kernel log (CAP_SYSLOG, or `kernel.dmesg_restrict=0`); without one, no Xid events are emitted — `gpuviewer doctor` says which applies. Additive. |
 
 ## Compatibility promise
 

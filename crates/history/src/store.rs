@@ -497,6 +497,15 @@ impl SqliteStore {
         })
     }
 
+    /// The file's `PRAGMA user_version` (its schema version; 0 for a pre-versioning file).
+    /// Read-only safe — `gpuviewer doctor` reports it without migrating anything.
+    pub fn schema_version(&self) -> Result<u32, StoreError> {
+        let v: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        Ok(v.max(0) as u32)
+    }
+
     /// The on-disk path of this store's database.
     pub fn path(&self) -> &Path {
         &self.path

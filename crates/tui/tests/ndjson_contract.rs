@@ -26,6 +26,11 @@ const DOCUMENTED_KINDS: &[&str] = &[
     "recording_started",
     "recording_stopped",
     "recording_degraded",
+    "host_suspended",
+    "power_limit_changed",
+    "pcie_link_degraded",
+    "ecc_error",
+    "xid_error",
 ];
 
 const DOCUMENTED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
@@ -82,6 +87,30 @@ fn assert_frame_device(dev: &Value) {
         sample.contains_key("util_engine"),
         "util_engine key must be present (null is fine): {sample:?}"
     );
+    // The v0.2 additive sample fields: always present, null where unexposed.
+    for key in [
+        "power_limit_mw",
+        "pcie_gen",
+        "pcie_width",
+        "ecc_uncorrected",
+    ] {
+        assert!(
+            sample.contains_key(key),
+            "sample field {key:?} must be present (null is fine): {sample:?}"
+        );
+        let v = &sample[key];
+        assert!(
+            v.is_null() || v.is_u64(),
+            "{key} must be a non-negative integer or null: {v}"
+        );
+    }
+    // GeForce has no ECC: the mock NVIDIA board must say "absent", never 0.
+    if dev["name"].as_str().is_some_and(|n| n.contains("4090")) {
+        assert!(
+            sample["ecc_uncorrected"].is_null(),
+            "no-ECC part must serialize ecc_uncorrected as null, never 0: {sample:?}"
+        );
+    }
     // throttle is nullable in the model (null = source cannot observe — a blind spot,
     // not "not throttling"), but the mock OBSERVES throttling by design, so here it
     // must be the five-boolean object the spec table describes.
@@ -118,7 +147,7 @@ fn assert_frame_device(dev: &Value) {
         );
         // Additive v1 fields: the keys must be present (null when unknown), or old
         // consumers checking `"cpu_pct" in proc` would see the field flicker.
-        for key in ["mem_bytes", "util_pct", "cpu_pct", "container"] {
+        for key in ["mem_bytes", "util_pct", "cpu_pct", "container", "cmdline"] {
             assert!(
                 p.get(key).is_some(),
                 "process field {key:?} must be present (null is fine): {p}"

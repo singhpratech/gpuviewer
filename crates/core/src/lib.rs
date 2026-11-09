@@ -32,7 +32,7 @@ pub mod proc_meta;
 #[cfg(feature = "wddm")]
 pub mod wddm;
 
-pub use backend::{all_backends, BackendError, GpuBackend};
+pub use backend::{all_backends, probe_backends, BackendError, GpuBackend, SkippedBackend};
 pub use events::{Confidence, Event, EventEngine, EventKind, Severity};
 pub use model::{
     fmt_bytes, normalize_pci_id, now_ms, DeviceId, DynamicSample, ProcessKind, ProcessSample,

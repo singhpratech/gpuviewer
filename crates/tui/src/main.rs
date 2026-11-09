@@ -14,6 +14,7 @@
 
 mod app;
 mod collector;
+mod doctor;
 mod signals;
 mod ui;
 
@@ -70,6 +71,8 @@ struct ReportArgs {
     until: Option<String>,
     db: Option<PathBuf>,
     mock: bool,
+    /// One JSON object instead of the text digest (`report --json`).
+    json: bool,
 }
 
 /// Per-OS default location of the history database — the HELP-text mirror of
@@ -101,11 +104,12 @@ fn help_text() -> String {
     USAGE:\n  \
       gpuviewer [--json [--once]] [--mock] [--interval <ms>] [--no-backoff]\n            \
                 [--db <path>] [--on-event <cmd>]\n  \
-      gpuviewer report [--since <spec>] [--until <spec>] [--db <path>] [--mock]\n  \
+      gpuviewer report [--since <spec>] [--until <spec>] [--db <path>] [--mock] [--json]\n  \
       gpuviewer demo [--seed-only]\n  \
       gpuviewer export [--since <spec>] [--until <spec>] [--keep-cmdline] [--db <path>]\n                   \
                        [--mock] <out.gpvr>\n  \
-      gpuviewer view <file.gpvr>\n\n\
+      gpuviewer view <file.gpvr>\n  \
+      gpuviewer doctor [--db <path>] [--mock]\n\n\
     LIVE OPTIONS:\n  \
       --json          stream one NDJSON frame per tick to stdout\n  \
       --once          with --json: print a single frame and exit\n  \
@@ -129,7 +133,8 @@ fn help_text() -> String {
       --since <spec>  window start; default 24h\n  \
       --until <spec>  window end; default now\n  \
       --db <path>     history database to read (read-only)\n  \
-      --mock          read the history-mock.db instead of real history\n\n  \
+      --mock          read the history-mock.db instead of real history\n  \
+      --json          print one JSON object (\"type\":\"report\") instead of the text digest\n\n  \
       <spec> is a relative duration (12h, 45m, 7d) or a clock time (HH:MM, today; yesterday\n      \
       if that time is still in the future)\n\n\
     demo — seed 8h of simulated history into its own history-demo.db (history.db is never\n    \
@@ -144,6 +149,9 @@ fn help_text() -> String {
                       to be shared, and argv can name private paths)\n  \
       --db <path>     source history database (default: the recorded default)\n  \
       --mock          read history-mock.db as the source\n\n\
+    doctor — report what this build can see here: each backend (or why it was skipped),\n    \
+    each device's available/unavailable metrics from a real two-tick probe, the Xid\n    \
+    kernel-log status, and the history database. Records nothing; paste it into bug reports\n\n\
     view — replay a .gpvr file read-only: no backends, no recording, no live mode.\n    \
     q quits; arrows or a/d scrub (A/D pages, g/G ends); enter jumps to the selected event\n\n\
     GENERAL:\n  \
@@ -226,6 +234,7 @@ fn parse_report_args(mut it: impl Iterator<Item = String>) -> Result<ReportArgs>
         until: None,
         db: None,
         mock: false,
+        json: false,
     };
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -248,6 +257,7 @@ fn parse_report_args(mut it: impl Iterator<Item = String>) -> Result<ReportArgs>
                 ))
             }
             "--mock" => r.mock = true,
+            "--json" => r.json = true,
             "--help" | "-h" => {
                 emit_line(&help_text());
                 std::process::exit(0);
@@ -388,6 +398,10 @@ fn main() -> Result<()> {
         Some("view") => {
             let _ = raw.next();
             return run_view(parse_view_args(raw)?);
+        }
+        Some("doctor") => {
+            let _ = raw.next();
+            return run_doctor(raw);
         }
         _ => {}
     }
@@ -695,9 +709,85 @@ fn run_report(args: ReportArgs) -> Result<()> {
     let store = SqliteStore::open_readonly(&path)
         .map_err(|e| anyhow::anyhow!("cannot open {} read-only: {e}", path.display()))?;
 
-    let report = build_report(&store, from, to)?;
+    let report = if args.json {
+        build_report_json(&store, from, to)?
+    } else {
+        build_report(&store, from, to)?
+    };
     emit(&report);
     Ok(())
+}
+
+/// One device's window summary in `report --json`. Field meanings match the text
+/// digest's line; every number is nullable for the same reason the NDJSON stream's are.
+#[derive(Serialize)]
+struct ReportDevice {
+    id: DeviceId,
+    name: String,
+    /// False when the window holds no rollups for this device (it was absent, or nothing
+    /// was recording) — the numbers below are then all null, never zeros.
+    has_samples: bool,
+    util_avg_pct: Option<f32>,
+    util_max_pct: Option<f32>,
+    temp_max_c: Option<f32>,
+    /// Peak of the per-bucket average memory used, bytes (same as the text digest).
+    mem_max_bytes: Option<u64>,
+    /// Rollup buckets in which at least one frame observed throttling.
+    throttle_buckets: u64,
+}
+
+#[derive(Serialize)]
+struct ReportJson<'a> {
+    v: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    from_ms: u64,
+    to_ms: u64,
+    devices: Vec<ReportDevice>,
+    /// The window's events, oldest first, in the NDJSON event shape (minus the envelope).
+    events: &'a [Event],
+}
+
+/// `report --json`: the digest as ONE JSON object (`"type":"report"`, `"v":1`) for
+/// scripts and dashboards — the text digest's numbers without the scraping.
+fn build_report_json(store: &SqliteStore, from: u64, to: u64) -> Result<String> {
+    let devices = store
+        .devices()
+        .map_err(|e| anyhow::anyhow!("reading devices: {e}"))?;
+    let events = store
+        .events_between(from, to)
+        .map_err(|e| anyhow::anyhow!("reading events: {e}"))?;
+    let mut out_devices = Vec::with_capacity(devices.len());
+    for d in &devices {
+        let mut rows = store
+            .samples_between(&d.device_id, from, to, Tier::OneMin)
+            .unwrap_or_default();
+        if rows.is_empty() {
+            rows = store
+                .samples_between(&d.device_id, from, to, Tier::TenSec)
+                .unwrap_or_default();
+        }
+        out_devices.push(ReportDevice {
+            id: d.device_id.clone(),
+            name: d.name.clone(),
+            has_samples: !rows.is_empty(),
+            util_avg_pct: mean(rows.iter().filter_map(|r| r.util_avg)),
+            util_max_pct: rows.iter().filter_map(|r| r.util_max).fold(None, fmax),
+            temp_max_c: rows.iter().filter_map(|r| r.temp_max_c).fold(None, fmax),
+            mem_max_bytes: rows.iter().filter_map(|r| r.mem_avg).max(),
+            throttle_buckets: rows.iter().filter(|r| r.throttle_n > 0).count() as u64,
+        });
+    }
+    let mut s = serde_json::to_string(&ReportJson {
+        v: 1,
+        kind: "report",
+        from_ms: from,
+        to_ms: to,
+        devices: out_devices,
+        events: &events,
+    })?;
+    s.push('\n');
+    Ok(s)
 }
 
 /// Build the digest text from an already-open store. Split from `run_report` so it can be
@@ -1030,6 +1120,35 @@ fn seed_demo(path: &Path, from_ms: u64, to_ms: u64) -> Result<(usize, usize)> {
     // Persist the partial tail buckets so the recording reaches all the way to `to_ms`.
     rec.flush();
     Ok((events, throttles))
+}
+
+// ===========================================================================================
+// doctor subcommand — what this build can see on this machine (see doctor.rs).
+// ===========================================================================================
+
+fn run_doctor(it: impl Iterator<Item = String>) -> Result<()> {
+    let mut mock = false;
+    let mut db: Option<PathBuf> = None;
+    let mut it = it;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--mock" => mock = true,
+            "--db" => {
+                db = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--db needs a path"))?,
+                ))
+            }
+            "--help" | "-h" => {
+                emit_line(&help_text());
+                std::process::exit(0);
+            }
+            other => bail!("unknown doctor flag: {other} (see --help)"),
+        }
+    }
+    let db = db.or_else(|| default_history_path(mock).ok());
+    emit(&doctor::report(mock, db)?);
+    Ok(())
 }
 
 // ===========================================================================================

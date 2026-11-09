@@ -996,12 +996,20 @@ fn ecc_events(
     st.last_ecc = Some(now);
 }
 
-/// Device util that counts as "busy" for the degraded-link check: NVIDIA raises the link
-/// to full speed under real load, so a low link is only a story while the GPU is working.
+/// Device util that counts as "busy" for the degraded-link check: the link trains up to
+/// its full generation under real load, so a low generation is only a story while the GPU
+/// is working.
 const PCIE_BUSY_UTIL_PCT: f32 = 50.0;
 /// How long the busy-and-below-max pattern must hold, unbroken, before it is narrated.
 const PCIE_DEGRADED_MIN_MS: u64 = 60_000;
 
+/// Only the link GENERATION is judged; the width never is. Measured on a laptop RTX 4090
+/// (driver 580): NVML's "max link width" reads x16 while the board runs x8 under load by
+/// design — the "device and system" maximum is in practice the GPU's own capability, so a
+/// width comparison would narrate "likely degraded" on healthy x8-wired laptops. The
+/// generation, by contrast, trained to its maximum (Gen4) under load on the same machine:
+/// a busy GPU stuck below its max generation is the riser/seat/signal-integrity story.
+/// The width still rides in the narration and evidence as context.
 fn pcie_link_events(
     st: &mut DevState,
     device: &DeviceId,
@@ -1010,14 +1018,13 @@ fn pcie_link_events(
     max: Option<(u32, u32)>,
     out: &mut Vec<Event>,
 ) {
-    let (Some((max_gen, max_width)), Some(gen), Some(width)) =
-        (max, sample.pcie_gen, sample.pcie_width)
-    else {
+    let (Some((max_gen, max_width)), Some(gen)) = (max, sample.pcie_gen) else {
         st.pcie = None; // no baseline or a blind tick: the "unbroken" premise is gone
         return;
     };
-    if gen >= max_gen && width >= max_width {
-        // Observed at full link: the episode (and the narrated latch) are over.
+    let width = sample.pcie_width;
+    if gen >= max_gen {
+        // Observed at full generation: the episode (and the narrated latch) are over.
         st.pcie = None;
         st.pcie_narrated = false;
         return;
@@ -1035,17 +1042,28 @@ fn pcie_link_events(
         util_sum: 0.0,
         util_n: 0,
         min_gen: gen,
-        min_width: width,
+        min_width: width.unwrap_or(0),
     });
     ep.util_sum += util as f64;
     ep.util_n += 1;
     ep.min_gen = ep.min_gen.min(gen);
-    ep.min_width = ep.min_width.min(width);
+    if let Some(w) = width {
+        ep.min_width = if ep.min_width == 0 {
+            w
+        } else {
+            ep.min_width.min(w)
+        };
+    }
     let held = sample.ts_ms.saturating_sub(ep.start_ms);
     if held < PCIE_DEGRADED_MIN_MS {
         return;
     }
     let mean = ep.util_sum / ep.util_n.max(1) as f64;
+    let width_note = if ep.min_width > 0 {
+        format!(" x{}", ep.min_width)
+    } else {
+        String::new()
+    };
     out.push(Event {
         ts_ms: sample.ts_ms,
         device: device.clone(),
@@ -1053,18 +1071,17 @@ fn pcie_link_events(
         severity: Severity::Warning,
         confidence: Confidence::Likely,
         title: format!(
-            "{name} PCIe link likely degraded — Gen{} x{} under load for {} (supports Gen{max_gen} x{max_width})",
+            "{name} PCIe link likely degraded — Gen{}{width_note} under load for {} (supports Gen{max_gen})",
             ep.min_gen,
-            ep.min_width,
             fmt_dur_ms(held)
         ),
         evidence: format!(
-            "link at or below Gen{} x{} for {} while device util averaged {mean:.0}% \
-             (≥{PCIE_BUSY_UTIL_PCT:.0}% every tick); device+slot maximum Gen{max_gen} \
-             x{max_width}. Links slow down at idle by design, so only a busy GPU is judged; \
-             a riser, a loose seat, or a slot sharing lanes are common causes",
+            "link generation at or below Gen{} for {} while device util averaged {mean:.0}% \
+             (≥{PCIE_BUSY_UTIL_PCT:.0}% every tick); reported maximum Gen{max_gen} \
+             (width x{max_width} reported max, not judged). Links slow down at idle by \
+             design, so only a busy GPU is judged; a riser, a loose seat, or signal \
+             integrity are common causes",
             ep.min_gen,
-            ep.min_width,
             fmt_dur_ms(held)
         ),
     });
@@ -1404,35 +1421,39 @@ mod tests {
             out
         };
         // Idle at Gen1: link power management, never a story.
-        let out = drive(&mut engine, 0..=120_000, 3.0, (1, 16));
+        let out = drive(&mut engine, 0..=120_000, 3.0, (1, 8));
         assert!(
             kinds(&out, EventKind::PcieLinkDegraded).is_empty(),
             "idle downclock is normal"
         );
-        // Busy at full link: silent.
-        let out = drive(&mut engine, 121_000..=200_000, 95.0, (4, 16));
-        assert!(kinds(&out, EventKind::PcieLinkDegraded).is_empty());
-        // Busy at x8 for 59s, then util drops: the unbroken premise breaks, silent.
-        let mut out = drive(&mut engine, 201_000..=259_000, 95.0, (4, 8));
-        out.extend(drive(&mut engine, 260_000..=261_000, 20.0, (4, 8)));
+        // Busy at full generation but x8 against a reported x16 — the measured laptop
+        // case: width is never judged, so this is silent.
+        let out = drive(&mut engine, 121_000..=300_000, 95.0, (4, 8));
+        assert!(
+            kinds(&out, EventKind::PcieLinkDegraded).is_empty(),
+            "an x8-wired laptop under load is healthy"
+        );
+        // Busy at Gen2 for 59s, then util drops: the unbroken premise breaks, silent.
+        let mut out = drive(&mut engine, 301_000..=359_000, 95.0, (2, 16));
+        out.extend(drive(&mut engine, 360_000..=361_000, 20.0, (2, 16)));
         assert!(
             kinds(&out, EventKind::PcieLinkDegraded).is_empty(),
             "59s is under the bar"
         );
-        // Busy at x8 for a full minute: narrated once, hedged.
-        let out = drive(&mut engine, 262_000..=400_000, 95.0, (4, 8));
+        // Busy at Gen2 for a full minute: narrated once, hedged.
+        let out = drive(&mut engine, 362_000..=500_000, 95.0, (2, 16));
         let ev = kinds(&out, EventKind::PcieLinkDegraded);
         assert_eq!(ev.len(), 1, "one bad seat narrates once, not every minute");
         assert_eq!(ev[0].confidence, Confidence::Likely);
         assert!(ev[0].title.contains("likely"), "{}", ev[0].title);
         assert!(
-            ev[0].title.contains("Gen4 x8") && ev[0].title.contains("Gen4 x16"),
+            ev[0].title.contains("Gen2 x16") && ev[0].title.contains("supports Gen4"),
             "{}",
             ev[0].title
         );
-        // Back at full link re-arms; a new degraded minute narrates again.
-        let mut out = drive(&mut engine, 401_000..=402_000, 95.0, (4, 16));
-        out.extend(drive(&mut engine, 403_000..=470_000, 95.0, (3, 16)));
+        // Back at full generation re-arms; a new degraded minute narrates again.
+        let mut out = drive(&mut engine, 501_000..=502_000, 95.0, (4, 16));
+        out.extend(drive(&mut engine, 503_000..=570_000, 95.0, (3, 16)));
         assert_eq!(kinds(&out, EventKind::PcieLinkDegraded).len(), 1);
     }
 

@@ -472,9 +472,276 @@ fn help_documents_the_launch_artifacts() {
     let out = bin().arg("--help").output().expect("failed to spawn");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for needle in ["demo", "export", "view", ".gpvr", "--seed-only", "--since"] {
+    for needle in [
+        "demo",
+        "export",
+        "view",
+        ".gpvr",
+        "--seed-only",
+        "--since",
+        "--until",
+        "--keep-cmdline",
+        "doctor",
+        "report",
+        "--json",
+    ] {
         assert!(stdout.contains(needle), "--help must mention {needle:?}");
     }
+}
+
+/// `export --until` bounds the window's right edge, an inverted window is refused, and
+/// process command lines are omitted from the shareable file unless `--keep-cmdline`.
+#[test]
+fn export_until_bounds_the_window_and_cmdline_is_opt_in() {
+    let dir = scratch_dir("export-until");
+    let src = dir.join("src.db");
+    let dev = DeviceId("0000:01:00.0".into());
+    let now = now_ms();
+    let b_now = now - now % 10_000;
+    {
+        let (mut store, _) = SqliteStore::open(&src).unwrap();
+        store
+            .register_device(&dev, "CLI GPU", Vendor::Nvidia, Some(8 << 30))
+            .unwrap();
+        let rows: Vec<_> = (0..=720u64)
+            .map(|i| sample_rollup(&dev, b_now - (720 - i) * 10_000))
+            .collect();
+        store.insert_sample_rollups(Tier::TenSec, &rows).unwrap();
+        store
+            .insert_process_rollups(&[gpuviewer_history::ProcessRollup {
+                device_id: dev.clone(),
+                bucket_ms: b_now - 90 * 60_000,
+                pid: 4521,
+                name: "python".into(),
+                kind: gpuviewer_core::ProcessKind::Compute,
+                mem_max: Some(4 << 30),
+                util_avg: Some(90.0),
+                cpu_avg: Some(120.0),
+                container: None,
+                cmdline: Some("python train.py --config private/client.yaml".into()),
+            }])
+            .unwrap();
+        store
+            .insert_events(&[
+                throttle_event(&dev, now - 90 * 60_000, "the overnight incident"),
+                throttle_event(&dev, now - 10 * 60_000, "something later"),
+            ])
+            .unwrap();
+    }
+    let export = |out: &Path, extra: &[&str]| {
+        let mut args = vec![
+            "export",
+            "--db",
+            src.to_str().unwrap(),
+            "--since",
+            "2h",
+            "--until",
+            "1h",
+        ];
+        args.extend_from_slice(extra);
+        args.push(out.to_str().unwrap());
+        bin().args(&args).output().expect("spawn")
+    };
+
+    let plain = dir.join("plain.gpvr");
+    let out = export(&plain, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("command lines omitted"));
+    let ex = SqliteStore::open_readonly(&plain).unwrap();
+    let events = ex.events_between(0, now + 3_600_000).unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "--until excludes what came after the window"
+    );
+    assert!(events[0].title.contains("overnight"));
+    let procs = ex.processes_at(&dev, b_now - 90 * 60_000).unwrap();
+    assert_eq!(procs.len(), 1);
+    assert_eq!(
+        procs[0].cmdline, None,
+        "command lines are opt-in for a shared file"
+    );
+
+    let kept = dir.join("kept.gpvr");
+    let out = export(&kept, &["--keep-cmdline"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ex = SqliteStore::open_readonly(&kept).unwrap();
+    let procs = ex.processes_at(&dev, b_now - 90 * 60_000).unwrap();
+    assert_eq!(
+        procs[0].cmdline.as_deref(),
+        Some("python train.py --config private/client.yaml")
+    );
+
+    let out = bin()
+        .args([
+            "export",
+            "--db",
+            src.to_str().unwrap(),
+            "--since",
+            "1h",
+            "--until",
+            "2h",
+            dir.join("inverted.gpvr").to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success(), "an inverted window must be refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("empty window"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `report --json` is ONE parseable object with the documented envelope.
+#[test]
+fn report_json_is_one_object_with_devices_and_events() {
+    let dir = scratch_dir("report-json");
+    let src = dir.join("src.db");
+    let dev = DeviceId("0000:01:00.0".into());
+    let now = now_ms();
+    {
+        let (mut store, _) = SqliteStore::open(&src).unwrap();
+        store
+            .register_device(&dev, "CLI GPU", Vendor::Nvidia, Some(8 << 30))
+            .unwrap();
+        let b_now = now - now % 10_000;
+        let rows: Vec<_> = (0..=60u64)
+            .map(|i| sample_rollup(&dev, b_now - (60 - i) * 10_000))
+            .collect();
+        store.insert_sample_rollups(Tier::TenSec, &rows).unwrap();
+        store
+            .insert_events(&[throttle_event(&dev, now - 60_000, "a throttle")])
+            .unwrap();
+    }
+    let out = bin()
+        .args([
+            "report",
+            "--db",
+            src.to_str().unwrap(),
+            "--since",
+            "1h",
+            "--json",
+        ])
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "one line, one object");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["type"], "report");
+    let d = &v["devices"][0];
+    assert_eq!(d["id"], "0000:01:00.0");
+    assert_eq!(d["has_samples"], true);
+    assert_eq!(d["util_max_pct"], 90.0);
+    assert_eq!(v["events"][0]["kind"], "throttle_start");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `doctor --mock` runs without a GPU or a tty, names the backend, every device with its
+/// metric split, and the (not yet created) history database — and records nothing.
+#[test]
+fn doctor_reports_backends_devices_and_history_without_recording() {
+    let dir = scratch_dir("doctor");
+    let out = bin_hermetic(&dir)
+        .args(["doctor", "--mock"])
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "doctor",
+        "mock    in use (--mock)",
+        "GPU0",
+        "GPU1",
+        "available",
+        "unavailable",
+        "xid errors",
+        "history-mock.db",
+        "not created yet",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "doctor output must mention {needle:?}:\n{stdout}"
+        );
+    }
+    // Nothing recorded: the data dir holds no database afterwards.
+    let any_db = walk(&dir)
+        .iter()
+        .any(|p| p.extension().is_some_and(|e| e == "db"));
+    assert!(
+        !any_db,
+        "doctor must never create or write a history database"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// SIGTERM (`systemctl stop`) ends a `--json` session the clean way: exit 0, and the
+/// stream's last line is the `recording_stopped` mark — the stop the next session would
+/// otherwise misreport as a crash.
+#[cfg(unix)]
+#[test]
+fn sigterm_ends_a_json_session_with_the_stop_mark() {
+    use std::io::{BufRead, BufReader};
+    let dir = scratch_dir("sigterm");
+    let mut child = bin_hermetic(&dir)
+        .args(["--json", "--mock", "--interval", "200"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    assert!(
+        first.contains("\"type\":\"frame\""),
+        "stream started: {first}"
+    );
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(status.success());
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut rest).unwrap();
+    let code = child.wait().expect("wait");
+    assert!(
+        code.success(),
+        "a SIGTERM'd session exits cleanly, got {code:?}"
+    );
+    let last = rest.lines().last().unwrap_or(&first);
+    let v: serde_json::Value = serde_json::from_str(last).expect("last line is JSON");
+    assert_eq!(v["kind"], "recording_stopped", "final line: {last}");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---- fixtures ----

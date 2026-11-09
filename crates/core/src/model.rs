@@ -67,8 +67,9 @@ pub struct StaticInfo {
     /// port on most dGPUs, not the slot link, and would make the comparison a lie.
     #[serde(default)]
     pub pcie_max_gen: Option<u32>,
-    /// Widest PCIe link (lanes) this device and its slot support together; see
-    /// [`Self::pcie_max_gen`].
+    /// Widest PCIe link (lanes) NVML reports for the device and slot. Shown, never
+    /// judged: on a laptop RTX 4090 it read x16 while the board runs x8 under load by
+    /// design, so it is not a trustworthy baseline (see `events.rs` pcie_link_events).
     #[serde(default)]
     pub pcie_max_width: Option<u32>,
 }

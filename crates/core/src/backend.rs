@@ -58,8 +58,25 @@ pub trait GpuBackend: Send {
 /// output, so real devices must not leak in. Otherwise the mock is the fallback when no
 /// real backend initialized (so the TUI always has something to show, clearly labeled).
 pub fn all_backends(force_mock: bool) -> Vec<Box<dyn GpuBackend>> {
+    let (backends, skipped) = probe_backends(force_mock);
+    for (name, why) in skipped {
+        eprintln!("gpuviewer: {name} backend skipped: {why}");
+    }
+    backends
+}
+
+/// A compiled-in backend that did not initialize: its name and the reason.
+pub type SkippedBackend = (&'static str, String);
+
+/// [`all_backends`] without the stderr side channel: the initialized backends plus, for
+/// every compiled-in backend that did NOT initialize, its name and the reason. `gpuviewer
+/// doctor` prints the reasons as part of its report instead of as warnings. Same order,
+/// same mock rules.
+pub fn probe_backends(force_mock: bool) -> (Vec<Box<dyn GpuBackend>>, Vec<SkippedBackend>) {
+    #[allow(unused_mut)]
+    let mut skipped: Vec<SkippedBackend> = Vec::new();
     if force_mock {
-        return vec![Box::new(crate::mock::MockBackend::new())];
+        return (vec![Box::new(crate::mock::MockBackend::new())], skipped);
     }
 
     let mut backends: Vec<Box<dyn GpuBackend>> = Vec::new();
@@ -67,19 +84,19 @@ pub fn all_backends(force_mock: bool) -> Vec<Box<dyn GpuBackend>> {
     #[cfg(all(feature = "nvidia", any(target_os = "linux", target_os = "windows")))]
     match crate::nvidia::NvidiaBackend::init() {
         Ok(b) => backends.push(Box::new(b)),
-        Err(e) => eprintln!("gpuviewer: nvidia backend skipped: {e}"),
+        Err(e) => skipped.push(("nvidia", e.to_string())),
     }
 
     #[cfg(target_os = "linux")]
     match crate::amd::AmdBackend::init() {
         Ok(b) => backends.push(Box::new(b)),
-        Err(e) => eprintln!("gpuviewer: amd backend skipped: {e}"),
+        Err(e) => skipped.push(("amd", e.to_string())),
     }
 
     #[cfg(target_os = "linux")]
     match crate::intel::IntelBackend::init() {
         Ok(b) => backends.push(Box::new(b)),
-        Err(e) => eprintln!("gpuviewer: intel backend skipped: {e}"),
+        Err(e) => skipped.push(("intel", e.to_string())),
     }
 
     // wddm registers LAST among Windows backends (§3.7): the collector's first-wins PCI
@@ -89,18 +106,18 @@ pub fn all_backends(force_mock: bool) -> Vec<Box<dyn GpuBackend>> {
     #[cfg(all(feature = "wddm", target_os = "windows"))]
     match crate::wddm::WddmBackend::init() {
         Ok(b) => backends.push(Box::new(b)),
-        Err(e) => eprintln!("gpuviewer: wddm backend skipped: {e}"),
+        Err(e) => skipped.push(("wddm", e.to_string())),
     }
 
     // Registry order per design §9: nvidia → amd → intel → (wddm) → apple.
     #[cfg(all(feature = "apple", target_os = "macos"))]
     match crate::apple::AppleBackend::init() {
         Ok(b) => backends.push(Box::new(b)),
-        Err(e) => eprintln!("gpuviewer: apple backend skipped: {e}"),
+        Err(e) => skipped.push(("apple", e.to_string())),
     }
 
     if backends.is_empty() {
         backends.push(Box::new(crate::mock::MockBackend::new()));
     }
-    backends
+    (backends, skipped)
 }

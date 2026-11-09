@@ -105,7 +105,11 @@
         "mem_clock_mhz",
         "encoder_pct",
         "decoder_pct",
-        "throttle"
+        "throttle",
+        "power_limit_mw",
+        "pcie_gen",
+        "pcie_width",
+        "ecc_uncorrected"
       ],
       "properties": {
         "ts_ms": {
@@ -190,6 +194,38 @@
             }
           ],
           "description": "null = this source cannot observe throttling (blind spot, e.g. WDDM counters/macOS) \u2014 NOT 'not throttling'; an all-false object is an observed quiet."
+        },
+        "power_limit_mw": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Power limit the driver enforces right now, milliwatts (re-read every tick; it can change mid-run). null where unexposed."
+        },
+        "pcie_gen": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Current PCIe link generation. Drops at idle by design (link power management). null where unexposed \u2014 only NVML reports it."
+        },
+        "pcie_width": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Current PCIe link width, lanes. null where unexposed."
+        },
+        "ecc_uncorrected": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Uncorrectable ECC memory errors since the driver loaded (volatile counter). null on parts without ECC or with it disabled \u2014 never 0 for 'no ECC'."
         }
       }
     },
@@ -230,7 +266,8 @@
         "mem_bytes",
         "util_pct",
         "cpu_pct",
-        "container"
+        "container",
+        "cmdline"
       ],
       "properties": {
         "pid": {
@@ -275,6 +312,13 @@
             "null"
           ],
           "description": "Container identity (e.g. docker:1a2b3c4d5e6f); null for host processes or when unknown."
+        },
+        "cmdline": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Command line with argv0 reduced to its basename and secret-looking argument values redacted as ***, capped at 240 chars. null when unreadable or unsupported on this OS."
         }
       }
     },
@@ -322,7 +366,12 @@
             "device_returned",
             "recording_started",
             "recording_stopped",
-            "recording_degraded"
+            "recording_degraded",
+            "host_suspended",
+            "power_limit_changed",
+            "pcie_link_degraded",
+            "ecc_error",
+            "xid_error"
           ],
           "description": "All listed kinds are emitted today. Consumers must ignore kinds not in this list (new ones arrive additively per the compatibility promise)."
         },
