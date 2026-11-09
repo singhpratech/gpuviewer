@@ -125,6 +125,44 @@ impl ChartStyle {
     }
 }
 
+/// Which events the story feed shows; `f` cycles it in live and replay. Filtering is
+/// presentation only — every event is still recorded, streamed, and on the timeline lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoryFilter {
+    All,
+    /// Warning and Critical only — the "what went wrong overnight" view.
+    Warnings,
+    /// Observed facts only: the inferences ("likely …") are hidden.
+    Facts,
+}
+
+impl StoryFilter {
+    pub fn next(self) -> Self {
+        match self {
+            StoryFilter::All => StoryFilter::Warnings,
+            StoryFilter::Warnings => StoryFilter::Facts,
+            StoryFilter::Facts => StoryFilter::All,
+        }
+    }
+
+    pub fn admits(self, e: &Event) -> bool {
+        match self {
+            StoryFilter::All => true,
+            StoryFilter::Warnings => e.severity != gpuviewer_core::Severity::Info,
+            StoryFilter::Facts => e.confidence == gpuviewer_core::Confidence::Fact,
+        }
+    }
+
+    /// Shown in the story pane's title while a filter is active.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            StoryFilter::All => None,
+            StoryFilter::Warnings => Some("warnings+"),
+            StoryFilter::Facts => Some("facts only"),
+        }
+    }
+}
+
 /// One queried replay window, cached between seeks so rendering never touches SQLite.
 /// `samples`/`processes` are indexed like `Shared::infos`, so the device tabs keep working
 /// unchanged in replay.
@@ -181,8 +219,12 @@ pub struct App {
     /// `--no-persist` when the user never passed it is exactly the confidently-wrong
     /// narration the honesty contract forbids.
     pub replay_hint: Option<ReplayBlock>,
-    /// How the live/replay charts are painted; 's' cycles it.
+    /// How the live/replay charts are painted; 'c' cycles it.
     pub chart_style: ChartStyle,
+    /// Which events the story feed lists; 'f' cycles it. In Live, `story_selected`
+    /// indexes the FILTERED newest-first feed; in Replay it stays an index into the
+    /// window's full event list (selection just skips hidden rows).
+    pub story_filter: StoryFilter,
     /// Timeline cursor in unix millis; meaningful only in `Mode::Timeline`.
     pub timeline_cursor_ms: u64,
     /// Current rung on [`TIMELINE_ZOOMS`].
@@ -225,6 +267,7 @@ impl App {
             story_selected: None,
             replay_hint: None,
             chart_style: ChartStyle::Braille,
+            story_filter: StoryFilter::All,
             timeline_cursor_ms: 0,
             timeline_zoom: TIMELINE_DEFAULT_ZOOM,
             timeline_cols: (FALLBACK_SIZE.0 - 2) as usize,
@@ -387,10 +430,16 @@ impl App {
             KeyCode::Enter => {
                 // Enter on a selected event scrolls back to it. The feed displays
                 // newest-first, so the visual index maps back from the end of the log.
+                let filter = self.story_filter;
                 let ts = self.story_selected.and_then(|i| {
                     let sh = self.collector.shared.lock().unwrap();
-                    let evs = sh.history.events();
-                    evs.len().checked_sub(1 + i).map(|j| evs[j].ts_ms)
+                    sh.history
+                        .events()
+                        .iter()
+                        .rev()
+                        .filter(|e| filter.admits(e))
+                        .nth(i)
+                        .map(|e| e.ts_ms)
                 });
                 if let Some(ts) = ts {
                     self.enter_replay(Some(ts));
@@ -399,6 +448,7 @@ impl App {
             KeyCode::Char('r') => self.enter_replay(None),
             KeyCode::Char('t') => self.enter_timeline(),
             KeyCode::Char('c') => self.chart_style = self.chart_style.toggled(),
+            KeyCode::Char('f') => self.cycle_story_filter(),
             _ => {}
         }
         KeyOutcome::Continue
@@ -452,6 +502,7 @@ impl App {
             }
             KeyCode::Char('t') => self.enter_timeline(),
             KeyCode::Char('c') => self.chart_style = self.chart_style.toggled(),
+            KeyCode::Char('f') => self.cycle_story_filter(),
             _ => {}
         }
         KeyOutcome::Continue
@@ -753,21 +804,72 @@ impl App {
 
     /// Move the story selection by `delta` within the active feed (live ring or replay
     /// window). A first press selects the top row; the index clamps at both ends.
+    fn cycle_story_filter(&mut self) {
+        self.story_filter = self.story_filter.next();
+        // The old index points into a different list now.
+        self.story_selected = None;
+    }
+
+    /// Indices into the replay window's events that the current filter shows.
+    pub fn replay_visible(&self) -> Vec<usize> {
+        self.replay
+            .as_ref()
+            .map(|w| {
+                w.events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| self.story_filter.admits(e))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn move_story_selection(&mut self, delta: i64) {
-        let count = match self.mode {
-            Mode::Live => self.collector.shared.lock().unwrap().history.events().len(),
-            Mode::Replay => self.replay.as_ref().map(|w| w.events.len()).unwrap_or(0),
+        match self.mode {
+            Mode::Live => {
+                let filter = self.story_filter;
+                let count = self
+                    .collector
+                    .shared
+                    .lock()
+                    .unwrap()
+                    .history
+                    .events()
+                    .iter()
+                    .filter(|e| filter.admits(e))
+                    .count();
+                if count == 0 {
+                    self.story_selected = None;
+                    return;
+                }
+                self.story_selected = Some(match self.story_selected {
+                    None => 0,
+                    Some(i) => i.saturating_add_signed(delta as isize).min(count - 1),
+                });
+            }
+            Mode::Replay => {
+                // Step through the VISIBLE rows; the stored index stays a real index into
+                // the window's events so Enter and the renderer need no remapping.
+                let visible = self.replay_visible();
+                if visible.is_empty() {
+                    self.story_selected = None;
+                    return;
+                }
+                let pos = match self
+                    .story_selected
+                    .and_then(|s| visible.iter().position(|&v| v == s))
+                {
+                    None => 0,
+                    Some(p) => p
+                        .saturating_add_signed(delta as isize)
+                        .min(visible.len() - 1),
+                };
+                self.story_selected = Some(visible[pos]);
+            }
             // The timeline has no story pane; its event lane is cursor-driven.
-            Mode::Timeline => 0,
-        };
-        if count == 0 {
-            self.story_selected = None;
-            return;
+            Mode::Timeline => self.story_selected = None,
         }
-        self.story_selected = Some(match self.story_selected {
-            None => 0,
-            Some(i) => i.saturating_add_signed(delta as isize).min(count - 1),
-        });
     }
 }
 
@@ -1073,6 +1175,62 @@ mod tests {
             app.cursor_ms,
             BASE + 5_000,
             "cursor anchors at the selected event's ts"
+        );
+        cleanup(&path);
+    }
+
+    /// Live filter: with "facts only", the newest row is the fact even though a newer
+    /// inference exists, and Enter jumps to THAT fact — selection indexes the filtered feed.
+    #[test]
+    fn live_story_filter_hides_inferences_and_enter_follows_the_filtered_row() {
+        let (mut app, path) = seeded_app();
+        {
+            let mut sh = app.collector.shared.lock().unwrap();
+            let dev = sh.infos[0].id.clone();
+            sh.history.push_events([
+                throttle_event(BASE + 5_000, &dev),
+                likely_event(BASE + 15_000, &dev),
+            ]);
+        }
+        app.handle_key(KeyCode::Char('f')); // warnings+
+        assert_eq!(app.story_filter, super::StoryFilter::Warnings);
+        app.handle_key(KeyCode::Char('f')); // facts only
+        assert_eq!(app.story_filter, super::StoryFilter::Facts);
+        app.handle_key(KeyCode::Up);
+        app.handle_key(KeyCode::Down); // only one visible row: stays on it
+        assert_eq!(app.story_selected, Some(0));
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Replay);
+        assert_eq!(
+            app.cursor_ms,
+            BASE + 5_000,
+            "the fact, not the newer inference"
+        );
+        app.handle_key(KeyCode::Char('f')); // back to all
+        assert_eq!(app.story_filter, super::StoryFilter::All);
+        assert_eq!(
+            app.story_selected, None,
+            "a filter change drops the stale index"
+        );
+        cleanup(&path);
+    }
+
+    /// Replay filter: selection steps over hidden rows, and the stored index is still
+    /// the real window index (Enter seeks to the right event).
+    #[test]
+    fn replay_story_filter_skips_hidden_rows() {
+        let (mut app, path) = seeded_app();
+        app.enter_replay(Some(BASE + 10_000));
+        app.handle_key(KeyCode::Char('f'));
+        app.handle_key(KeyCode::Char('f')); // facts only: the BASE+15s inference is hidden
+        app.handle_key(KeyCode::Down);
+        app.handle_key(KeyCode::Down);
+        let w = app.replay_window().expect("replay window");
+        let sel = app.story_selected.expect("a row is selected");
+        assert_eq!(
+            w.events[sel].ts_ms,
+            BASE + 5_000,
+            "only the fact is selectable"
         );
         cleanup(&path);
     }

@@ -218,7 +218,11 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
         gauges_a,
         &GaugeValues {
             power_mw: latest.and_then(|s| s.power_mw),
-            power_limit_mw: info.power_limit_mw,
+            // The limit the driver enforces NOW (it can change mid-run); the startup
+            // value only when this tick could not read it.
+            power_limit_mw: latest
+                .and_then(|s| s.power_limit_mw)
+                .or(info.power_limit_mw),
             temp_c: latest.and_then(|s| s.temp_c),
             temp_slowdown_c: info.temp_slowdown_c,
             // None = this source cannot observe throttling (§5.4) — rendered as an
@@ -226,6 +230,7 @@ fn render_charts(f: &mut Frame, area: Rect, app: &App, shared: &Shared, info: &S
             throttling: latest.and_then(|s| s.throttle).map(|t| t.any()),
             fan_pct: latest.and_then(|s| s.fan_pct),
             sm_clock_mhz: latest.and_then(|s| s.sm_clock_mhz),
+            pcie: latest.and_then(|s| s.pcie_gen.zip(s.pcie_width)),
         },
     );
 }
@@ -325,6 +330,8 @@ fn render_charts_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow, 
             throttling: at.and_then(|r| bucket_throttling(r.throttle_n, r.throttle_observed_n)),
             fan_pct: at.and_then(|r| r.fan_max_pct),
             sm_clock_mhz: at.and_then(|r| r.sm_clock_avg),
+            // Not in the rollups: a link width is a state, not a quantity to average.
+            pcie: None,
         },
     );
 }
@@ -860,6 +867,8 @@ struct GaugeValues {
     throttling: Option<bool>,
     fan_pct: Option<f32>,
     sm_clock_mhz: Option<u32>,
+    /// Current PCIe link (generation, width) — live only; the rollups do not carry it.
+    pcie: Option<(u32, u32)>,
 }
 
 /// Gauge row: power · temp · fan/clock.
@@ -940,6 +949,12 @@ fn render_gauges(f: &mut Frame, area: Rect, v: &GaugeValues) {
         .fan_pct
         .map(|p| (p as f64 / 100.0).clamp(0.0, 1.0))
         .unwrap_or(0.0);
+    // The link only shows where a source reports it (NVML); elsewhere it is omitted
+    // rather than printed as "—" — the gauge row has no room for a column of dashes.
+    let link = v
+        .pcie
+        .map(|(g, w)| format!(" · Gen{g} x{w}"))
+        .unwrap_or_default();
     f.render_widget(
         Gauge::default()
             .block(
@@ -949,7 +964,7 @@ fn render_gauges(f: &mut Frame, area: Rect, v: &GaugeValues) {
             )
             .ratio(fan_ratio)
             .gauge_style(Style::default().fg(Color::Blue))
-            .label(format!("{fan} · {clk}")),
+            .label(format!("{fan} · {clk}{link}")),
         fc_a,
     );
 }
@@ -1092,6 +1107,7 @@ fn render_story(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
         .events()
         .iter()
         .rev()
+        .filter(|e| app.story_filter.admits(e))
         .enumerate()
         .skip(skip)
         .take(cap)
@@ -1107,7 +1123,10 @@ fn render_story(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" story — what changed and why ")
+            .title(match app.story_filter.label() {
+                Some(l) => format!(" story — what changed and why [{l}] "),
+                None => " story — what changed and why ".to_string(),
+            })
             .title_style(Style::default().add_modifier(Modifier::BOLD)),
     );
     f.render_widget(list, area);
@@ -1123,21 +1142,27 @@ fn render_story_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow) {
         .take_while(|e| e.ts_ms <= app.cursor_ms)
         .count();
     let mut rows: Vec<(Option<usize>, Line)> = Vec::with_capacity(w.events.len() + 1);
+    let mut marker_row = None;
     for (i, e) in w.events.iter().enumerate() {
         if i == marker_at {
+            marker_row = Some(rows.len());
             rows.push((None, cursor_line(app.cursor_ms)));
         }
-        rows.push((Some(i), event_line(e)));
+        if app.story_filter.admits(e) {
+            rows.push((Some(i), event_line(e)));
+        }
     }
     if marker_at == w.events.len() {
+        marker_row = Some(rows.len());
         rows.push((None, cursor_line(app.cursor_ms)));
     }
 
     // Keep the selected row (or, with nothing selected, the cursor marker) visible.
+    let marker_row = marker_row.unwrap_or(0);
     let focus = app
         .story_selected
-        .map(|s| s + usize::from(s >= marker_at))
-        .unwrap_or(marker_at);
+        .and_then(|s| rows.iter().position(|(idx, _)| *idx == Some(s)))
+        .unwrap_or(marker_row);
     let skip = focus.saturating_sub(cap.saturating_sub(1));
     let items: Vec<ListItem> = rows
         .into_iter()
@@ -1157,9 +1182,13 @@ fn render_story_replay(f: &mut Frame, area: Rect, app: &App, w: &ReplayWindow) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(
-                " story — events {}–{} ",
+                " story — events {}–{}{} ",
                 fmt_clock(w.from_ms),
-                fmt_clock(w.to_ms)
+                fmt_clock(w.to_ms),
+                app.story_filter
+                    .label()
+                    .map(|l| format!(" [{l}]"))
+                    .unwrap_or_default()
             ))
             .title_style(Style::default().add_modifier(Modifier::BOLD)),
     );
@@ -1255,12 +1284,12 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
         Mode::Replay => match app.view_file() {
             Some(file) => format!(
                 " REPLAY {}  viewing {file} (read-only) · q quit · enter jump to event · \
-                 ←→/ad scrub 10s · A/D 5m · g/G ends · t timeline · c style",
+                 ←→/ad scrub 10s · A/D 5m · g/G ends · t timeline · c style · f filter",
                 fmt_clock(app.cursor_ms)
             ),
             None => format!(
                 " REPLAY {}  esc live · enter jump to event · ←→/ad scrub 10s · A/D 5m · \
-                 g/G ends · t timeline · c style  (10s rollups, 48h retention){mock_tag}",
+                 g/G ends · t timeline · c style · f filter  (10s rollups, 48h retention){mock_tag}",
                 fmt_clock(app.cursor_ms)
             ),
         },
@@ -1318,7 +1347,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App, shared: &Shared) {
             };
             format!(
                 " q quit · ←→/ad/tab device · p pause{paused} · ↑↓/ws story · enter/r replay · \
-                 t timeline · c style{cadence}{hint}  —  gpuviewer{mock_tag}"
+                 t timeline · c style · f filter{cadence}{hint}  —  gpuviewer{mock_tag}"
             )
         }
     };
