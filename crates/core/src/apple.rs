@@ -310,7 +310,9 @@ pub mod parse {
     /// stored, with zero rows dropped (every observed chip leads with an all-zero "off"
     /// row that has no DVFS meaning).
     pub fn parse_voltage_states(raw: &[u8]) -> Vec<u32> {
-        raw.chunks_exact(8)
+        raw.as_chunks::<8>()
+            .0
+            .iter()
             .filter_map(|row| {
                 let freq_raw = u32::from_le_bytes([row[0], row[1], row[2], row[3]]);
                 // row[4..8] is the voltage column — irrelevant to clock reporting.

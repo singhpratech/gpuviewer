@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use gpuviewer_core::{now_ms, Event};
 use gpuviewer_history::{ProcessRollup, SampleRollup, SqliteStore, Tier};
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::{TerminalOptions, Viewport};
 
@@ -210,6 +210,12 @@ pub struct App {
     collector: Collector,
 }
 
+/// Ctrl-C in raw mode: quit, in every mode — including the file viewer and timeline,
+/// where a bare 'c' means something else (or nothing).
+pub fn is_ctrl_c(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'C'))
+}
+
 impl App {
     pub fn new(collector: Collector) -> Self {
         Self {
@@ -319,10 +325,22 @@ impl App {
             // the width the strips were actually drawn at.
             self.timeline_cols = crate::ui::timeline_strip_cols(width);
 
+            // SIGTERM/SIGHUP (a dropped SSH session, `kill`): leave through the same door
+            // as `q`, so `run` restores the terminal and the collector writes its stop
+            // mark and flushes the recording tail.
+            if crate::signals::requested() {
+                return Ok(());
+            }
             if event::poll(Duration::from_millis(250))? {
                 if let TermEvent::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
                         continue;
+                    }
+                    // Raw mode turns Ctrl-C into a key event instead of SIGINT. Without
+                    // this arm it fell through to the bare 'c' binding and toggled the
+                    // chart style — the universal "quit" key did something else entirely.
+                    if is_ctrl_c(key.code, key.modifiers) {
+                        return Ok(());
                     }
                     if self.handle_key(key.code) == KeyOutcome::Quit {
                         return Ok(());
@@ -333,6 +351,8 @@ impl App {
     }
 
     /// Dispatch one key press according to the current mode.
+    ///
+    /// Ctrl-C never reaches here: the event loop quits on it first ([`is_ctrl_c`]).
     ///
     /// Every navigation key has a letter alias, because Mac laptops have no
     /// PgUp/PgDn/Home/End keys and terminal emulators routinely swallow the Fn+arrow
@@ -753,6 +773,18 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ctrl_c_quits_but_bare_c_still_toggles_the_chart() {
+        use ratatui::crossterm::event::KeyModifiers;
+        assert!(super::is_ctrl_c(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(super::is_ctrl_c(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        ));
+        assert!(!super::is_ctrl_c(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!super::is_ctrl_c(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    }
+
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 

@@ -308,6 +308,76 @@ fn recording_started_event(
     }
 }
 
+/// Wall-clock time the OS did not run us across one inter-tick gap (wall advance minus
+/// monotonic advance) before it is narrated as a suspend. NTP slews, never steps, under
+/// normal operation, and a scheduling hiccup shows up in BOTH clocks — so a divergence
+/// this large is the host sleeping, or a manual/forward wall-clock step. The narration is
+/// `Likely` for exactly that second possibility.
+pub const SUSPEND_MIN_MS: u64 = 30_000;
+
+/// The `host_suspended` inference: the machine slept between two ticks. Info — a laptop
+/// lid closing is normal life, not a fault — but it must be narrated, because the hole it
+/// leaves on the timeline is otherwise indistinguishable from the GPU sitting idle, or
+/// from gpuviewer not running.
+fn host_suspended_event(
+    prev_wall_ms: u64,
+    now_wall_ms: u64,
+    mono_gap: Duration,
+    unseen_ms: u64,
+    anchor: DeviceId,
+) -> Event {
+    let unseen = Duration::from_millis(unseen_ms);
+    Event {
+        ts_ms: now_wall_ms,
+        device: anchor,
+        kind: EventKind::HostSuspended,
+        severity: Severity::Info,
+        confidence: Confidence::Likely,
+        title: format!(
+            "host likely asleep for {} ({}–{}) — nothing was recorded; the gap is the \
+             machine suspended, not the GPU idle",
+            fmt_dur(unseen),
+            fmt_clock(prev_wall_ms),
+            fmt_clock(now_wall_ms),
+        ),
+        evidence: format!(
+            "wall clock advanced {} between ticks while the monotonic clock advanced {}; the \
+             {} difference is time the OS did not run gpuviewer — a system suspend, or a \
+             forward wall-clock step (manual or NTP), which this check cannot tell apart",
+            fmt_dur(Duration::from_millis(
+                now_wall_ms.saturating_sub(prev_wall_ms)
+            )),
+            fmt_dur(mono_gap),
+            fmt_dur(unseen),
+        ),
+    }
+}
+
+/// The user paused collection with `p`: a deliberate hole, narrated so the timeline's
+/// blank stretch carries its cause. Reuses `collector_stall` (it asserts exactly "the
+/// recording has a hole") at Info severity — no new wire kind.
+fn paused_event(paused_at_ms: u64, now_ms: u64, anchor: DeviceId) -> Event {
+    let dur = Duration::from_millis(now_ms.saturating_sub(paused_at_ms));
+    Event {
+        ts_ms: now_ms,
+        device: anchor,
+        kind: EventKind::CollectorStall,
+        severity: Severity::Info,
+        confidence: Confidence::Fact,
+        title: format!(
+            "collection was paused for {} (since {}) — the recording has a hole there",
+            fmt_dur(dur),
+            fmt_clock(paused_at_ms)
+        ),
+        evidence: format!(
+            "the user paused collection at {} and resumed at {}; no samples were taken \
+             in between",
+            fmt_stamp(paused_at_ms),
+            fmt_stamp(now_ms)
+        ),
+    }
+}
+
 /// A single backend `refresh_dynamic` probe taking longer than this is worth a one-line
 /// Info note ("nvidia probe took 1.2s — driver slow to respond"): NVML/sysfs calls can block
 /// (PCIe-throughput queries, a sleeping GPU waking) and a slow probe foreshadows a stall.
@@ -357,8 +427,20 @@ pub struct Engine {
     db_path: Option<PathBuf>,
     /// The configured interval, for the stall threshold.
     interval: Duration,
-    /// Wall instant the last tick finished — the basis for stall-gap detection.
+    /// Monotonic instant the last tick finished — the basis for stall-gap detection.
     last_tick_end: Option<Instant>,
+    /// Wall-clock (unix ms) of the same moment. The monotonic clock stops while the host
+    /// is suspended (Linux `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW`) and the wall clock
+    /// does not, so their divergence across one inter-tick gap is how a suspend is seen.
+    last_tick_end_wall_ms: Option<u64>,
+    /// The sleep the caller is about to take before the next tick (the adaptive backoff
+    /// may stretch it to 5× the interval, capped at 10s). The stall threshold scales from
+    /// THIS, not the configured interval: judging a deliberate 5s backoff sleep against
+    /// the 1s interval's 5s threshold narrated a false "collection stalled" on every
+    /// low-power tick.
+    cadence: Duration,
+    /// Unix ms the user paused collection (TUI `p`), until the next tick narrates it.
+    paused_since_ms: Option<u64>,
     /// Last time we emitted a slow-probe note for a given device.
     last_slow_note: HashMap<DeviceId, Instant>,
     /// A pending `HistoryReset` to fold into the very first tick's events (the store reported
@@ -570,6 +652,9 @@ impl Engine {
             db_path,
             interval: config.interval,
             last_tick_end: None,
+            last_tick_end_wall_ms: None,
+            cadence: config.interval,
+            paused_since_ms: None,
             last_slow_note: HashMap::new(),
             pending_reset,
             pending_session_start,
@@ -603,30 +688,51 @@ impl Engine {
         let mut frame_devices = Vec::with_capacity(self.devices.len());
         let mut events = Vec::new();
 
-        // Self-honesty: a between-tick gap longer than the threshold means a backend probe
-        // blocked and the recording has a hole. Narrate it on THIS (successful) tick so the
-        // gap is recorded as a fact, not left to read as the GPU having gone quiet.
+        // Self-honesty about the time BETWEEN ticks: an unrecorded hole must be narrated,
+        // never left to read as the GPU having gone quiet. (A probe blocking INSIDE a tick
+        // is the slow-probe note below — it never shows up in this gap.)
         let now_instant = Instant::now();
-        if let Some(prev_end) = self.last_tick_end {
+        let now_wall = now_ms();
+        if let Some(paused_at) = self.paused_since_ms.take() {
+            // The user paused collection — a deliberate hole, narrated as such (Info, not
+            // a stall warning). The suspend/stall checks are skipped for this one gap: it
+            // is already explained.
+            events.push(paused_event(paused_at, now_wall, self.anchor_device()));
+        } else if let (Some(prev_end), Some(prev_wall)) =
+            (self.last_tick_end, self.last_tick_end_wall_ms)
+        {
             let gap = now_instant.duration_since(prev_end);
-            if is_stall(gap, self.interval) {
-                let last_good = fmt_clock(now_ms().saturating_sub(gap.as_millis() as u64));
+            let wall_gap_ms = now_wall.saturating_sub(prev_wall);
+            let unseen_ms = wall_gap_ms.saturating_sub(gap.as_millis() as u64);
+            if unseen_ms >= SUSPEND_MIN_MS {
+                events.push(host_suspended_event(
+                    prev_wall,
+                    now_wall,
+                    gap,
+                    unseen_ms,
+                    self.anchor_device(),
+                ));
+            } else if is_stall(gap, self.cadence.max(self.interval)) {
+                let last_good = fmt_clock(now_wall.saturating_sub(gap.as_millis() as u64));
                 let anchor = self.anchor_device();
                 events.push(Event {
-                    ts_ms: now_ms(),
+                    ts_ms: now_wall,
                     device: anchor,
                     kind: EventKind::CollectorStall,
                     severity: Severity::Warning,
                     confidence: Confidence::Fact,
                     title: format!(
-                        "collection stalled {} — a backend probe blocked; the data gap is \
+                        "collection stalled {} — no frames were taken; the data gap is \
                          recorded, last good frame at {last_good}",
                         fmt_dur(gap)
                     ),
                     evidence: format!(
-                        "inter-tick gap {} exceeds the {} stall threshold (interval {})",
+                        "inter-tick gap {} exceeds the {} stall threshold (cadence {}, \
+                         interval {}); the collector was not scheduled — the process was \
+                         stopped, starved of CPU, or blocked writing its output",
                         fmt_dur(gap),
-                        fmt_dur(stall_threshold(self.interval)),
+                        fmt_dur(stall_threshold(self.cadence.max(self.interval))),
+                        fmt_dur(self.cadence),
                         fmt_dur(self.interval),
                     ),
                 });
@@ -770,6 +876,7 @@ impl Engine {
         }
 
         self.last_tick_end = Some(Instant::now());
+        self.last_tick_end_wall_ms = Some(now_ms());
         self.frames_folded += 1;
 
         Frame {
@@ -788,6 +895,29 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn set_last_tick_end(&mut self, t: Instant) {
         self.last_tick_end = Some(t);
+        // Keep the wall twin consistent with the injected monotonic gap, so stall tests
+        // do not accidentally read as a suspend.
+        let gap = Instant::now().saturating_duration_since(t).as_millis() as u64;
+        self.last_tick_end_wall_ms = Some(now_ms().saturating_sub(gap));
+    }
+
+    /// Test seam for the suspend check: the previous tick's wall-clock end, set
+    /// independently of the monotonic one (that divergence IS the suspend signal).
+    #[cfg(test)]
+    pub(crate) fn set_last_tick_end_wall(&mut self, ms: u64) {
+        self.last_tick_end_wall_ms = Some(ms);
+    }
+
+    /// Tell the engine the sleep about to be taken before the next tick, so the stall
+    /// threshold tracks the adaptive cadence instead of the configured interval.
+    pub fn set_cadence(&mut self, cadence: Duration) {
+        self.cadence = cadence;
+    }
+
+    /// The user paused collection: the next tick narrates the hole as a pause (Info)
+    /// rather than a stall. Idempotent — the earliest pause instant is kept.
+    pub fn note_paused(&mut self) {
+        self.paused_since_ms.get_or_insert_with(now_ms);
     }
 
     /// The `device` anchor for collector-scoped events (stall, panic, session boundary):
@@ -993,8 +1123,9 @@ impl Drop for Engine {
 /// minute.
 pub struct EventSink {
     cmd: String,
-    /// Live children awaiting reap; swept (non-blocking) on each fire.
-    children: Vec<Child>,
+    /// Live children awaiting reap, with their spawn instant; swept (non-blocking) on each
+    /// fire, and killed once they outlive [`SINK_HOOK_TIMEOUT`].
+    children: Vec<(Child, Instant)>,
     /// Spawn timestamps inside the current rolling 60s window.
     window: Vec<Instant>,
     /// Whether the "rate cap hit" warning was already printed in the current over-cap burst.
@@ -1003,6 +1134,16 @@ pub struct EventSink {
 
 /// At most this many `--on-event` spawns per rolling minute.
 const SINK_MAX_PER_MIN: usize = 60;
+
+/// At most this many hooks alive at once. The per-minute cap bounds spawns, not
+/// survivors: a hook that never exits (a `curl` against a dead host with no timeout, a
+/// `read` waiting on a tty) used to accumulate one live child per event — up to ~86k a
+/// day. Beyond this many, new events are dropped (with a warning) until some exit.
+const SINK_MAX_LIVE: usize = 16;
+
+/// A hook still running after this long is killed and reaped. Hooks are notifications;
+/// one that runs for a minute is wedged, and leaving it would pin the live-children cap.
+const SINK_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl EventSink {
     pub fn new(cmd: String) -> Self {
@@ -1021,6 +1162,17 @@ impl EventSink {
         let now = Instant::now();
         self.window
             .retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        if self.children.len() >= SINK_MAX_LIVE {
+            if !self.warned {
+                self.warned = true;
+                eprintln!(
+                    "gpuviewer: --on-event has {SINK_MAX_LIVE} hooks still running — dropping \
+                     event hooks until some exit (hooks are killed after {}s)",
+                    SINK_HOOK_TIMEOUT.as_secs()
+                );
+            }
+            return;
+        }
         if self.window.len() >= SINK_MAX_PER_MIN {
             if !self.warned {
                 self.warned = true;
@@ -1071,17 +1223,53 @@ impl EventSink {
         match command.spawn() {
             Ok(child) => {
                 self.window.push(now);
-                self.children.push(child);
+                self.children.push((child, now));
             }
             Err(e) => eprintln!("gpuviewer: --on-event spawn failed: {e}"),
         }
     }
 
     /// Reap any finished children without blocking — a hook that is still running stays in the
-    /// list and is checked again next time.
+    /// list and is checked again next time, unless it outlived [`SINK_HOOK_TIMEOUT`], in which
+    /// case it is killed and reaped now.
     fn reap(&mut self) {
-        self.children
-            .retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+        let now = Instant::now();
+        self.children.retain_mut(|(c, spawned)| {
+            if matches!(c.try_wait(), Ok(Some(_))) {
+                return false;
+            }
+            if now.duration_since(*spawned) >= SINK_HOOK_TIMEOUT {
+                let _ = c.kill();
+                let _ = c.wait();
+                return false;
+            }
+            true
+        });
+    }
+
+    /// Hooks currently alive (test visibility for the live cap).
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.children.len()
+    }
+
+    /// Block until every live hook has exited (tests only).
+    #[cfg(test)]
+    fn wait_all(&mut self) {
+        for (c, _) in &mut self.children {
+            let _ = c.wait();
+        }
+        self.children.clear();
+    }
+
+    /// Kill every live hook (tests only — the never-exiting-hook fixture).
+    #[cfg(test)]
+    fn kill_all(&mut self) {
+        for (c, _) in &mut self.children {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        self.children.clear();
     }
 }
 
@@ -1427,6 +1615,7 @@ impl Collector {
                             // baseline, so the idle decision never touches (or contends
                             // on) Shared.
                             let effective = cadence.observe(&frame);
+                            engine.set_cadence(effective);
                             let mut sh = s.lock().unwrap();
                             for (i, fd) in frame.devices.iter().enumerate() {
                                 if let Some(sample) = &fd.sample {
@@ -1499,7 +1688,10 @@ impl Collector {
                         }
                     }
                 } else {
-                    cadence.skip()
+                    engine.note_paused();
+                    let skip = cadence.skip();
+                    engine.set_cadence(skip);
+                    skip
                 };
                 effective_interval_ms.store(effective.as_millis() as u64, Ordering::Relaxed);
                 // Sleep the cadence in slices so shutdown is noticed promptly (see
@@ -2767,6 +2959,144 @@ mod tests {
         );
     }
 
+    /// Regression: the adaptive backoff sleeps 5× the interval (capped at 10s). The stall
+    /// threshold used to be computed from the configured interval alone, so a deliberate
+    /// 5s low-power sleep at the default 1s interval (threshold max(3s, 5s) = 5s) plus a
+    /// few microseconds of bookkeeping narrated "collection stalled" on every backed-off
+    /// tick. Told the cadence, the engine judges the gap against it.
+    #[test]
+    fn a_backed_off_sleep_is_not_a_stall() {
+        let mut engine = flaky_engine(None, |_| false);
+        let _ = engine.tick_guarded();
+        engine.set_cadence(Duration::from_secs(5));
+        engine.set_last_tick_end(
+            Instant::now()
+                .checked_sub(Duration::from_millis(5_050))
+                .expect("uptime exceeds 6s"),
+        );
+        let TickOutcome::Frame(f) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(
+            f.events.iter().all(|e| e.kind != EventKind::CollectorStall),
+            "a gap that matches the backoff cadence is the schedule, not a stall: {:?}",
+            f.events.iter().map(|e| &e.title).collect::<Vec<_>>()
+        );
+
+        // A gap well past the STRETCHED cadence's threshold (3×5s = 15s) still narrates.
+        engine.set_last_tick_end(
+            Instant::now()
+                .checked_sub(Duration::from_secs(16))
+                .expect("uptime exceeds 16s"),
+        );
+        let TickOutcome::Frame(f) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        let stall = f
+            .events
+            .iter()
+            .find(|e| e.kind == EventKind::CollectorStall)
+            .expect("a real hole past the cadence threshold must still be narrated");
+        assert!(
+            !stall.title.contains("probe blocked"),
+            "an inter-tick gap cannot be a blocked probe (probes run inside a tick): {}",
+            stall.title
+        );
+        assert!(
+            stall.evidence.contains("cadence 5.0s"),
+            "{}",
+            stall.evidence
+        );
+    }
+
+    /// The suspend signal: the monotonic clock barely moved but the wall clock jumped an
+    /// hour. That is narrated as a hedged `host_suspended` (never a stall warning —
+    /// nothing was wrong with the collector), with both clocks in the evidence.
+    #[test]
+    fn wall_clock_jump_without_monotonic_advance_narrates_a_suspend() {
+        let mut engine = flaky_engine(None, |_| false);
+        let _ = engine.tick_guarded();
+        engine.set_last_tick_end(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("uptime exceeds 1s"),
+        );
+        engine.set_last_tick_end_wall(now_ms() - 3_600_000);
+        let TickOutcome::Frame(f) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        let sus: Vec<&Event> = f
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::HostSuspended)
+            .collect();
+        assert_eq!(sus.len(), 1, "exactly one suspend narration");
+        let e = sus[0];
+        assert_eq!(
+            e.confidence,
+            Confidence::Likely,
+            "a clock step looks the same"
+        );
+        assert_eq!(e.severity, Severity::Info, "sleeping is normal life");
+        assert!(
+            e.title.contains("likely"),
+            "inference titles hedge: {}",
+            e.title
+        );
+        assert!(
+            e.evidence.contains("wall clock") && e.evidence.contains("monotonic"),
+            "{}",
+            e.evidence
+        );
+        assert!(
+            f.events.iter().all(|e| e.kind != EventKind::CollectorStall),
+            "a suspend is not a collector stall"
+        );
+
+        // A small divergence (well under SUSPEND_MIN_MS) is scheduling noise: silent.
+        engine.set_last_tick_end(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("uptime exceeds 1s"),
+        );
+        engine.set_last_tick_end_wall(now_ms() - 3_000);
+        let TickOutcome::Frame(f) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(f.events.iter().all(|e| e.kind != EventKind::HostSuspended));
+    }
+
+    /// A user pause is a deliberate hole: narrated once, at Info, as a pause.
+    #[test]
+    fn a_user_pause_is_narrated_as_a_pause_not_a_stall() {
+        let mut engine = flaky_engine(None, |_| false);
+        let _ = engine.tick_guarded();
+        engine.note_paused();
+        engine.set_last_tick_end(
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("uptime exceeds 60s"),
+        );
+        let TickOutcome::Frame(f) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        let holes: Vec<&Event> = f
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::CollectorStall)
+            .collect();
+        assert_eq!(holes.len(), 1);
+        assert_eq!(holes[0].severity, Severity::Info);
+        assert!(holes[0].title.contains("paused"), "{}", holes[0].title);
+        let TickOutcome::Frame(f) = engine.tick_guarded() else {
+            panic!("scripted to never fail");
+        };
+        assert!(
+            f.events.iter().all(|e| e.kind != EventKind::CollectorStall),
+            "the pause narrates once"
+        );
+    }
+
     /// The slow-probe foreshadowing note: one probe past [`SLOW_PROBE`] narrates an INFO
     /// `CollectorStall` fact against the slow device itself; a second slow probe inside
     /// the cooldown stays silent (a persistently-slow driver must not flood the feed);
@@ -3356,9 +3686,12 @@ mod tests {
             title: "t".into(),
             evidence: "e".into(),
         };
-        // Fire well past the cap; the window must never exceed SINK_MAX_PER_MIN.
+        // Fire well past the cap; the window must never exceed SINK_MAX_PER_MIN. Each hook
+        // is waited out before the next fire so the separate live-children cap never
+        // engages here — this test is about the per-minute spawn cap alone.
         for _ in 0..(SINK_MAX_PER_MIN + 25) {
             sink.fire(&ev);
+            sink.wait_all();
         }
         assert_eq!(
             sink.window.len(),
@@ -3369,5 +3702,28 @@ mod tests {
             sink.warned,
             "exceeding the cap must set the one-time warning"
         );
+    }
+
+    /// A hook that never exits must not accumulate: the live-children cap holds new
+    /// spawns at [`SINK_MAX_LIVE`] and warns, instead of growing one zombie per event.
+    #[cfg(unix)]
+    #[test]
+    fn event_sink_caps_live_hooks_that_never_exit() {
+        let mut sink = EventSink::new("sleep 30".into());
+        let ev = Event {
+            ts_ms: 1,
+            device: DeviceId("d".into()),
+            kind: EventKind::ProcessExited,
+            severity: Severity::Info,
+            confidence: Confidence::Fact,
+            title: "t".into(),
+            evidence: "e".into(),
+        };
+        for _ in 0..(SINK_MAX_LIVE + 10) {
+            sink.fire(&ev);
+        }
+        assert_eq!(sink.live(), SINK_MAX_LIVE, "survivors are capped");
+        assert!(sink.warned, "hitting the live cap warns");
+        sink.kill_all();
     }
 }

@@ -14,6 +14,7 @@
 
 mod app;
 mod collector;
+mod signals;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -455,6 +456,9 @@ fn main() -> Result<()> {
         }
     }
 
+    // Live modes only: these hold a recording whose tail and stop mark a signal must not
+    // throw away (see signals.rs).
+    signals::install();
     if args.json {
         run_json(engine, args.interval, args.once)
     } else {
@@ -517,7 +521,10 @@ fn run_json(mut engine: Engine, interval: Duration, once: bool) -> Result<()> {
                          panics — stream ended (panic details on stderr above)"
                     );
                 }
-                std::thread::sleep(interval);
+                if signals::sleep_or_shutdown(interval) {
+                    emit_stop_mark(&mut engine);
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -550,7 +557,12 @@ fn run_json(mut engine: Engine, interval: Duration, once: bool) -> Result<()> {
             emit_stop_mark(&mut engine);
             return Ok(());
         }
-        std::thread::sleep(interval);
+        // SIGTERM (`systemctl stop`), SIGINT, SIGHUP: the same clean end as `--once` — the
+        // stream is still open, so the stop mark goes out as the final line.
+        if signals::sleep_or_shutdown(interval) {
+            emit_stop_mark(&mut engine);
+            return Ok(());
+        }
     }
 }
 

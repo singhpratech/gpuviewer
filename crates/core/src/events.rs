@@ -79,6 +79,10 @@ pub enum EventKind {
     /// same rule the collector applies to its own stalls, applied to its own storage.
     /// Emitted by the tui collector. Always `Confidence::Fact`.
     RecordingDegraded,
+    /// The host was very likely suspended between two ticks: the wall clock advanced far
+    /// more than the monotonic clock (which stops during suspend). `Likely`, because a
+    /// forward wall-clock step looks identical. Emitted by the tui collector.
+    HostSuspended,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

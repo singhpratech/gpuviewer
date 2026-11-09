@@ -24,6 +24,10 @@ serde_json.workspace = true
 anyhow.workspace = true
 ratatui.workspace = true
 chrono.workspace = true
+# SIGTERM/SIGINT/SIGHUP → cooperative shutdown so the recording tail and the stop mark
+# land on `systemctl stop` / a dropped SSH session (src/signals.rs). Already in the tree
+# transitively via crossterm on unix; pure Rust + libc, no C shim.
+signal-hook = "0.3"
 
 # build.rs gates on env CARGO_CFG_TARGET_OS == "windows" (build scripts run on the HOST —
 # design §8) and embeds docs/assets/icon/gpuviewer.ico via rc.exe on windows-latest.

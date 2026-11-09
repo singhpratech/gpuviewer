@@ -10,3 +10,6 @@
 # locally built release artifacts (tarballs, AppImage, deb/rpm) — produced by CI/packaging,
 # never checked in
 /dist
+
+# Claude Code local state (agent worktrees, session files) — never part of the repo
+/.claude/
