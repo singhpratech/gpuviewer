@@ -1,0 +1,5 @@
+# SYNTHETIC fixture (see the fixtures README) mirroring the libdrm amdgpu.ids format
+# device_id,	revision_id,	product_name
+1.0.0
+15BF,	C4,	AMD Radeon 780M Graphics
+15BF,	CF,	AMD Radeon 760M Graphics

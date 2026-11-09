@@ -1,0 +1,26 @@
+pos:	0
+flags:	02100002
+mnt_id:	24
+ino:	3104
+drm-driver:	amdgpu
+drm-client-id:	43
+drm-pdev:	0000:03:00.0
+pasid:	32803
+drm-total-cpu:	0
+drm-shared-cpu:	0
+drm-active-cpu:	0
+drm-resident-cpu:	0
+drm-purgeable-cpu:	0
+drm-total-gtt:	2 MiB
+drm-shared-gtt:	0
+drm-active-gtt:	0
+drm-resident-gtt:	2 MiB
+drm-purgeable-gtt:	0
+drm-total-vram:	4 MiB
+drm-shared-vram:	0
+drm-active-vram:	0
+drm-resident-vram:	4 MiB
+drm-purgeable-vram:	0
+drm-memory-vram:	4096 KiB
+drm-memory-gtt: 	2048 KiB
+drm-memory-cpu: 	0 KiB

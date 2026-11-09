@@ -1,0 +1,13 @@
+pos:	0
+flags:	02100002
+mnt_id:	24
+ino:	2297
+drm-driver:	amdgpu
+drm-client-id:	22
+drm-pdev:	0000:c3:00.0
+pasid:	32795
+drm-memory-vram:	32768 KiB
+drm-memory-gtt: 	98304 KiB
+drm-memory-cpu: 	0 KiB
+drm-engine-gfx:	40000000 ns
+drm-engine-dec:	2500000000 ns
