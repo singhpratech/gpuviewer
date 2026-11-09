@@ -41,7 +41,7 @@ it happened and read the story in plain English.
   <a href="#keybinds">Keybinds</a>
 </p>
 
-> **Status — `v0.2.1` is out.** Prebuilt binaries for Linux (`tar.gz` / `.deb` / `.rpm` /
+> **Status — `v0.2.2` is out.** Prebuilt binaries for Linux (`tar.gz` / `.deb` / `.rpm` /
 > AppImage), Windows (`zip`) and macOS Apple Silicon (`tar.gz`), each with checksums and
 > build-provenance attestations. Linux covers NVIDIA, AMD and Intel; Windows covers all
 > three through NVML and the WDDM performance counters; macOS covers Apple Silicon at the
@@ -317,7 +317,7 @@ This project was built research-first, and the research is in the repo:
 
 ## Status
 
-**v0.2.1.** Install paths: [`docs/packaging/installing.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md).
+**v0.2.2.** Install paths: [`docs/packaging/installing.md`](https://github.com/singhpratech/gpuviewer/blob/main/docs/packaging/installing.md).
 
 | Platform | Backends |
 |---|---|

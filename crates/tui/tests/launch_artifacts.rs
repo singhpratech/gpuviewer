@@ -180,6 +180,22 @@ fn export_honors_the_window_and_refuses_overwrite() {
         "a 30m window of 10s buckets is ~180 rows, got {}",
         rows.len()
     );
+    // Regression (0.2.2): the copy must keep every column in its own column. The
+    // positional INSERT shipped before named the observed count `throttle_hw_n`.
+    let r0 = rows.first().expect("window must not be empty");
+    assert_eq!(
+        (
+            r0.throttle_n,
+            r0.throttle_observed_n,
+            r0.throttle_thermal_n,
+            r0.throttle_power_n,
+            r0.throttle_hw_n
+        ),
+        (0, 10, 0, 0, 0),
+        "exported throttle counters must survive the copy column-for-column"
+    );
+    assert_eq!(r0.util_max, Some(90.0));
+    assert_eq!(r0.sm_clock_max, Some(1800));
     let oldest = rows.first().expect("window must not be empty").bucket_ms;
     assert!(
         oldest >= now - 31 * 60_000,

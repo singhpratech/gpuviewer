@@ -210,9 +210,8 @@ const SAMPLE_COLS: &str = "device_id, bucket_ms, n, util_min, util_avg, util_max
      mem_max, power_avg_mw, power_max_mw, temp_avg_c, temp_max_c, fan_max_pct, sm_clock_min, \
      sm_clock_avg, sm_clock_max, throttle_n, throttle_thermal_n, throttle_power_n, \
      throttle_hw_n, throttle_observed_n";
-/// `cmdline` stays LAST: it is the migration-added column, so a table created before v4
-/// and one created after both have it in this position, and the export's positional
-/// `INSERT INTO processes_10s SELECT …` lines up either way.
+/// `cmdline` is last because it is the migration-added column; every INSERT names its
+/// columns, so physical column order never matters.
 const PROC_COLS: &str =
     "device_id, bucket_ms, pid, name, kind, mem_max, util_avg, cpu_avg, container, cmdline";
 
@@ -1224,27 +1223,35 @@ impl SqliteStore {
             params![from.to_string(), to.to_string()],
         )?;
         let devices = tx.execute(
-            "INSERT INTO devices SELECT device_id, name, vendor, mem_total_bytes \
+            "INSERT INTO devices (device_id, name, vendor, mem_total_bytes) \
+             SELECT device_id, name, vendor, mem_total_bytes \
              FROM src.devices",
             [],
         )?;
+        // Every copy names its destination columns. A positional `INSERT INTO t SELECT …`
+        // silently depends on the destination's physical column order, and the
+        // migration-added columns sit in different places in a fresh file (SCHEMA_SQL) and
+        // in a migrated one (ALTER TABLE appends): the positional form shipped in 0.1/0.2.0
+        // and scrambled four throttle counters in every export — `throttle_observed_n`
+        // landed in `throttle_hw_n`, so a replayed file read "hw slowdown" or "throttle
+        // n/a" where the recording said "observed, quiet".
         let samples_10s = tx.execute(
             &format!(
-                "INSERT INTO samples_10s SELECT {SAMPLE_COLS} FROM src.samples_10s \
+                "INSERT INTO samples_10s ({SAMPLE_COLS}) SELECT {SAMPLE_COLS} FROM src.samples_10s \
                  WHERE bucket_ms >= ?1 AND bucket_ms <= ?2"
             ),
             params![from, to],
         )?;
         let samples_1m = tx.execute(
             &format!(
-                "INSERT INTO samples_1m SELECT {SAMPLE_COLS} FROM src.samples_1m \
+                "INSERT INTO samples_1m ({SAMPLE_COLS}) SELECT {SAMPLE_COLS} FROM src.samples_1m \
                  WHERE bucket_ms >= ?1 AND bucket_ms <= ?2"
             ),
             params![from, to],
         )?;
         let processes_10s = tx.execute(
             &format!(
-                "INSERT INTO processes_10s SELECT {proc_cols} FROM src.processes_10s \
+                "INSERT INTO processes_10s ({PROC_COLS}) SELECT {proc_cols} FROM src.processes_10s \
                  WHERE bucket_ms >= ?1 AND bucket_ms <= ?2"
             ),
             params![from, to],
