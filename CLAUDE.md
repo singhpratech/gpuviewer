@@ -306,7 +306,10 @@ paths resolve against CWD); `tools/make-appimage.sh` (appimagetool SHA-pinned at
 AppImage bundles neither glibc (Linux builds on ubuntu-22.04 to hold the glibc 2.35 floor) nor
 `libnvidia-ml.so.1`; the target is **gnu, never musl** — musl cannot dlopen libnvidia-ml.
 Icons: `python3 tools/make-icons.py` (stdlib-only, but requires a locally installed headless
-Chrome/Chromium).
+Chrome/Chromium). README/site screenshots (`docs/assets/{replay,timeline}.svg`) are rendered from the real
+`ui::render` over the seeded demo, never drawn by hand: `GPV_SHOTS_DIR=/tmp/shots cargo test -p
+gpuviewer-tui --bin gpuviewer -- --ignored screenshot_dump`, then `python3
+tools/make-screenshots.py /tmp/shots docs/assets` (stdlib-only; block glyphs become rects).
 
 deb/rpm asset lists live in `crates/tui/Cargo.toml` metadata and deliberately declare **no**
 NVIDIA package dependency — the dlopen'd `libnvidia-ml.so.1` is invisible to DT_NEEDED scanners

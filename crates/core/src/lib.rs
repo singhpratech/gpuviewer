@@ -3,8 +3,19 @@
 //! Architecture (see CLAUDE.md and docs/research/04-synthesis.md):
 //! - [`backend::GpuBackend`]: nvtop's vendor-vtable split (static / dynamic / processes),
 //!   per-field `Option<T>`, runtime-loaded vendor libs, failed init = skipped backend.
-//! - [`events::EventEngine`]: derives the narrated "story" events from raw samples.
+//! - [`backend::probe_backends`] / [`backend::all_backends`]: the explicit registry
+//!   (nvidia → amd → intel → wddm → apple), with the reason every skipped backend failed.
+//! - [`events::EventEngine`]: derives the narrated "story" events from raw samples —
+//!   throttle onset/recovery, process attach/exit, power-limit changes and uncorrectable
+//!   ECC errors as facts; VRAM pressure, idle gaps, suspected hangs, CPU spillover and a
+//!   PCIe link stuck below its generation under load as hedged "likely" inferences. Every
+//!   event carries its raw evidence.
+//! - [`kmsg`]: NVIDIA Xid errors from the Linux kernel log, quoted verbatim.
+//! - [`proc_meta`]: per-process CPU%, container identity, and command lines with
+//!   secret-looking arguments redacted at capture.
 //! - [`mock::MockBackend`]: scripted simulation for CI/demos; the contract for real backends.
+//!
+//! Every metric is `Option<T>`: `None` means "this source cannot report it" — never zero.
 
 #[cfg(target_os = "linux")]
 pub mod amd;

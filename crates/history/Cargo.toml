@@ -10,7 +10,7 @@ documentation = "https://docs.rs/gpuviewer-history"
 keywords = ["gpu", "history", "sqlite", "telemetry", "monitoring"]
 categories = ["hardware-support", "database"]
 repository.workspace = true
-description = "History store for gpuviewer: RAM rings for the live window, SQLite rollups later"
+description = "History store for gpuviewer: RAM rings for the live window, SQLite 10s/1m rollups and an event log, .gpvr export"
 
 [dependencies]
 gpuviewer-core.workspace = true

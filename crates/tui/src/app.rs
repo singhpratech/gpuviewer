@@ -1867,4 +1867,79 @@ mod tests {
         );
         cleanup(&path);
     }
+
+    /// README screenshot source (not a check): with `GPV_SHOTS_DIR` set, seeds the real
+    /// 8h demo recording, renders the replay view (at the last throttle onset) and the
+    /// timeline overview through the real `ui::render` into a 144×32 buffer, and writes
+    /// every cell (symbol, fg, bg, modifiers) as JSON. `tools/make-screenshots.py` turns
+    /// those into `docs/assets/{replay,timeline}.svg`. Run:
+    /// `GPV_SHOTS_DIR=/tmp/shots cargo test -p gpuviewer-tui --bin gpuviewer -- --ignored screenshot_dump`
+    #[test]
+    #[ignore = "screenshot generator, run on demand"]
+    fn screenshot_dump() {
+        let Ok(dir) = std::env::var("GPV_SHOTS_DIR") else {
+            eprintln!("GPV_SHOTS_DIR not set — nothing to do");
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = scratch_path();
+        let now = gpuviewer_core::now_ms();
+        crate::seed_demo(&path, now - 8 * 3_600_000, now).unwrap();
+        let anchor = SqliteStore::open_readonly(&path)
+            .unwrap()
+            .latest_event_ms(Some(EventKind::ThrottleStart))
+            .unwrap();
+        let collector = test_collector(Some(path.clone()));
+        let mut app = App::new(collector);
+
+        let dump = |app: &App, name: &str| {
+            let mut terminal = Terminal::new(TestBackend::new(144, 32)).unwrap();
+            {
+                let sh = app.collector.shared.lock().unwrap();
+                terminal.draw(|f| crate::ui::render(f, app, &sh)).unwrap();
+            }
+            let buf = terminal.backend().buffer().clone();
+            let mut rows = Vec::new();
+            for y in 0..buf.area.height {
+                let mut row = Vec::new();
+                for x in 0..buf.area.width {
+                    let c = &buf[(x, y)];
+                    row.push(serde_json::json!([
+                        c.symbol(),
+                        format!("{:?}", c.fg),
+                        format!("{:?}", c.bg),
+                        format!("{:?}", c.modifier),
+                    ]));
+                }
+                rows.push(row);
+            }
+            std::fs::write(
+                dir.join(format!("{name}.json")),
+                serde_json::to_string(&rows).unwrap(),
+            )
+            .unwrap();
+        };
+
+        app.enter_replay(anchor);
+        // Select the onset row so the feed shows the selection highlight, as a user
+        // pressing Enter on it would see.
+        let sel = app
+            .replay_window()
+            .and_then(|w| w.events.iter().position(|e| Some(e.ts_ms) == anchor));
+        app.story_selected = sel;
+        dump(&app, "replay");
+
+        app.enter_timeline();
+        // 1h rung (10s tier): narrow enough that the stalls and throttle episodes show as
+        // real dips, instead of every column's peak reading ~99%. Cursor on the onset.
+        while app.timeline_zoom > 0 {
+            app.handle_key(KeyCode::Char('+'));
+        }
+        if let Some(a) = anchor {
+            app.timeline_cursor_ms = a;
+        }
+        dump(&app, "timeline");
+        cleanup(&path);
+    }
 }

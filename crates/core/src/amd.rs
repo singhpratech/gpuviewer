@@ -682,7 +682,7 @@ fn residency_delta(prev: &ResidencyAcc, cur: &ResidencyAcc) -> Option<ThrottleRe
 /// status word. `Some` reports which throttlers were engaged between the two reads (an
 /// all-false `Some` is an observed quiet window); `None` whenever either blob is not a
 /// decodable v1_7/v1_8 residency block or the pair does not form an honest window — see
-/// [`residency_delta`]. Every other revision returns `None` here: use
+/// `residency_delta`. Every other revision returns `None` here: use
 /// [`decode_gpu_metrics_throttle`] for those.
 pub fn decode_gpu_metrics_throttle_delta(prev: &[u8], cur: &[u8]) -> Option<ThrottleReasons> {
     residency_delta(&residency_snapshot(prev)?, &residency_snapshot(cur)?)

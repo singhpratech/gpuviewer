@@ -371,7 +371,7 @@ pub mod pdh {
 
     /// One formatted collection of every GPU counter stream — pure data, so the
     /// aggregation functions above are testable from scripted values on any OS. Built on
-    /// Windows by [`SharedPdh::snapshot`]; both Windows backends read the same snapshot.
+    /// Windows by `SharedPdh::snapshot`; both Windows backends read the same snapshot.
     ///
     /// Empty vectors are the *normal* GPU-less/first-sample state, not an error.
     #[derive(Clone, Debug, Default, PartialEq)]

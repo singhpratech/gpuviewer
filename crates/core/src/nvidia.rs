@@ -10,7 +10,7 @@
 //! - Throttle mapping is edge-honest: GPU idle is deliberately NOT narrated as throttling
 //!   (an idle GPU is not slow). Configuration limiters (applications-clocks / display-clock
 //!   settings) map to the catch-all `other` so they are surfaced without being mislabeled as
-//!   a thermal or power slowdown. See [`map_throttle`].
+//!   a thermal or power slowdown. See `map_throttle`.
 //! - WSL2 is detected once at init: per-process GPU info is N/A *at the driver level*
 //!   there, so `StaticInfo::process_hint` explains the empty process table up front
 //!   instead of crashing on it (nvtop #432 is the cautionary tale).

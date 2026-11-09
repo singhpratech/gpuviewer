@@ -42,15 +42,15 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 /// Schema version stamped into `PRAGMA user_version` and `meta.schema_version`. Bump when
 /// the table shape changes so a future migration step can branch on it.
 /// v2: the event-dedupe UNIQUE index (`idx_events_dedupe`), added by
-/// [`SqliteStore::migrate_event_dedupe`] on open with pre-existing duplicates collapsed.
+/// `SqliteStore::migrate_event_dedupe` on open with pre-existing duplicates collapsed.
 ///
 /// The stamp is guarded in BOTH directions: older files migrate forward, but a file
 /// stamped HIGHER than this constant was written by a NEWER gpuviewer, and every write
 /// open refuses it with the file untouched ([`StoreError::SchemaTooNew`]) — this build
 /// must never migrate, prune, or down-stamp a shape it has never seen.
 ///
-/// v3: `throttle_observed_n` on both rollup tables ([`SqliteStore::migrate_throttle_observed`]).
-/// v4: `processes_10s.cmdline` ([`SqliteStore::migrate_process_cmdline`]).
+/// v3: `throttle_observed_n` on both rollup tables (`SqliteStore::migrate_throttle_observed`).
+/// v4: `processes_10s.cmdline` (`SqliteStore::migrate_process_cmdline`).
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// Retention windows. Public because the UI tells the user how far back history reaches

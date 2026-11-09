@@ -592,9 +592,17 @@
       </div>
       <div class="rule-item">
         <h4>The recorder narrates its own failures</h4>
-        <p>Collector stalls, lost and returned devices, and session start/stop marks are events
-        too — so a gap in the story is explained by the recorder, not left for you to guess at.</p>
-      </div>
+        <p>Collector stalls, pauses, a laptop going to sleep, lost and returned devices, and
+          session start/stop marks are events too — so a gap in the story is explained by the
+          recorder, not left for you to guess at. <code>systemctl stop</code> and a dropped SSH
+          session end the recording cleanly instead of reading as a crash.</p>
+        </div>
+        <div class="rule-item">
+          <h4>Shared files carry no secrets by default</h4>
+          <p>Process command lines tell three <code>python</code> jobs apart, with token- and
+          password-looking arguments redacted the moment they are read. An exported
+          <code>.gpvr</code> leaves command lines out entirely unless you ask for them.</p>
+        </div>
     </div>
   </div>
 </section>
@@ -619,8 +627,8 @@
           <tr>
             <td class="v">Linux</td>
             <td class="v">NVIDIA · AMD · Intel</td>
-            <td class="v">NVML · sysfs / gpu_metrics · fdinfo (i915 + xe)</td>
-            <td class="v">Yes — pid, VRAM, util, CPU%, container</td>
+            <td class="v">NVML · sysfs / gpu_metrics · fdinfo (i915 + xe) · kernel log (Xid)</td>
+            <td class="v">Yes — pid, VRAM, util, CPU%, container, command line</td>
           </tr>
           <tr>
             <td class="v">Windows</td>
@@ -668,10 +676,9 @@ singhpratech/gpuviewer/main/install.sh | sh</pre>
 gpuviewer/main/install.ps1 | iex</pre>
       </div>
       <div class="inst">
-        <h4>From source</h4>
-<pre><span class="p">$</span> cargo install --git https://github.com/singhpratech/gpuviewer \
-    gpuviewer-tui
-<span class="c"># needs Rust 1.95+</span></pre>
+        <h4>With cargo</h4>
+<pre><span class="p">$</span> cargo install gpuviewer-tui
+<span class="c"># from crates.io · needs Rust 1.95+</span></pre>
       </div>
       <div class="inst">
         <h4>Try it with no GPU</h4>
@@ -684,9 +691,11 @@ gpuviewer/main/install.ps1 | iex</pre>
     <div style="margin-top:2.4rem">
       <p class="chan">Then, the next morning</p>
 <pre><span class="p">$</span> gpuviewer report --since 12h          <span class="c"># plain-text digest of the night</span>
-<span class="p">$</span> gpuviewer export --since 12h out.gpvr <span class="c"># a shareable incident slice</span>
+<span class="p">$</span> gpuviewer report --since 12h --json   <span class="c"># the same digest as one JSON object</span>
+<span class="p">$</span> gpuviewer export --since 01:00 --until 03:00 out.gpvr  <span class="c"># just the incident</span>
 <span class="p">$</span> gpuviewer view out.gpvr               <span class="c"># replay it anywhere — no GPU needed</span>
-<span class="p">$</span> gpuviewer --json                      <span class="c"># NDJSON stream for scripting</span></pre>
+<span class="p">$</span> gpuviewer --json                      <span class="c"># NDJSON stream for scripting</span>
+<span class="p">$</span> gpuviewer doctor                      <span class="c"># what it can see on this box — for bug reports</span></pre>
     </div>
   </div>
 </section>
@@ -713,14 +722,18 @@ gpuviewer/main/install.ps1 | iex</pre>
   var SPAN = 480;
 
   var EVENTS = [
-    { t:   4, kind: 'recording_started', conf: 'fact',   title: 'Recording started — gpuviewer 0.1.0',
+    { t:   4, kind: 'recording_started', conf: 'fact',   title: 'Recording started — gpuviewer 0.2.0',
       ev: 'interval 1.0s · backends: nvml (1 device) · db ~/.local/share/gpuviewer/history.db' },
+    { t: 150, kind: 'power_limit_changed', conf: 'fact', title: 'GPU0 power limit lowered 450→350 W',
+      ev: 'enforced power limit read 450000 mW, now 350000 mW · drawing 431 W at the change · who changed it is not claimed' },
     { t: 218, kind: 'process_attached',  conf: 'fact',   title: 'python (pid 4521) attached — 19.2 GiB',
       ev: 'compute context on GPU0 · first seen 01:38:07 · 19.2 GiB of 24.0 GiB' },
     { t: 254, kind: 'throttle_start',    conf: 'fact',   title: 'GPU0 throttling — thermal',
       ev: 'clocks 2610 → 1725 MHz · temp 84 °C (slowdown 83 °C) · NVML clocks-event bitmask: SW_THERMAL_SLOWDOWN' },
     { t: 291, kind: 'throttle_end',      conf: 'fact',   title: 'Throttling ended — clocks recovered',
       ev: 'held 37m02s · clocks back to 2540 MHz (97% of pre-throttle) · temp 79 °C' },
+    { t: 296, kind: 'pcie_link_degraded', conf: 'likely', title: 'GPU0 PCIe link likely degraded — Gen1 x16 under load (supports Gen4)',
+      ev: 'link generation at or below Gen1 for 1m00s while util averaged 94% (≥50% every tick) · reported maximum Gen4 · links slow down at idle by design, so only a busy GPU is judged; a riser or a loose seat are common causes' },
     { t: 302, kind: 'vram_pressure',     conf: 'likely', title: 'VRAM likely to run out in ~26 min',
       ev: '21.4 GiB of 24.0 GiB (89%) climbing 41 MiB/min over the last 3m · largest holder python (pid 4521), 19.2 GiB · trend, not a reservation — an allocator flush would reset it' },
     { t: 401, kind: 'idle_gap',          conf: 'likely', title: 'GPU likely starved for 4m12s — dataloader stall',

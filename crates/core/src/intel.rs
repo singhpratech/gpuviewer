@@ -4,7 +4,7 @@
 //!
 //! The defining caveat: **i915 and xe are two different worlds** (research 02). Same
 //! vendor, two in-tree drivers, different fdinfo keys AND different sysfs freq layouts —
-//! every read below is dispatched on a per-device [`Dialect`] detected from the uevent:
+//! every read below is dispatched on a per-device `Dialect` detected from the uevent:
 //! - i915 (Gen9 → Meteor Lake, DG2 default): fdinfo `drm-engine-*` cumulative busy-ns
 //!   (kernel 5.19+), per-process memory regions named `local0`/`system0` (6.8+),
 //!   card-level `gt_*_freq_mhz` files, dGPU-only `lmem_total_bytes`, hwmon package
@@ -14,7 +14,7 @@
 //!   `device/tile0/gt0/freq0/*` freq files, NO VRAM-total sysfs at all, hwmon package
 //!   temp on `temp2_input` — there is NO temp1, and temp3 is the VRAM sensor (6.15+);
 //!   hwmon power channels by scope, index 1 = card / index 2 = pkg (card preferred, pkg
-//!   fallback — see [`resolve_power_channel`]).
+//!   fallback — see `resolve_power_channel`).
 //!
 //! Per the domain rules in CLAUDE.md:
 //! - Every path derives from a root-dir parameter (`with_root`), so the whole backend
@@ -28,7 +28,7 @@
 //!   only exists since 6.15), and summing fdinfo across clients we may not be able to
 //!   see would understate — an invented number is worse than an honest absence.
 //! - The xe per-process utilization math is NOT the i915 math: Δbusy-cycles over
-//!   Δtotal-cycles, never over wall time — see [`cycles_util_pct`].
+//!   Δtotal-cycles, never over wall time — see `cycles_util_pct`.
 //! - Other users' fdinfo needs root/CAP_SYS_PTRACE, so unprivileged runs carry an
 //!   honest "your processes only" `process_hint` (same model as the AMD backend).
 
